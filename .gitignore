@@ -7,10 +7,12 @@ __pycache__/
 *.pyc
 
 # Runtime data / generated artifacts
-TRADEIN/llm_request.json
+# (wildcarded so these still match after Steve's script location changes)
+**/llm_request.json
+**/analyzer.log*
+Agents/Steve - Daily Analyst/narrative_*.md
 TRADEIN/paper_trading/trades.json
 TRADEIN/paper_trading/paper_trades_journal.xlsx
-TRADEIN/analyzer.log*
 Graphs/*.png
 MailToMail/Scripts/
 
