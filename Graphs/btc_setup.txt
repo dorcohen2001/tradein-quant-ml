@@ -1,0 +1,25 @@
+DAILY TRADE SETUP — 2026-07-29
+
+Asset: BTCUSDT (Crypto)
+Confluence Score: 66.5/100
+
+🌍 Macro Context
+BTC Downtrend ($64,315.99), ETH Mixed ($1,904.89), USDT.D 8.079146567040398% Falling/Stable (risk-on) -> Regime: Neutral
+
+📈 Technical Thesis
+Price hugging EMA50 (-0.99%); Inside Fibonacci golden zone (6.409e+04-6.604e+04); Support near 5.913e+04; Resistance near 6.47e+04; Trend: DOWNTREND, RSI 50.3, MACD bearish
+
+📰 Fundamental Catalyst
+Sentiment: Negative
+  - Bitcoin bounces to $64,300 but the real move waits on the Fed: Crypto Markets Today - CoinDesk
+  - BTC, ETH price news: Bitcoin rises toward $64,000 amid Korea's record chip crash - CoinDesk
+  - Live updates: Bitcoin rises above $64,000 ahead of Fed rate decision - CoinDesk
+
+⚙️ Trade Parameters
+Direction: 🔴 SHORT
+Entry Zone: 64,189.35 - 64,639.58
+Target 1: 59,130.91 (R:R 7.35)
+Target 2: 57,800.19 (R:R 9.24)
+Stop Loss: 65,023.50
+
+⚠️ Risk Disclaimer: This is not financial advice. Markets are volatile and all trading involves risk of loss. Position size responsibly and do your own research (DYOR) before entering any trade.

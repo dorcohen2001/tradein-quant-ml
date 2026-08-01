@@ -1,0 +1,23 @@
+DAILY TRADE SETUP — LTCUSDT (SHORT)
+
+MACRO CONTEXT:
+Bitcoin dominance keeps grinding higher while alt majors bleed. Litecoin has
+underperformed the majors this week, and funding has flipped positive into
+resistance — a classic setup for a fade.
+
+TECHNICAL THESIS:
+Price rallied straight into the Fibonacci Golden Zone at 44.43 - 46.02 and is
+showing rejection wicks. LTC remains capped below the EMA 50 and the EMA 200
+on the daily, keeping the higher-timeframe trend bearish. Key resistance sits
+at 46.60, while support rests at 40.10 and 37.80. RSI is rolling over from the
+mid-50s without ever reaching overbought, and the MACD histogram is fading
+toward a bearish cross — momentum is running out of fuel.
+
+TRADE PARAMETERS:
+Direction: SHORT
+Entry Zone: 44.40 - 45.60
+TP1: 42.92
+TP2: 41.20
+TP3: 39.50
+SL: 46.59
+Risk: 1R at roughly 2.5% from mid-entry; scale out a third at each target.

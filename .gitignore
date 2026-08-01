@@ -1,0 +1,17 @@
+# Secrets
+.env
+**/.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime data / generated artifacts
+TRADEIN/paper_trading/trades.json
+TRADEIN/paper_trading/paper_trades_journal.xlsx
+TRADEIN/analyzer.log*
+Graphs/*.png
+MailToMail/Scripts/
+
+# Manual backups (superseded by git history)
+BackUp/
