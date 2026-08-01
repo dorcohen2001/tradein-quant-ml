@@ -127,13 +127,7 @@ PAPER_TRADING_JOURNAL_XLSX = os.path.join(
 # ---------------------------------------------------------------------------
 # Live runner
 # ---------------------------------------------------------------------------
-CYCLE_INTERVAL_MINUTES = 15  # minutes between background position-refresh cycles
-
-# Full watchlist scans are expensive (hundreds of HTTP requests) and operate on
-# DAILY candles, which barely change intraday — so scans run only at these local
-# hours (first cycle at/after each hour), while open positions are refreshed
-# every cycle. Pass --scan-every-cycle to live_runner.py to restore old behavior.
-SCAN_HOURS = [9, 16]
+CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
 
 # ---------------------------------------------------------------------------
 # Daily analyzer (daily_tradein_analyzer.py)

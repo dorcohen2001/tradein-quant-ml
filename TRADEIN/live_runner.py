@@ -9,14 +9,12 @@ Ties together the screener, TA/macro/news engines, and trade generator to:
 
 Usage:
     python live_runner.py --asset-class both --top-n 2
-    python live_runner.py --skip-scan          # only refresh open paper trades
-    python live_runner.py --once               # run a single full cycle and exit
-    python live_runner.py --scan-every-cycle   # legacy behavior: scan on every cycle
+    python live_runner.py --skip-scan   # only refresh open paper trades
+    python live_runner.py --once        # run a single cycle and exit (no loop)
 
-Scheduling: open positions are refreshed every CYCLE_INTERVAL_MINUTES, but the
-full watchlist scan (hundreds of HTTP requests against DAILY candles that
-barely change intraday) runs only on the first cycle at/after each hour in
-config.SCAN_HOURS. `--once` always scans (it's a manual invocation).
+By default this script runs forever, executing one full scan/refresh cycle
+every CYCLE_INTERVAL_MINUTES (see config.py), sleeping in between. Stop it
+with Ctrl+C.
 """
 from __future__ import annotations
 
@@ -30,7 +28,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from config import CYCLE_INTERVAL_MINUTES, SCAN_HOURS, TOP_N_ASSETS
+from config import CYCLE_INTERVAL_MINUTES, TOP_N_ASSETS
 from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
 from news.news_analyzer import analyze_sentiment
@@ -156,12 +154,12 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
     return reports
 
 
-def run_cycle(args, do_scan: bool = True) -> None:
-    """Execute one position-refresh pass, plus a watchlist scan when due."""
+def run_cycle(args) -> None:
+    """Execute a single scan + position-refresh cycle."""
     print("[paper] Refreshing open paper trade positions...", file=sys.stderr)
     process_open_positions()
 
-    if args.skip_scan or not do_scan:
+    if args.skip_scan:
         return
 
     reports = run(args.asset_class, args.top_n, args.candidate_pool)
@@ -175,15 +173,6 @@ def run_cycle(args, do_scan: bool = True) -> None:
         print("\n" + "=" * 60 + "\n")
 
 
-def _next_due_scan(completed: set[tuple[dt.date, int]], now: dt.datetime) -> tuple[dt.date, int] | None:
-    """The (date, hour) scan slot that is due now and not yet completed."""
-    for hour in sorted(SCAN_HOURS):
-        slot = (now.date(), hour)
-        if now.hour >= hour and slot not in completed:
-            return slot
-    return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Live Paper Trading Runner with Telegram Alerts")
     parser.add_argument("--asset-class", choices=["stocks", "crypto", "both"], default="both",
@@ -193,23 +182,18 @@ def main():
     parser.add_argument("--candidate-pool", type=int, default=6,
                          help="How many top-scored candidates to evaluate before giving up (default: %(default)s)")
     parser.add_argument("--skip-scan", action="store_true",
-                         help="Never scan for new signals; only refresh existing open paper trades")
-    parser.add_argument("--scan-every-cycle", action="store_true",
-                         help="Scan the full watchlist on every cycle instead of only at SCAN_HOURS")
+                         help="Skip the new-signal scan and only refresh existing open paper trades")
     parser.add_argument("--once", action="store_true",
-                         help="Run a single full cycle (refresh + scan) and exit instead of looping")
+                         help="Run a single cycle and exit instead of looping forever")
     args = parser.parse_args()
 
     if args.once:
-        run_cycle(args, do_scan=True)
+        run_cycle(args)
         return
 
     print(f"[runner] Starting continuous execution loop "
-          f"(refresh every {CYCLE_INTERVAL_MINUTES} min; full scans at "
-          f"{'every cycle' if args.scan_every_cycle else f'hours {sorted(SCAN_HOURS)}'}). "
-          f"Press Ctrl+C to stop.", file=sys.stderr)
+          f"(every {CYCLE_INTERVAL_MINUTES} min). Press Ctrl+C to stop.", file=sys.stderr)
 
-    completed_scans: set[tuple[dt.date, int]] = set()
     cycle = 0
     while True:
         cycle += 1
@@ -217,18 +201,8 @@ def main():
         print(f"[cycle #{cycle}] START — {_timestamp()}", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
 
-        due_slot = _next_due_scan(completed_scans, dt.datetime.now())
-        do_scan = args.scan_every_cycle or due_slot is not None
-        if do_scan and not args.scan_every_cycle:
-            print(f"[runner] Scheduled scan slot {due_slot} is due — scanning watchlists.",
-                  file=sys.stderr)
-
         try:
-            run_cycle(args, do_scan=do_scan)
-            if due_slot is not None:
-                completed_scans.add(due_slot)
-                # keep only today's slots so the set doesn't grow forever
-                completed_scans = {s for s in completed_scans if s[0] == dt.date.today()}
+            run_cycle(args)
         except Exception as exc:
             print(f"[cycle #{cycle}] ERROR at {_timestamp()}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
