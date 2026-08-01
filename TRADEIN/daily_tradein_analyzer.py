@@ -57,6 +57,9 @@ _handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, enco
 _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(_handler)
 logger.addHandler(logging.StreamHandler(sys.stderr))
+# send_email.py's basicConfig installs a root handler; don't propagate to it
+# or every analyzer log line after the email stage prints twice.
+logger.propagate = False
 
 CLOSED_WITH_PNL = ("WIN_TP1", "WIN_TP2", "LOSS_SL")
 WIN_STATUSES = ("WIN_TP1", "WIN_TP2")
