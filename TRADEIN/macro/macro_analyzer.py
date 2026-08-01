@@ -96,9 +96,10 @@ def analyze_crypto_macro() -> MacroContext:
         "risk_sentiment_btc_5d_proxy": risk_sentiment,
         "btc_5d_return_pct": round(btc_5d_ret * 100, 2),
     }
+    usdt_d_str = f"{usdt_d_now:.2f}%" if usdt_d_now is not None else "n/a"
     summary = (
         f"BTC {btc_trend.title()} (${btc_price:,.2f}), ETH {eth_trend.title()} (${eth_price:,.2f}), "
-        f"USDT.D {usdt_d_now}%, BTC 5d momentum: {risk_sentiment} -> Regime: {regime}"
+        f"USDT.D {usdt_d_str}, BTC 5d momentum: {risk_sentiment} -> Regime: {regime}"
     )
     return MacroContext("crypto", regime, details, summary)
 
