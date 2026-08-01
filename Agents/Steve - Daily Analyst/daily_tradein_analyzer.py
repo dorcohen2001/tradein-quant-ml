@@ -47,6 +47,17 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# This script lives in Agents/Steve - Daily Analyst/, alongside the trading
+# system's own package at TRADEIN/TRADEIN/ (which owns config.py,
+# paper_trading/, etc.). Add that package directory to sys.path so the
+# imports below resolve regardless of the caller's cwd — mirrors how
+# config.py itself anchors every path to its own __file__ rather than to
+# whoever imports it.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRADEIN_PACKAGE_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "..", "TRADEIN"))
+if _TRADEIN_PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, _TRADEIN_PACKAGE_DIR)
+
 from config import (
     BACKTEST_TRADES_CSV,
     MAILTOMAIL_DIR,
@@ -55,7 +66,6 @@ from config import (
 )
 from paper_trading.tracker import get_all_trades
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(_SCRIPT_DIR, "analyzer.log")
 LLM_REQUEST_PATH = os.path.join(_SCRIPT_DIR, "llm_request.json")
 
