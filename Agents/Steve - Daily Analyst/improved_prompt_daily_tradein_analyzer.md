@@ -28,12 +28,11 @@ Compute from real data (no fabricated numbers):
 - Compute the same aggregates for the backtest CSV separately and label the two samples clearly (live vs. simulated).
 - If a metric can't be computed from the available data, say so explicitly in the report instead of inventing it.
 
-## Step 2 — Strategic Report Generation via LLM (cost-controlled)
-The script calls the Anthropic API with **computed aggregates only** and the LLM writes the narrative report. Hard requirements:
-- **Minimum-sample gate:** if fewer than `MIN_CLOSED_TRADES` (default 20) live trades are closed, SKIP the LLM call entirely. Archive and email a short deterministic status note instead ("N closed trades; insufficient sample for strategy revision") plus the backtest aggregates. This is the normal path early on — do not treat it as a failure.
-- **Compact payload:** send the LLM a small metrics JSON (~1–2 KB: live aggregates, backtest aggregates, last N closed trades). NEVER attach `trades.json`, the XLSX, or raw headline lists — the payload must not grow with history size.
-- **Static system prompt:** report format, role framing, and the no-code rules live in a fixed system prompt; only the metrics JSON changes per day. Cap `max_tokens` on the response (~2,000–4,000 output tokens is plenty).
-- API key via `.env` (`ANTHROPIC_API_KEY`); fail gracefully to a deterministic metrics-only report if the call fails.
+## Step 2 — Strategic Report Generation via local LLM handoff (no API key)
+No external LLM API is called and no API key is stored. The narrative is produced by a local LLM operator (Claude Code on this machine) via a two-phase handoff:
+- **Phase 1:** when at least `MIN_CLOSED_TRADES` (default 20) live trades are closed, the script prints the report instructions + a compact metrics JSON (~1–2 KB: live aggregates, backtest aggregates, last N closed trades), writes them to `llm_request.json`, and exits with code 3 ("narrative requested") without archiving/emailing. NEVER include `trades.json`, the XLSX, or raw headline lists — the payload must not grow with history size.
+- **Phase 2:** the operator generates the narrative Markdown and delivers it with `--narrative <file.md>`; the script appends a deterministic data appendix, then archives and emails.
+- **Minimum-sample gate:** below the threshold (or with `--no-llm`), skip the handoff and archive/email a short deterministic status note ("N closed trades; insufficient sample for strategy revision") plus the backtest aggregates. This is the normal unattended path early on — do not treat it as a failure.
 
 **Report content requirements:**
 - Bold, high-level strategic thinking — not minor parameter tweaks. Propose: new technical indicators, alternative risk-management frameworks, fundamental/macro filters, revised entry/exit logic, position-sizing changes, and hypotheses worth testing — each with rationale tied to the actual weaknesses found in Step 1.

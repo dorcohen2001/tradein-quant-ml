@@ -1,27 +1,35 @@
 """Daily Paper-Trading Analyzer, Report Generator & Email Dispatcher ("Steve").
 
-Pipeline (each stage isolated and logged to analyzer.log next to this script):
-  1. ANALYZE  — compute aggregate metrics from paper_trading/trades.json (live)
-                and backtest_suite/trades_log.csv (simulated), in Python.
-  2. REPORT   — if at least MIN_CLOSED_TRADES_FOR_LLM live trades are closed,
-                send ONLY the compact metrics JSON (~1-2 KB) to the Anthropic
-                API for a strategic narrative. Below the gate — the normal
-                case early on — skip the LLM entirely and emit a short
-                deterministic status report. Never attaches raw trade files,
-                so token cost does not grow with history size.
-  3. ARCHIVE  — save as report_YYYY-MM-DD.md in MailToMail/Scripts (overwrite;
-                the job is idempotent).
-  4. EMAIL    — send via MailToMail/send_email.py (subject
-                "TRADEIN Daily Report — YYYY-MM-DD", .md attached,
-                executive summary in the body).
+No external LLM API is called and no API key is required. The strategic
+narrative is produced by a *local* LLM operator (Claude Code running on this
+machine) through a two-phase handoff:
 
-Usage:
-    python daily_tradein_analyzer.py                 # full run
+  Phase 1 (analyze + request):
+      python daily_tradein_analyzer.py
+      - Computes aggregate metrics from paper_trading/trades.json (live) and
+        backtest_suite/trades_log.csv (simulated), in Python.
+      - If at least --min-closed live trades are closed, prints the report
+        instructions + compact metrics JSON, writes them to llm_request.json
+        next to this script, and exits with code 3 ("narrative requested").
+        Nothing is archived or emailed yet.
+      - Below the gate (or with --no-llm) it skips the narrative and goes
+        straight to archive + email with a deterministic metrics report.
+
+  Phase 2 (deliver):
+      python daily_tradein_analyzer.py --narrative path/to/narrative.md
+      - Takes the externally generated Markdown narrative, appends the
+        deterministic data appendix, archives the report as
+        MailToMail/Scripts/report_YYYY-MM-DD.md (overwrite; idempotent), and
+        emails it (subject "TRADEIN Daily Report — YYYY-MM-DD", .md attached,
+        executive summary in the body).
+
+Other usage:
     python daily_tradein_analyzer.py --no-email      # skip the email stage
-    python daily_tradein_analyzer.py --no-llm        # force the deterministic report
+    python daily_tradein_analyzer.py --no-llm        # deterministic report, full delivery
     python daily_tradein_analyzer.py --min-closed 5  # override the sample gate
 
-Exit codes: 0 = success, 1 = a stage failed (Task Scheduler surfaces this).
+Exit codes: 0 = success, 1 = a stage failed (Task Scheduler surfaces this),
+3 = metrics emitted, awaiting an externally generated narrative (phase 2).
 """
 from __future__ import annotations
 
@@ -40,8 +48,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from config import (
-    ANTHROPIC_API_KEY,
-    ANTHROPIC_MODEL,
     BACKTEST_TRADES_CSV,
     MAILTOMAIL_DIR,
     MIN_CLOSED_TRADES_FOR_LLM,
@@ -49,7 +55,13 @@ from config import (
 )
 from paper_trading.tracker import get_all_trades
 
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyzer.log")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(_SCRIPT_DIR, "analyzer.log")
+LLM_REQUEST_PATH = os.path.join(_SCRIPT_DIR, "llm_request.json")
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_NARRATIVE_REQUESTED = 3
 
 logger = logging.getLogger("daily_tradein_analyzer")
 logger.setLevel(logging.INFO)
@@ -64,9 +76,9 @@ logger.propagate = False
 CLOSED_WITH_PNL = ("WIN_TP1", "WIN_TP2", "LOSS_SL")
 WIN_STATUSES = ("WIN_TP1", "WIN_TP2")
 
-LLM_SYSTEM_PROMPT = """\
+NARRATIVE_INSTRUCTIONS = """\
 You are a senior trading-strategy analyst reviewing a systematic paper-trading
-program. You receive a JSON payload of pre-computed performance aggregates for
+program. Below is a JSON payload of pre-computed performance aggregates for
 two samples: "live" (real-time paper trades) and "backtest" (historical
 simulation of the exact same signal logic; note its entry-fill assumption is
 slightly optimistic).
@@ -86,7 +98,10 @@ Hard rules:
 - Use ONLY numbers present in the payload. If a metric is null or absent, say
   it could not be computed — never invent a value.
 - If the live sample is small, say so and weight the backtest sample instead.
-- Keep it under ~900 words."""
+- Keep it under ~900 words.
+
+When done, save the report as a Markdown file and deliver it with:
+    python daily_tradein_analyzer.py --narrative <path-to-file.md>"""
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +222,7 @@ def compute_backtest_metrics() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — report generation
+# Stage 2 — report assembly / narrative handoff
 # ---------------------------------------------------------------------------
 def _metrics_markdown(title: str, m: dict | None) -> str:
     if not m:
@@ -225,6 +240,14 @@ def _metrics_markdown(title: str, m: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _data_appendix(live: dict, backtest: dict | None) -> str:
+    return (
+        "\n\n---\n\n## Data Appendix (computed, not narrative)\n\n"
+        + _metrics_markdown("Live paper trades", live)
+        + "\n" + _metrics_markdown("Backtest (simulated)", backtest)
+    )
+
+
 def build_deterministic_report(live: dict, backtest: dict | None, gate_note: str) -> str:
     today = dt.date.today().isoformat()
     return (
@@ -236,87 +259,37 @@ def build_deterministic_report(live: dict, backtest: dict | None, gate_note: str
     )
 
 
-def generate_llm_report(live: dict, backtest: dict | None) -> str | None:
-    """Compact-payload Anthropic call. Returns the narrative Markdown, or None
-    on any failure (missing key/SDK, API error, safety refusal) so the caller
-    can fall back to the deterministic report."""
-    if not ANTHROPIC_API_KEY:
-        logger.warning("ANTHROPIC_API_KEY not set — falling back to deterministic report.")
-        return None
-    try:
-        import anthropic
-    except ImportError:
-        logger.warning("anthropic SDK not installed (pip install anthropic) — "
-                       "falling back to deterministic report.")
-        return None
-
+def emit_narrative_request(live: dict, backtest: dict | None) -> None:
+    """Phase 1 handoff: print + persist the instructions and metrics payload
+    for the local LLM operator (Claude Code). No API call is made."""
     payload = {
         "report_date": dt.date.today().isoformat(),
         "live": live,
         "backtest": backtest,
     }
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        # Server-side refusal fallback enabled: if the model's safety
-        # classifiers decline (unlikely for trading metrics, but possible),
-        # the API retries on Anthropic's recommended fallback model.
-        response = client.beta.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=4096,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            system=LLM_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": json.dumps(payload, indent=1)}],
-        )
-        if response.stop_reason == "refusal":
-            logger.warning("LLM declined the request (stop_reason=refusal).")
-            return None
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
-        if not text:
-            logger.warning("LLM returned no text content.")
-            return None
-        usage = response.usage
-        logger.info("LLM report generated (%s): in=%s out=%s tokens.",
-                    response.model, usage.input_tokens, usage.output_tokens)
-        return text
-    except Exception:
-        logger.exception("LLM call failed — falling back to deterministic report.")
-        return None
+    request = {"instructions": NARRATIVE_INSTRUCTIONS, "payload": payload}
+    with open(LLM_REQUEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(request, f, indent=2)
+
+    print("=" * 70)
+    print("NARRATIVE REQUESTED — local LLM generation required (no API call made)")
+    print(f"Request also written to: {LLM_REQUEST_PATH}")
+    print("=" * 70)
+    print("\n--- INSTRUCTIONS " + "-" * 52)
+    print(NARRATIVE_INSTRUCTIONS)
+    print("\n--- METRICS PAYLOAD (JSON) " + "-" * 42)
+    print(json.dumps(payload, indent=2))
+    print("=" * 70)
+    logger.info("Narrative request emitted to stdout and %s (exit code %d).",
+                LLM_REQUEST_PATH, EXIT_NARRATIVE_REQUESTED)
 
 
-def build_report(live: dict, backtest: dict | None, min_closed: int, no_llm: bool) -> str:
-    closed = live.get("closed_trades", 0)
-
-    if closed < min_closed:
-        gate_note = (
-            f"Only **{closed}** live paper trades are closed — below the "
-            f"{min_closed}-trade minimum for meaningful strategy analysis, so the "
-            f"LLM strategy review was skipped (this is the expected path early on; "
-            f"it saves the daily API cost until the sample is worth analyzing). "
-            f"The computed aggregates for both samples are below."
-        )
-        logger.info("Sample gate: %d closed < %d — deterministic report.", closed, min_closed)
-        return build_deterministic_report(live, backtest, gate_note)
-
-    if no_llm:
-        return build_deterministic_report(
-            live, backtest, "LLM narrative disabled via --no-llm; metrics only.")
-
-    narrative = generate_llm_report(live, backtest)
-    if narrative is None:
-        return build_deterministic_report(
-            live, backtest,
-            "The LLM strategy review could not be generated today (see analyzer.log); "
-            "the computed metrics are below.")
-
-    # Append a deterministic data appendix so the archived report always
-    # carries the exact computed numbers, independent of the narrative.
-    appendix = (
-        "\n\n---\n\n## Data Appendix (computed, not LLM-generated)\n\n"
-        + _metrics_markdown("Live paper trades", live)
-        + "\n" + _metrics_markdown("Backtest (simulated)", backtest)
-    )
-    return narrative + appendix
+def load_narrative(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        narrative = f.read().strip()
+    if not narrative:
+        raise ValueError(f"narrative file {path} is empty")
+    return narrative
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +338,12 @@ def email_report(report_path: str, report_md: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="TRADEIN daily paper-trading analyzer")
     parser.add_argument("--no-email", action="store_true", help="skip the email stage")
-    parser.add_argument("--no-llm", action="store_true", help="skip the LLM narrative")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="skip the narrative handoff; deliver the deterministic report")
+    parser.add_argument("--narrative", metavar="FILE",
+                        help="phase 2: deliver an externally generated narrative Markdown file")
     parser.add_argument("--min-closed", type=int, default=MIN_CLOSED_TRADES_FOR_LLM,
-                        help="minimum closed live trades before calling the LLM "
+                        help="minimum closed live trades before requesting a narrative "
                              "(default: %(default)s)")
     args = parser.parse_args()
 
@@ -390,15 +366,40 @@ def main() -> int:
         backtest = None
         failed = True
 
-    # Stage 2 — report (build_report never raises; it degrades internally)
-    report_md = build_report(live, backtest, args.min_closed, args.no_llm)
+    # Stage 2 — assemble the report (or hand off for narrative generation)
+    closed = live.get("closed_trades", 0)
+    if args.narrative:
+        try:
+            narrative = load_narrative(args.narrative)
+        except Exception:
+            logger.exception("Could not read narrative file %s.", args.narrative)
+            return EXIT_FAILED
+        logger.info("Using externally generated narrative from %s.", args.narrative)
+        report_md = narrative + _data_appendix(live, backtest)
+    elif closed < args.min_closed:
+        gate_note = (
+            f"Only **{closed}** live paper trades are closed — below the "
+            f"{args.min_closed}-trade minimum for meaningful strategy analysis, so the "
+            f"strategy narrative was skipped (this is the expected path early on). "
+            f"The computed aggregates for both samples are below."
+        )
+        logger.info("Sample gate: %d closed < %d — deterministic report.",
+                    closed, args.min_closed)
+        report_md = build_deterministic_report(live, backtest, gate_note)
+    elif args.no_llm:
+        report_md = build_deterministic_report(
+            live, backtest, "Narrative disabled via --no-llm; metrics only.")
+    else:
+        # Phase 1 handoff: emit the request and stop — no archive/email yet.
+        emit_narrative_request(live, backtest)
+        return EXIT_NARRATIVE_REQUESTED
 
     # Stage 3 — archive whatever was produced
     try:
         report_path = archive_report(report_md)
     except Exception:
         logger.exception("Archive stage failed.")
-        return 1
+        return EXIT_FAILED
 
     # Stage 4 — email
     if args.no_email:
@@ -415,7 +416,7 @@ def main() -> int:
             failed = True
 
     logger.info("=== daily_tradein_analyzer done (failed=%s) ===", failed)
-    return 1 if failed else 0
+    return EXIT_FAILED if failed else EXIT_OK
 
 
 if __name__ == "__main__":

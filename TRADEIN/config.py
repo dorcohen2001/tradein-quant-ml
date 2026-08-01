@@ -132,9 +132,7 @@ CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
 # ---------------------------------------------------------------------------
 # Daily analyzer (daily_tradein_analyzer.py)
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5")
-MIN_CLOSED_TRADES_FOR_LLM = 20  # below this, skip the LLM call (sample too small)
+MIN_CLOSED_TRADES_FOR_LLM = 20  # below this, skip the narrative handoff (sample too small)
 REPORT_ARCHIVE_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "MailToMail", "Scripts")
 )

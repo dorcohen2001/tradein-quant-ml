@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 
 # Runtime data / generated artifacts
+TRADEIN/llm_request.json
 TRADEIN/paper_trading/trades.json
 TRADEIN/paper_trading/paper_trades_journal.xlsx
 TRADEIN/analyzer.log*
