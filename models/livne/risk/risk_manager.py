@@ -24,6 +24,7 @@ from config import (
     TP1_MIN_RR,
     TP2_MAX_RR,
     TP2_TARGET_RR,
+    TP_MIN_SEPARATION_RR,
 )
 from ta.candles import is_bearish_engulfing, is_bullish_engulfing
 from ta.mtfa import MTFASetup
@@ -132,20 +133,34 @@ def _intraday_target2(direction: str, setup: MTFASetup, entry_price: float, risk
     have run to the breakeven stop every time and TP2 would be decorative.
 
     The 15m swing is the reachable structural objective; the clamp then keeps
-    TP2 sane when even that is unhelpfully close or far."""
+    TP2 sane when even that is unhelpfully close or far.
+
+    TP2 is additionally guaranteed to sit at least `TP_MIN_SEPARATION_RR`
+    beyond TP1. Previously it was floored at `max(MIN_RISK_REWARD,
+    TP2_TARGET_RR)` = 2.0R, which collided exactly with a TP1 that had itself
+    been clamped to TP1_MAX_RR = 2.0R -- producing two identical target prices
+    (seen live on LRCX and SMH). The floor is now relative to wherever TP1
+    actually landed, so the two tiers can never coincide.
+    """
     itf_extreme = setup.itf_swing_high if direction == "LONG" else setup.itf_swing_low
-    lo_bound = entry_price + risk * TP1_MAX_RR if direction == "LONG" else entry_price - risk * TP1_MAX_RR
-    hi_bound = entry_price + risk * TP2_MAX_RR if direction == "LONG" else entry_price - risk * TP2_MAX_RR
 
-    candidate = itf_extreme if itf_extreme else 0.0
+    # Minimum acceptable TP2, in R -- always strictly beyond TP1.
+    tp1_rr = abs(target1 - entry_price) / risk
+    min_tp2_rr = max(tp1_rr + TP_MIN_SEPARATION_RR, TP2_TARGET_RR, MIN_RISK_REWARD)
+    # The ceiling must never be pulled back below that floor, or the clamp
+    # would silently re-collapse TP2 onto TP1 for a very wide TP1.
+    max_tp2_rr = max(TP2_MAX_RR, min_tp2_rr)
+
     if direction == "LONG":
-        if candidate <= max(target1, lo_bound):
-            candidate = entry_price + risk * max(MIN_RISK_REWARD, TP2_TARGET_RR)
-        return min(candidate, hi_bound)
+        floor_price = entry_price + risk * min_tp2_rr
+        ceil_price = entry_price + risk * max_tp2_rr
+        candidate = itf_extreme if itf_extreme and itf_extreme > floor_price else floor_price
+        return min(candidate, ceil_price)
 
-    if candidate <= 0 or candidate >= min(target1, lo_bound):
-        candidate = entry_price - risk * max(MIN_RISK_REWARD, TP2_TARGET_RR)
-    return max(candidate, hi_bound)
+    floor_price = entry_price - risk * min_tp2_rr
+    ceil_price = entry_price - risk * max_tp2_rr
+    candidate = itf_extreme if itf_extreme and 0 < itf_extreme < floor_price else floor_price
+    return max(candidate, ceil_price)
 
 
 def compute_targets(direction: str, setup: MTFASetup, entry_price: float, stop: float) -> dict:
@@ -184,6 +199,17 @@ def compute_targets(direction: str, setup: MTFASetup, entry_price: float, stop: 
             target1 = structural_tp1
 
         target2 = _intraday_target2("SHORT", setup, entry_price, risk, target1)
+
+    # Invariant: the two exit tiers must be genuinely distinct and correctly
+    # ordered. `_intraday_target2` already guarantees this; the check is
+    # repeated here as a last line of defence because a TP1 == TP2 alert is
+    # silently wrong rather than loudly broken -- validate_min_rr passes it,
+    # the message renders fine, and the tracker books a TP1 partial only to
+    # close the remainder at the identical price.
+    ordered = target2 > target1 if direction == "LONG" else target2 < target1
+    if not ordered:
+        step = risk * TP_MIN_SEPARATION_RR
+        target2 = target1 + step if direction == "LONG" else target1 - step
 
     if target1 <= 0 or target2 <= 0:
         return {"target1": None, "target2": None}

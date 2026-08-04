@@ -114,6 +114,20 @@ TP2_MAX_RR = 4.0        # ceiling on TP2. Without it, TP2 inherits the zone-time
                         # extreme -- an entire multi-month leg away -- and an intraday trade
                         # can never reach it (observed 7.5R on ETH, 14.3R on BTC).
 
+# TP2 must clear TP1 by at least this much R. Without it the two targets could
+# land on the SAME price: whenever structural resistance sat beyond TP1_MAX_RR,
+# TP1 clamped to exactly 2.0R while TP2's fallback was also 2.0R
+# (max(MIN_RISK_REWARD, TP2_TARGET_RR)). Both printed 2.00R at an identical
+# price -- observed live on LRCX and SMH -- and validate_min_rr could not catch
+# it because both legs individually cleared their floors. A two-tier exit whose
+# tiers are the same price is not a two-tier exit: the runner would book the
+# TP1 partial and immediately close the remainder at the same level.
+#
+# 0.75R is chosen so the clamped case (TP1 = 2.0R) yields TP2 = 2.75R, landing
+# inside the requested 2.5R-3.0R band WITHOUT raising TP1's floor -- which must
+# stay at 1.0R so high-certainty 1:1-1:2 setups are still dispatched.
+TP_MIN_SEPARATION_RR = 0.75
+
 # ---------------------------------------------------------------------------
 # Moving averages -- trend benchmark
 # ---------------------------------------------------------------------------

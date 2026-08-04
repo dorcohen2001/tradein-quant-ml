@@ -128,6 +128,17 @@ _STATUS_EMOJI = {
     "EXPIRED": "⌛",
 }
 
+# ACTIVE is the only status in this notifier that OPENS exposure: price just
+# reached the planned entry zone and the paper position went live. Every other
+# status closes some or all of it. The header used to be hardcoded to
+# "EXIT ALERT", so an entry fill was announced as an exit -- exactly backwards,
+# and easy to misread at a glance in a busy chat.
+_ENTRY_STATUSES = frozenset({"ACTIVE"})
+
+
+def _alert_header(status: str) -> str:
+    return "🔵 ENTRY ALERT" if status in _ENTRY_STATUSES else "🔴 EXIT ALERT"
+
 
 def _format_status_update(trade: dict) -> str:
     """Status values like `PARTIAL_TP1`/`LOSS_SL_BE` contain underscores and
@@ -141,7 +152,7 @@ def _format_status_update(trade: dict) -> str:
     emoji = _STATUS_EMOJI.get(status, "ℹ️")
 
     lines = [
-        f"[{escape_markdown(MODEL_NAME)}] 🔴 EXIT ALERT",
+        f"[{escape_markdown(MODEL_NAME)}] {_alert_header(status)}",
         f"{emoji} *PAPER TRADE UPDATE* — `{escape_markdown_code(trade['ticker'])}` ({escape_markdown(trade['direction'])})",
         f"Status: *{escape_markdown(status)}*",
     ]
