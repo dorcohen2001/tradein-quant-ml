@@ -69,11 +69,15 @@ CRYPTO_BENCHMARK = "BTCUSDT"
 # ---------------------------------------------------------------------------
 # Screening thresholds
 # ---------------------------------------------------------------------------
-# Liquidity is gated on a 20-day SMA of dollar volume (Close * Volume) rather
+# Liquidity is gated on a rolling SMA of dollar volume (Close * Volume) rather
 # than a single day's reading, so one noisy bar can't flip a name in or out.
 # No static minimum stock price -- a hard $5 floor was dropped in favor of
 # the dollar-volume/market-cap filters actually doing the liquidity work.
-DOLLAR_VOLUME_SMA_LOOKBACK = 20
+#
+# INTRADAY: lookback cut 20 -> 7 trading days. On an intraday horizon what
+# matters is whether a name is liquid and active *this week* -- a 20-day mean
+# smooths straight over the volume shift that makes a name tradeable today.
+DOLLAR_VOLUME_SMA_LOOKBACK = 7
 # Each is a single tunable value chosen as the midpoint of the requested
 # band -- the code needs one number to gate on. Adjust directly if you want
 # to run nearer either edge of the range.
@@ -87,8 +91,28 @@ MIN_STOCK_MARKET_CAP = 1_000_000_000  # $1B floor; excludes micro-caps
 VOLUME_SPIKE_MULT = 1.5               # default multiplier for ta_engine.volume_spike() when a caller doesn't override it
 RS_LOOKBACK_DAYS = 5                  # relative strength window
 EARNINGS_BLACKOUT_HOURS = 48          # exclude stocks with earnings this soon
-MIN_RISK_REWARD = 3.0                 # minimum 1:3 R:R (final target) for any generated trade
 TOP_N_ASSETS = 2                      # number of setups produced per run
+
+# Minimum daily bars required before a ticker is evaluated. INTRADAY: cut
+# 60 -> 25. Daily bars now only supply regime/context and the most recent
+# structure shift or consolidation breakout; ~5 weeks is enough for that,
+# and demanding a full quarter needlessly excluded names.
+MIN_DAILY_HISTORY_BARS = 25
+
+# ---------------------------------------------------------------------------
+# Risk/reward floors -- INTRADAY recalibration.
+#
+# The old swing floors (TP1 >= 1:2, TP2 >= 1:3) are unreachable on a 15m
+# trigger and would have starved the funnel to near-zero signals. The hard
+# rule is now simply: never risk more than the reward. A high-certainty setup
+# offering 1:1-1:2 is a legitimate intraday trade and is dispatched, not
+# discarded; TP2 still reaches for 1:2+ whenever structure actually allows it.
+# ---------------------------------------------------------------------------
+MIN_RISK_REWARD = 1.0   # HARD floor on the final target -- reject anything below 1:1
+TP2_TARGET_RR = 2.0     # what TP2 aims for when no structural level provides better
+TP2_MAX_RR = 4.0        # ceiling on TP2. Without it, TP2 inherits the zone-timeframe swing
+                        # extreme -- an entire multi-month leg away -- and an intraday trade
+                        # can never reach it (observed 7.5R on ETH, 14.3R on BTC).
 
 # ---------------------------------------------------------------------------
 # Moving averages -- trend benchmark
@@ -103,14 +127,39 @@ PRIMARY_MA_PERIOD = 200
 SECONDARY_MA_PERIOD = 150
 
 # ---------------------------------------------------------------------------
-# Multi-Timeframe Analysis (MTFA)
+# Multi-Timeframe Analysis (MTFA) -- INTRADAY mapping ("Option B")
+#
+# Target holding period is minutes to a few hours, so the whole ladder moved
+# down. The previous mapping (Weekly/Monthly context, 12H/8H/4H vote, 4H
+# trigger) could not produce an intraday trade at all: the trigger candle
+# alone took four hours to close.
+#
+#   CONTEXT      daily              -- regime / overall direction bias only
+#   DISCOVERY    weekly, daily, 12h -- where the key S/R, order blocks and
+#                                      pivots actually live (top-down)
+#   REFINE       4h, 3h, 1h         -- precision-tighten those zone edges
+#   EXECUTION    15m trigger, with 5m + 1h confirmation
+#
+# Binance intervals are native except 3h, which is resampled from 1h.
+# yfinance has no 12h/4h/3h either, so those are resampled from 1h as well;
+# 15m/5m are fetched natively (60-day history cap, ample for a 200-period MA).
 # ---------------------------------------------------------------------------
-# Binance kline intervals are native; yfinance has no 4H/8H/12H so those are
-# built by resampling 1H bars (see utils.data_fetch.resample_ohlc).
-HTF_INTERVALS = {"crypto": {"monthly": "1M", "weekly": "1w"},
-                  "stocks": {"monthly": "1mo", "weekly": "1wk"}}
-ITF_INTERVALS_CRYPTO = ["12h", "8h", "4h"]        # native Binance intervals
-ITF_RESAMPLE_RULES_STOCKS = ["12h", "8h", "4h"]   # pandas resample rules from 1H bars
+ZONE_DISCOVERY_TFS = ["weekly", "daily", "12h"]
+ZONE_REFINE_TFS = ["4h", "3h", "1h"]
+LTF_TRIGGER_TF = "15m"
+LTF_CONFIRM_TFS = ["5m", "1h"]
+
+# EMA200 alignment vote now runs on the execution ladder rather than 12H/8H/4H.
+LTF_ALIGNMENT_TFS = ["1h", "15m", "5m"]
+LTF_MA_MIN_ALIGNED = 2  # how many of the 3 must agree with PRIMARY_MA_PERIOD trend alignment
+
+# Per-asset-class interval strings. `None` => build by resampling 1h bars.
+TF_INTERVALS = {
+    "crypto": {"weekly": "1w", "daily": "1d", "12h": "12h", "4h": "4h",
+               "3h": None, "1h": "1h", "15m": "15m", "5m": "5m"},
+    "stocks": {"weekly": "1wk", "daily": "1d", "12h": None, "4h": None,
+               "3h": None, "1h": "1h", "15m": "15m", "5m": "5m"},
+}
 
 RSI_PERIOD = 14
 RSI_PIVOT_LEFT = 16
@@ -118,26 +167,82 @@ RSI_PIVOT_RIGHT = 5
 DIVERGENCE_MIN_BAR_GAP = 5     # min bars between compared pivots
 DIVERGENCE_MAX_BAR_GAP = 60    # max bars between compared pivots
 
-OB_LOOKBACK_BARS = 80          # HTF bars scanned for order blocks
+OB_LOOKBACK_BARS = 80          # bars scanned for order blocks on each zone timeframe
 OB_IMPULSE_ATR_MULT = 2.0      # impulse candle must exceed this multiple of ATR
 OB_STRUCTURE_LOOKBACK = 20     # bars used to detect the swing high/low the impulse must break
-HTF_ZONE_PROXIMITY_PCT = 0.04  # price must be within +/-4% of a HTF support/resistance/OB/Fib level to count as
-                                # "at the zone" -- widened from 2% to catch setups developing just outside a tight band
-ITF_MA200_MIN_ALIGNED = 2      # how many of the 3 ITF timeframes must agree with PRIMARY_MA_PERIOD trend alignment
 
-# Stage A confluence *scoring* input (see screener._score_candidate), NOT a
-# hard gate -- weekly volume vs its N-week average at the matched HTF zone.
-# Institutional absorption/accumulation at real structure often prints on
-# near-average or even red weekly bars (a "low-volume retest"); directional
-# confirmation and volume triggers belong downstream in Stage B (braking
-# event + ITF volume spike). 1.00 = baseline average; a zone touch on any
-# volume still passes Stage A, above-average volume just scores a bonus.
+# INTRADAY: proximity tightened 4.0% -> 1.25%. At intraday scale +/-4% spans
+# an entire session's range, so nearly every bar counted as "at a zone" and
+# the gate stopped discriminating at all.
+HTF_ZONE_PROXIMITY_PCT = 0.0125
+
+# Discovery zones are coarse; refinement timeframes must confirm price is at
+# the zone within a tighter band before it counts as a precision-refined zone.
+ZONE_REFINE_PROXIMITY_PCT = 0.005
+
+# Minimum bars required on a zone/refine timeframe before it is used. INTRADAY:
+# the old 60-bar weekly floor is gone -- only the most recent structural swings
+# and pivots matter now, not deep history.
+MIN_ZONE_HISTORY_BARS = 30
+
+# EMA200 as a structural anchor. A touch/reaction at the 200 EMA on a refine
+# timeframe is treated as a high-certainty barrier in its own right, not just
+# an alignment vote -- price rarely slices it cleanly on first contact.
+EMA200_ANCHOR_PROXIMITY_PCT = 0.004
+EMA200_ANCHOR_SCORE_BONUS = 0.15
+
+# Zone-timeframe volume confluence -- a *scoring* input (see
+# screener._score_candidate), NOT a gate. Institutional absorption at real
+# structure often prints on near-average or even red bars (a "low-volume
+# retest"); the mandatory directional volume proof lives on the execution
+# timeframe instead (see LTF_VOLUME_* below).
 HTF_VOLUME_CONFLUENCE_MULT = 1.00
-HTF_VOLUME_CONFLUENCE_LOOKBACK = 20    # weeks
+HTF_VOLUME_CONFLUENCE_LOOKBACK = 20
 
-ITF_VOLUME_SPIKE_MULT = 1.10    # ITF reversal candle volume vs N-period SMA -- adaptive scaling: 1.05-1.10x is
-                                 # enough for a Daily/Weekly swing execution timeframe (was 1.5x)
-ITF_VOLUME_LOOKBACK = 20
+# ---------------------------------------------------------------------------
+# MANDATORY directional volume confirmation on the 15m trigger candle.
+#
+# This is a hard gate and it is DIRECTIONAL -- a raw volume spike is no longer
+# sufficient, because a spike on the wrong side of the market is exactly what
+# a failed reversal looks like:
+#
+#   LONG  -> buyer volume surge: the bullish reversal candle itself must print
+#            expanded volume vs its N-bar average.
+#   SHORT -> seller volume expansion on the rejection candle, ideally preceded
+#            by buyer exhaustion (volume drying up into the rally high).
+#
+# Exhaustion is measured and reported (it feeds the score and the thesis text)
+# but only the expansion leg is mandatory -- requiring both would reject
+# legitimate sharp reversals that turn without a slow bleed first.
+# ---------------------------------------------------------------------------
+LTF_VOLUME_SURGE_MULT = 1.30      # reversal candle volume vs its N-bar SMA -- HARD gate
+LTF_VOLUME_LOOKBACK = 20
+LTF_EXHAUSTION_LOOKBACK = 5       # bars of the prior push checked for fading volume
+LTF_EXHAUSTION_MAX_RATIO = 0.95   # prior-push avg volume below this multiple of baseline = exhaustion
+
+# ---------------------------------------------------------------------------
+# Candlestick reversal certainty (high weight).
+#
+# A volume climax or a market-structure shift ALONE no longer qualifies as a
+# trigger -- an explicit, direction-matching reversal formation is required:
+#
+#   LONG  -> doji followed by a strong bullish engulfing (highest conviction),
+#            a bullish engulfing, a hammer, or a high-conviction pin bar.
+#   SHORT -> doji followed by a bearish engulfing, a bearish engulfing,
+#            a shooting star, or a high-conviction pin bar.
+#
+# Volume climax / structure shift are retained as *confluence* flags that add
+# conviction score, which is how they now earn their keep.
+# ---------------------------------------------------------------------------
+REVERSAL_PIN_BAR_WICK_RATIO = 0.60   # stricter than the old 0.50 -- "high conviction" pin bar
+REVERSAL_SCAN_BARS = 3               # how many recent trigger-TF bars are scanned for the formation
+REVERSAL_CONVICTION = {              # score contribution per formation, 0-1
+    "doji_then_engulfing": 1.00,
+    "engulfing": 0.85,
+    "hammer": 0.75,
+    "shooting_star": 0.75,
+    "pin_bar_rejection": 0.65,
+}
 
 # Stage B: the ITF trigger no longer requires price strictly contained inside
 # the [0.5, 0.786] Fib golden zone -- a clear support/resistance reaction
@@ -163,15 +268,44 @@ BRAKING_STRUCTURE_LOOKBACK = 10  # bars checked for a fresh Market Structure Shi
 # ---------------------------------------------------------------------------
 # Risk management / multi-tier take-profit
 # ---------------------------------------------------------------------------
-TP1_MIN_RR = 2.0    # TP1 must clear at least 1:2 (recalibrated floor)
-TP1_MAX_RR = 3.0    # TP1 targets the 1:2-1:3 band when a structural level allows
+# INTRADAY: TP1 band recalibrated from 1:2-1:3 down to 1:1-1:2. A 15m trigger
+# rarely offers 2R to the first structural level; insisting on it rejected
+# essentially every valid intraday setup.
+TP1_MIN_RR = 1.0    # TP1 must clear at least 1:1
+TP1_MAX_RR = 2.0    # TP1 targets the 1:1-1:2 band when a structural level allows
 TP1_CLOSE_PCT = 0.5 # fraction of position closed at TP1
 ACCOUNT_RISK_PCT = 0.01  # illustrative %-of-account risk used only to label alert size
 ILLUSTRATIVE_ACCOUNT_SIZE = 10_000  # purely for the alert's informational position-size note; no real capital is tracked
-STOP_STRUCTURAL_BUFFER_PCT = 0.005  # extra cushion placed beyond the chosen structural stop level
-STOP_MAX_ATR_MULT = 5.0  # hard cap on stop distance: min(structural distance, this many ATRs) -- guards
-                          # against a stale/extreme structural level (e.g. a far-away 52-week high/low)
-                          # blowing the risk distance out to something unrealistic (and TP1/TP2 negative)
+
+# ---------------------------------------------------------------------------
+# Liquidity-sweep stop buffer (ATR-scaled).
+#
+#     buffer = max(STOP_ATR_BUFFER_MULT * ATR(trigger_tf), price * STOP_MIN_TICK_PCT)
+#
+# Replaces the old flat 0.5% cushion, which was catastrophically oversized
+# intraday: on a $200 stock it placed the stop a full dollar beyond structure
+# while a typical 15m ATR is ~$0.15, so the buffer alone exceeded a realistic
+# intraday target and forced every setup to fail the R:R gate.
+#
+# Scaling by ATR on the trigger timeframe makes the cushion proportional to
+# the noise actually present right now, which is the thing that produces
+# liquidity sweeps of a structural level. The tick floor keeps the buffer
+# non-zero when ATR is unavailable or the instrument is very quiet.
+# ---------------------------------------------------------------------------
+STOP_ATR_BUFFER_MULT = 0.25    # k in the formula above (requested band: 0.20-0.30)
+# 0.005% of price -- a genuine FLOOR, deliberately set an order of magnitude
+# below the ATR term so it binds only when ATR is unavailable or the
+# instrument is unusually quiet. At 0.02% it was actually exceeding
+# 0.25 x ATR(15m) on both a $200 stock and BTC, which silently replaced the
+# ATR scaling with a flat percentage -- the exact behaviour being removed.
+# 0.005% of $200 is one cent, i.e. a real minimum tick.
+STOP_MIN_TICK_PCT = 0.00005
+
+# Hard cap on stop DISTANCE (not the buffer): min(structural distance, N * ATR).
+# INTRADAY: 5.0 -> 2.5. Structural levels are now sourced from 4H/1H zones
+# while ATR is measured on 15m, so an un-tightened cap would let a 4H swing
+# level place a stop many multiples of intraday range away.
+STOP_MAX_ATR_MULT = 2.5
 
 # ---------------------------------------------------------------------------
 # Dynamic trend-reversal + volume exit (backtest daily-bar early-exit signal).
@@ -265,7 +399,11 @@ COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 # it and defeating the whole point).
 # ---------------------------------------------------------------------------
 YF_CACHE_DIR = os.path.join(RUNTIME_DIR, "cache", "yfinance")
-YF_OHLCV_CACHE_SECONDS = 1800       # 30 min -- daily/intraday-1H history bars
+YF_OHLCV_CACHE_SECONDS = 1800       # 30 min -- daily/weekly context bars, which barely move intraday
+YF_INTRADAY_CACHE_SECONDS = 180     # 3 min -- 15m/5m/1H execution bars. Must stay well under the
+                                     # 15m bar period or the trigger timeframe would be evaluated
+                                     # against a bar that closed two cycles ago.
+YF_INTRADAY_STALE_FALLBACK_SECONDS = 900  # 15 min -- outage safety net for the intraday fetchers
 YF_METADATA_CACHE_SECONDS = 24 * 3600  # 24h -- market cap barely moves intraday; earnings dates are known in advance
 YF_STALE_FALLBACK_SECONDS = 72 * 3600  # how far past expiry a cached value may still be served as an emergency
                                         # fallback if every retry fails (e.g. a sustained rate-limit outage) --
@@ -310,9 +448,32 @@ PAPER_TRADING_STORE = os.path.join(RUNTIME_DIR, "stores", "trades_livne.json")
 PAPER_TRADING_JOURNAL_XLSX = os.path.join(RUNTIME_DIR, "journals", "trade_journal_livne.xlsx")
 
 # ---------------------------------------------------------------------------
-# Live runner
+# Live runner -- INTRADAY cadence
+#
+# Livne now cycles every 2 minutes: a trade meant to live 20 minutes cannot be
+# managed on a 15-minute poll, which gave it roughly one stop/target check for
+# its entire lifetime.
+#
+# Two things are deliberately NOT sped up with it:
+#
+#   BITON_CYCLE_INTERVAL_MINUTES -- Biton is a separate, frozen production
+#   model and must keep its existing 15-minute rhythm. Livne's runner invokes
+#   it on this independent schedule instead of once per Livne cycle, which
+#   would otherwise have multiplied Biton's run rate (and its API load) ~7x
+#   purely as a side effect of a Livne-only change.
+#
+#   FUNNEL_EXPORT_INTERVAL_MINUTES -- the funnel tracer re-runs the entire
+#   gate chain for every watchlist ticker. At a 2-minute cadence that is ~30
+#   reports/hour, which would churn through the 50-file retention in under two
+#   hours and roughly double scan cost for a purely diagnostic artifact.
 # ---------------------------------------------------------------------------
-CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
+CYCLE_INTERVAL_MINUTES = 2
+BITON_CYCLE_INTERVAL_MINUTES = 15
+FUNNEL_EXPORT_INTERVAL_MINUTES = 15
+
+# Intraday signals go stale fast. A setup that has not been entered within a
+# few hours no longer reflects the structure that produced it.
+PENDING_EXPIRY_HOURS = 6
 
 # ---------------------------------------------------------------------------
 # Execution / fill-price simulation

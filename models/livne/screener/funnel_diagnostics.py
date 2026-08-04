@@ -37,11 +37,12 @@ from config import (
     EARNINGS_BLACKOUT_HOURS,
     FUNNEL_LOG_DIR,
     FUNNEL_LOG_RETENTION_PER_MODEL,
-    ITF_INTERVALS_CRYPTO,
-    ITF_MA200_MIN_ALIGNED,
-    ITF_VOLUME_LOOKBACK,
-    ITF_VOLUME_SPIKE_MULT,
+    LTF_ALIGNMENT_TFS,
+    LTF_MA_MIN_ALIGNED,
+    LTF_TRIGGER_TF,
+    LTF_VOLUME_SURGE_MULT,
     MIN_CRYPTO_DOLLAR_VOLUME_SMA20,
+    MIN_DAILY_HISTORY_BARS,
     MIN_STOCK_DOLLAR_VOLUME_SMA20,
     MIN_STOCK_MARKET_CAP,
     PRIMARY_MA_PERIOD,
@@ -52,19 +53,30 @@ from macro.macro_analyzer import MacroContext
 from risk.risk_manager import compute_stop, compute_targets, validate_min_rr
 from screener.market_screener import _dollar_volume_sma
 from strategy.strategy_engine import entry_zone
-from ta.mtfa import MTFASetup, _fetch_htf, _fetch_itf, _within, detect_braking_event, fib_reaction, htf_pass, swing_excluding_recent
-from ta.ta_engine import add_moving_averages, atr, fibonacci_levels, volume_spike
+from ta.candles import detect_reversal_formation, directional_volume_confirmation
+from ta.mtfa import (
+    MTFASetup,
+    _fetch_frames,
+    _ma_alignment_vote,
+    _within,
+    _zone_frame_ok,
+    fib_reaction,
+    map_zones_top_down,
+    swing_excluding_recent,
+)
+from ta.divergence import DivergenceResult
+from ta.ta_engine import add_moving_averages, atr, determine_trend, fibonacci_levels
 from utils.data_fetch import get_binance_klines, get_next_earnings_date, get_stock_history, get_stock_market_cap
 
 SCAN_WORKERS = 8  # matches screener.market_screener's concurrency
 
 STAGE_COLUMNS = [
-    ("liquidity", "Liquidity / Volume Filter"),
-    ("htf_zone_volume_confluence", "Stage A: HTF Zone Match"),
-    ("braking_event", "Stage B: Reversal / Braking Event"),
-    ("itf_volume_spike", "Stage B: ITF Volume Spike"),
-    ("ma_alignment", "Stage B: 200MA Alignment"),
-    ("fib_confluence", "Stage B: Fib Containment / Reaction"),
+    ("liquidity", "Liquidity / Volume Filter (7d)"),
+    ("htf_zone_volume_confluence", "Zone Map: Top-Down Discovery + Refine"),
+    ("braking_event", "Trigger: Reversal Formation (15m)"),
+    ("itf_volume_spike", "Trigger: Directional Volume Confirmation"),
+    ("ma_alignment", "Trigger: 200MA Alignment (1h/15m/5m)"),
+    ("fib_confluence", "Trigger: Fib Containment / Reaction"),
     ("macro_regime", "Macro Correlation Regime"),
     ("risk_validation", "Risk Validation (SL/TP1/TP2 + Min R:R)"),
 ]
@@ -100,8 +112,8 @@ def _trace_ticker(ticker: str, asset_class: str, macro: MacroContext) -> TickerF
         else:
             df = get_stock_history(ticker, period="1y", interval="1d")
 
-        if df.empty or len(df) < 60:
-            rec.mark("liquidity", False, "insufficient history (<60 bars)")
+        if df.empty or len(df) < MIN_DAILY_HISTORY_BARS:
+            rec.mark("liquidity", False, f"insufficient history (<{MIN_DAILY_HISTORY_BARS} daily bars)")
             return rec
         rec.price = float(df["Close"].iloc[-1])
 
@@ -109,7 +121,7 @@ def _trace_ticker(ticker: str, asset_class: str, macro: MacroContext) -> TickerF
         rec.dollar_volume = dollar_volume
         floor = MIN_CRYPTO_DOLLAR_VOLUME_SMA20 if asset_class == "crypto" else MIN_STOCK_DOLLAR_VOLUME_SMA20
         if dollar_volume < floor:
-            rec.mark("liquidity", False, f"SMA20 dollar volume ${dollar_volume:,.0f} < ${floor:,.0f}")
+            rec.mark("liquidity", False, f"7d dollar volume ${dollar_volume:,.0f} < ${floor:,.0f}")
             return rec
 
         if asset_class == "stocks":
@@ -127,67 +139,75 @@ def _trace_ticker(ticker: str, asset_class: str, macro: MacroContext) -> TickerF
                     return rec
         rec.mark("liquidity", True)
 
-        # --- Stage A: HTF zone match (ta.mtfa.htf_pass). Weekly volume vs its
-        # N-week average is NOT a gate here -- it's a confluence-score bonus
-        # (screener._score_candidate); a zone touch on any volume passes.
-        htf_frames = _fetch_htf(ticker, asset_class)
-        htf = htf_pass(htf_frames["weekly"], htf_frames.get("monthly"))
-        if htf is None:
-            rec.mark("htf_zone_volume_confluence", False, "no HTF zone match (support/resistance/OB/Fib) within proximity")
+        # --- Zone map: top-down discovery (weekly/daily/12h) + refinement
+        # (4h/3h/1h). Zone-timeframe volume is NOT a gate -- it's a confluence
+        # score bonus; a zone touch on any volume passes.
+        frames = _fetch_frames(ticker, asset_class)
+        trigger_df = frames.get(LTF_TRIGGER_TF)
+        if trigger_df is None or trigger_df.empty or len(trigger_df) < 30:
+            rec.mark("htf_zone_volume_confluence", False, f"insufficient {LTF_TRIGGER_TF} history")
             return rec
-        rec.mark("htf_zone_volume_confluence", True, f"weekly vol {htf['htf_volume_ratio']}x avg")
-        direction = htf["direction"]
-        rec.direction = direction
-
-        # --- Stage B: ITF trigger (ta.mtfa.analyze_mtfa's internal sequence) ---
-        primary_col = f"EMA{PRIMARY_MA_PERIOD}"
-        itf_frames = _fetch_itf(ticker, asset_class)
-
-        trigger_df = itf_frames.get("4h")
-        if trigger_df is None or trigger_df.empty or len(trigger_df) < 20:
-            rec.mark("braking_event", False, "insufficient 4H history")
-            return rec
-
-        braking_pattern, braking_tf = None, None
-        for tf in ("4h", "1h"):
-            tf_df = itf_frames.get(tf)
-            if tf_df is None or tf_df.empty:
-                continue
-            found, pattern = detect_braking_event(tf_df, direction)
-            if found:
-                braking_pattern, braking_tf = pattern, tf
-                break
-        if braking_pattern is None:
-            rec.mark("braking_event", False, "no pin-bar/pattern/volume-climax/MSS on 4H or 1H")
-            return rec
-        rec.mark("braking_event", True, f"{braking_pattern} on {braking_tf}")
-
-        vol_spike_ok, vol_ratio = volume_spike(trigger_df, mult=ITF_VOLUME_SPIKE_MULT, lookback=ITF_VOLUME_LOOKBACK)
-        if not vol_spike_ok:
-            rec.mark("itf_volume_spike", False, f"{vol_ratio}x < {ITF_VOLUME_SPIKE_MULT}x required")
-            return rec
-        rec.mark("itf_volume_spike", True, f"{vol_ratio}x")
-
-        ma_aligned_count = 0
-        for tf in ITF_INTERVALS_CRYPTO:  # 12h/8h/4h
-            tf_df = itf_frames.get(tf)
-            if tf_df is None or tf_df.empty or len(tf_df) < PRIMARY_MA_PERIOD + 10:
-                continue
-            tf_df = add_moving_averages(tf_df, periods=(PRIMARY_MA_PERIOD,))
-            last = tf_df.iloc[-1]
-            if pd.isna(last.get(primary_col)):
-                continue
-            if direction == "LONG" and float(last["Close"]) >= float(last[primary_col]):
-                ma_aligned_count += 1
-            elif direction == "SHORT" and float(last["Close"]) <= float(last[primary_col]):
-                ma_aligned_count += 1
-        if ma_aligned_count < ITF_MA200_MIN_ALIGNED:
-            rec.mark("ma_alignment", False, f"{ma_aligned_count}/3 timeframes aligned, need {ITF_MA200_MIN_ALIGNED}")
-            return rec
-        rec.mark("ma_alignment", True, f"{ma_aligned_count}/3")
-
         itf_price = float(trigger_df["Close"].iloc[-1])
         rec.price = itf_price
+
+        daily = frames.get("daily")
+        htf_trend = determine_trend(add_moving_averages(daily)) if _zone_frame_ok(daily) else "UNKNOWN"
+
+        long_map = map_zones_top_down("LONG", itf_price, frames)
+        short_map = map_zones_top_down("SHORT", itf_price, frames)
+        if long_map and short_map:
+            if htf_trend == "UPTREND":
+                direction, zone_map = "LONG", long_map
+            elif htf_trend == "DOWNTREND":
+                direction, zone_map = "SHORT", short_map
+            else:
+                rec.mark("htf_zone_volume_confluence", False,
+                         "price at both support and resistance, daily context neutral -- ambiguous")
+                return rec
+        elif long_map:
+            direction, zone_map = "LONG", long_map
+        elif short_map:
+            direction, zone_map = "SHORT", short_map
+        else:
+            rec.mark("htf_zone_volume_confluence", False,
+                     "no zone match on weekly/daily/12h within proximity")
+            return rec
+
+        refined = "/".join(sorted({r["tf"] for r in zone_map["refined"]})) or "none"
+        rec.mark("htf_zone_volume_confluence", True,
+                 f"{zone_map['zone_type']} on {zone_map['zone_tf']}, refined: {refined}")
+        rec.direction = direction
+
+        # --- Trigger: explicit reversal FORMATION on the 15m frame ---
+        found, pattern, conviction, bar_offset = detect_reversal_formation(trigger_df, direction)
+        if not found:
+            rec.mark("braking_event", False,
+                     f"no engulfing/hammer/shooting-star/pin-bar formation on {LTF_TRIGGER_TF}")
+            return rec
+        rec.mark("braking_event", True, f"{pattern} (conviction {conviction:.2f}, {bar_offset} bars back)")
+
+        # --- Trigger: MANDATORY directional volume confirmation ---
+        formation_df = trigger_df.iloc[: len(trigger_df) - bar_offset]
+        volume_ok, vdetail = directional_volume_confirmation(formation_df, direction)
+        if not volume_ok:
+            reason = (f"{vdetail['ratio']}x < {LTF_VOLUME_SURGE_MULT}x required"
+                      if vdetail["direction_ok"] else
+                      f"candle leans against {direction} ({vdetail['ratio']}x volume)")
+            rec.mark("itf_volume_spike", False, reason)
+            return rec
+        vol_ratio = vdetail["ratio"]
+        rec.mark("itf_volume_spike", True,
+                 f"{vol_ratio}x" + (" + exhaustion" if vdetail.get("exhaustion") else ""))
+
+        # --- Trigger: 200MA alignment across 1h/15m/5m ---
+        ma_aligned_count = _ma_alignment_vote(direction, frames)
+        n_align = len(LTF_ALIGNMENT_TFS)
+        if ma_aligned_count < LTF_MA_MIN_ALIGNED:
+            rec.mark("ma_alignment", False,
+                     f"{ma_aligned_count}/{n_align} aligned, need {LTF_MA_MIN_ALIGNED}")
+            return rec
+        rec.mark("ma_alignment", True, f"{ma_aligned_count}/{n_align}")
+
         itf_hi, itf_lo = swing_excluding_recent(trigger_df)
         itf_fib = fibonacci_levels(itf_hi, itf_lo)
         contained = _within(itf_price, itf_fib["0.5"], itf_fib["0.786"])
@@ -207,19 +227,23 @@ def _trace_ticker(ticker: str, asset_class: str, macro: MacroContext) -> TickerF
         # this reuses the exact same structural levels evaluate_setup would) ---
         atr_val = atr(trigger_df).iloc[-1]
         trigger_ma = add_moving_averages(trigger_df, periods=(PRIMARY_MA_PERIOD,))
-        ema_val = trigger_ma[primary_col].iloc[-1]
+        ema_val = trigger_ma[f"EMA{PRIMARY_MA_PERIOD}"].iloc[-1]
 
         setup = MTFASetup(
             ticker=ticker, asset_class=asset_class, price=itf_price, direction_bias=direction,
-            htf_trend=htf["htf_trend"], htf_zone_type=htf["zone_type"], htf_zone=htf["zone"],
-            divergence=htf["divergence"], order_blocks=htf["obs"],
-            nearest_support=htf["near"].get("nearest_support"), nearest_resistance=htf["near"].get("nearest_resistance"),
-            swing_high=htf["hi"], swing_low=htf["lo"], fib_levels=htf["fib"], monthly_trend=htf["monthly_trend"],
-            itf_trigger_tf=braking_tf, itf_pattern=braking_pattern, itf_volume_ratio=vol_ratio,
+            htf_trend=htf_trend, htf_zone_type=zone_map["zone_type"], htf_zone=zone_map["zone"],
+            divergence=zone_map.get("divergence") or DivergenceResult(),
+            order_blocks=zone_map["order_blocks"],
+            nearest_support=zone_map["nearest_support"], nearest_resistance=zone_map["nearest_resistance"],
+            swing_high=zone_map["swing_high"], swing_low=zone_map["swing_low"],
+            fib_levels=zone_map["fib"], monthly_trend=htf_trend,
+            itf_trigger_tf=LTF_TRIGGER_TF, itf_pattern=pattern, itf_volume_ratio=vol_ratio,
             itf_ma200_aligned_count=ma_aligned_count, itf_fib_levels=itf_fib,
             itf_ema200=(None if pd.isna(ema_val) else float(ema_val)),
             itf_atr=(None if pd.isna(atr_val) else float(atr_val)), thesis="",
-            htf_volume_ratio=htf["htf_volume_ratio"],
+            htf_volume_ratio=0.0,
+            zone_tf=zone_map["zone_tf"], reversal_conviction=conviction,
+            ema200_anchor=zone_map["ema200_anchor"], volume_detail=vdetail,
         )
 
         entry_low, entry_high = entry_zone(direction, itf_price)

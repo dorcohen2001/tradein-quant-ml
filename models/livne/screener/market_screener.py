@@ -28,9 +28,12 @@ from config import (
     CRYPTO_BENCHMARK,
     DOLLAR_VOLUME_SMA_LOOKBACK,
     EARNINGS_BLACKOUT_HOURS,
+    EMA200_ANCHOR_SCORE_BONUS,
     HTF_VOLUME_CONFLUENCE_MULT,
-    ITF_VOLUME_SPIKE_MULT,
+    LTF_ALIGNMENT_TFS,
+    LTF_VOLUME_SURGE_MULT,
     MIN_CRYPTO_DOLLAR_VOLUME_SMA20,
+    MIN_DAILY_HISTORY_BARS,
     MIN_STOCK_DOLLAR_VOLUME_SMA20,
     MIN_STOCK_MARKET_CAP,
     RS_LOOKBACK_DAYS,
@@ -53,9 +56,11 @@ SCAN_WORKERS = 8  # concurrent fetch/analyze workers per watchlist scan
 
 
 def _dollar_volume_sma(df: pd.DataFrame, lookback: int = DOLLAR_VOLUME_SMA_LOOKBACK) -> float:
-    """20-day SMA of Close * Volume -- a dynamic liquidity metric that a
+    """Rolling SMA of Close * Volume -- a dynamic liquidity metric that a
     single noisy bar can't flip in or out, unlike a last-bar dollar-volume
-    check."""
+    check. INTRADAY: the window is now 7 trading days rather than 20, so a
+    name that has just become active is recognised as tradeable this week
+    instead of being averaged back down by three quiet weeks."""
     dollar_volume = df["Close"] * df["Volume"]
     return float(dollar_volume.tail(lookback).mean())
 
@@ -98,25 +103,34 @@ def _score_candidate(decision: StrategyDecision, dollar_volume: float, rs_pct: f
     breakdown = {}
     setup = decision.setup
 
-    # --- TA confluence (0-1): HTF zone + divergence + ITF primary-MA alignment + monthly bias + weekly volume bonus ---
-    ta_score = 0.25  # a decision only exists if a valid HTF zone was already matched
+    # --- TA confluence (0-1) ---
+    # INTRADAY reweighting. Reversal-formation CERTAINTY is now the single
+    # largest component: on a 15m chart the quality of the reversal candle is
+    # what separates a real turn from noise, far more than it was on a weekly
+    # swing setup. The EMA200 anchor and zone refinement are the other two
+    # intraday-specific additions.
+    ta_score = 0.10  # a decision only exists if a zone was already matched
+    ta_score += setup.reversal_conviction * 0.30          # explicit reversal formation quality
+    if setup.ema200_anchor is not None:
+        ta_score += EMA200_ANCHOR_SCORE_BONUS             # price pressed against the 200 EMA
+    if setup.zone_refined_tfs:
+        ta_score += 0.10                                  # zone survived precision refinement on 4h/3h/1h
     if (setup.direction_bias == "LONG" and setup.divergence.bullish) or \
        (setup.direction_bias == "SHORT" and setup.divergence.bearish):
-        ta_score += 0.20
-    ta_score += (setup.itf_ma200_aligned_count / 3) * 0.20
-    ta_score += _monthly_bias_score(decision.direction, setup.monthly_trend) * 0.15
-    # Weekly volume confluence at the HTF zone is a scoring bonus, not a gate
-    # (see ta.mtfa.htf_pass) -- a low-volume retest still qualifies, it just
-    # scores lower on this component than a zone touch backed by real volume.
+        ta_score += 0.10
+    ta_score += (setup.itf_ma200_aligned_count / len(LTF_ALIGNMENT_TFS)) * 0.15
+    ta_score += _monthly_bias_score(decision.direction, setup.monthly_trend) * 0.10
     if setup.htf_volume_ratio >= HTF_VOLUME_CONFLUENCE_MULT:
-        ta_score += 0.20
+        ta_score += 0.05
     ta_score = min(ta_score, 1.0)
     breakdown["ta_confluence"] = round(ta_score * w["ta_confluence"], 1)
 
     # --- Volume / liquidity (0-1): SMA20 dollar-volume gate + ITF volume spike + liquidity-cluster confluence ---
     liquidity_floor = MIN_CRYPTO_DOLLAR_VOLUME_SMA20 if decision.asset_class == "crypto" else MIN_STOCK_DOLLAR_VOLUME_SMA20
     liquidity_gate = 1.0 if dollar_volume >= liquidity_floor else 0.0
-    itf_vol_component = min(setup.itf_volume_ratio / ITF_VOLUME_SPIKE_MULT, 1.0)
+    itf_vol_component = min(setup.itf_volume_ratio / LTF_VOLUME_SURGE_MULT, 1.0)
+    if setup.volume_detail.get("exhaustion"):
+        itf_vol_component = min(itf_vol_component + 0.25, 1.0)  # exhaustion into the extreme adds conviction
     if decision.liquidity.favored_direction == decision.direction:
         liquidity_confluence = 1.0
     elif decision.liquidity.favored_direction is None:
@@ -144,7 +158,7 @@ def _score_candidate(decision: StrategyDecision, dollar_volume: float, rs_pct: f
 def _scan_stock_ticker(ticker: str, bench_ret: float, macro: MacroContext) -> Candidate | None:
     try:
         df = get_stock_history(ticker, period="1y", interval="1d")
-        if df.empty or len(df) < 60:
+        if df.empty or len(df) < MIN_DAILY_HISTORY_BARS:
             return None
 
         dollar_volume = _dollar_volume_sma(df)
@@ -187,7 +201,7 @@ def _scan_stock_ticker(ticker: str, bench_ret: float, macro: MacroContext) -> Ca
 def _scan_crypto_symbol(symbol: str, bench_ret: float, macro: MacroContext) -> Candidate | None:
     try:
         df = get_binance_klines(symbol, interval="1d", limit=300)
-        if df.empty or len(df) < 60:
+        if df.empty or len(df) < MIN_DAILY_HISTORY_BARS:
             return None
 
         dollar_volume = _dollar_volume_sma(df)

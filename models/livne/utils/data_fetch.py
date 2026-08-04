@@ -28,6 +28,8 @@ from config import (
     ORDERBOOK_DEPTH_LIMIT,
     REQUEST_TIMEOUT,
     YF_CACHE_DIR,
+    YF_INTRADAY_CACHE_SECONDS,
+    YF_INTRADAY_STALE_FALLBACK_SECONDS,
     YF_METADATA_CACHE_SECONDS,
     YF_OHLCV_CACHE_SECONDS,
     YF_RETRY_DELAYS,
@@ -47,7 +49,9 @@ _HISTORY_CACHE_SECONDS = 1800  # 30-minute buckets for crypto/CoinGecko daily-ca
 # equivalent stock paths already avoid this via the zero-TTL _live_price_cache;
 # this is the crypto counterpart.
 _INTRADAY_CACHE_SECONDS = 60
-_LIVE_INTRADAY_INTERVALS = frozenset({"1m", "3m", "5m", "15m"})
+_MIDRANGE_CACHE_SECONDS = 300
+_LIVE_INTRADAY_INTERVALS = frozenset({"1m", "3m", "5m", "15m", "30m"})
+_MIDRANGE_INTERVALS = frozenset({"1h", "2h", "3h", "4h"})
 
 
 def _bucket(seconds: int = _HISTORY_CACHE_SECONDS) -> int:
@@ -55,9 +59,17 @@ def _bucket(seconds: int = _HISTORY_CACHE_SECONDS) -> int:
 
 
 def _bucket_seconds_for(interval: str) -> int:
-    """Cache-bucket width for a Binance interval: short for the live intraday
-    intervals above, the normal history bucket for everything else."""
-    return _INTRADAY_CACHE_SECONDS if interval in _LIVE_INTRADAY_INTERVALS else _HISTORY_CACHE_SECONDS
+    """Cache-bucket width for a Binance interval, tiered to the bar period.
+
+    A cache entry must never outlive the bar it describes, or the strategy
+    evaluates a candle that already closed. With the intraday mapping the 15m
+    trigger and the 5m/1h confirmations are all on the hot path, so they get
+    short buckets; only the daily/weekly context frames keep the long one."""
+    if interval in _LIVE_INTRADAY_INTERVALS:
+        return _INTRADAY_CACHE_SECONDS
+    if interval in _MIDRANGE_INTERVALS:
+        return _MIDRANGE_CACHE_SECONDS
+    return _HISTORY_CACHE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +80,11 @@ _metadata_cache = cached_call(YF_CACHE_DIR, YF_METADATA_CACHE_SECONDS, YF_STALE_
 # ttl_seconds=0: always re-fetch: live price/position-tracking data must stay fresh, never routinely served
 # stale. Still gets retry/backoff, and a short (3-min) stale fallback purely as an outage safety net.
 _live_price_cache = cached_call(YF_CACHE_DIR, 0, 180, YF_RETRY_DELAYS)
+# Execution-timeframe bars (15m/5m): short TTL so the trigger candle is never
+# evaluated from a bar that has already closed. See config's YF_INTRADAY_*.
+_intraday_cache = cached_call(
+    YF_CACHE_DIR, YF_INTRADAY_CACHE_SECONDS, YF_INTRADAY_STALE_FALLBACK_SECONDS, YF_RETRY_DELAYS,
+)
 
 
 @_ohlcv_cache
@@ -173,9 +190,32 @@ def _fetch_stock_intraday_1h(ticker: str) -> pd.DataFrame:
 
 
 def get_stock_intraday_1h(ticker: str) -> pd.DataFrame:
-    """1H OHLCV history for `ticker`, the base resolution stock ITF (4H/8H/12H)
-    bars are resampled from."""
+    """1H OHLCV history for `ticker` -- the base resolution the coarser stock
+    zone frames (12H/4H/3H) are resampled from, since yfinance offers none of
+    them natively."""
     return _fetch_stock_intraday_1h(ticker).copy()
+
+
+@_intraday_cache
+def _fetch_stock_intraday(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+    if df.empty:
+        return df
+    df.index = pd.to_datetime(df.index)
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def get_stock_intraday(ticker: str, interval: str = "15m", period: str | None = None) -> pd.DataFrame:
+    """Sub-hourly stock OHLCV for the execution timeframes (15m trigger, 5m
+    confirmation).
+
+    yfinance caps sub-hourly history: 1m to ~7 days, everything else from 2m
+    to 90m to ~60 days. `period` defaults to the largest window the requested
+    interval actually allows, which still leaves ample bars for a 200-period
+    MA (200 x 15m is under 8 trading days; 200 x 5m is under 3)."""
+    if period is None:
+        period = "7d" if interval == "1m" else "60d"
+    return _fetch_stock_intraday(ticker, interval, period).copy()
 
 
 @_live_price_cache

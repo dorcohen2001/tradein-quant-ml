@@ -56,11 +56,13 @@ if hasattr(sys.stdout, "reconfigure"):
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
 from config import (
+    BITON_CYCLE_INTERVAL_MINUTES,
     BITON_LIVE_RUNNER,
     BITON_MODEL_DIR,
     BITON_PHASE_TIMEOUT_SECONDS,
     CHART_OUTPUT_DIR,
     CYCLE_INTERVAL_MINUTES,
+    FUNNEL_EXPORT_INTERVAL_MINUTES,
     MODEL_NAME,
     TOP_N_ASSETS,
 )
@@ -283,20 +285,63 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
     return reports
 
 
+class _IntervalGate:
+    """Fires at most once per `minutes`, independent of the caller's cadence.
+
+    Livne now cycles every 2 minutes (intraday), but two things must NOT
+    inherit that rate:
+
+      Biton -- a separate, frozen production model. It is invoked on its own
+      15-minute schedule so a Livne-only timeframe change does not silently
+      multiply Biton's run rate and API load by ~7x. Its behaviour is
+      unchanged from before the intraday switch.
+
+      The funnel export -- a diagnostic that re-runs the whole gate chain for
+      every watchlist ticker. Per-cycle at 2 minutes it would emit ~30
+      reports/hour, churn through the 50-file retention in under two hours,
+      and roughly double scan cost for something no trade depends on.
+
+    First call always fires, so a freshly started runner does both immediately
+    rather than waiting out a full interval.
+    """
+
+    def __init__(self, minutes: float) -> None:
+        self.interval = dt.timedelta(minutes=minutes)
+        self.last: dt.datetime | None = None
+
+    def due(self) -> bool:
+        now = dt.datetime.now()
+        if self.last is None or (now - self.last) >= self.interval:
+            self.last = now
+            return True
+        return False
+
+
+_biton_gate = _IntervalGate(BITON_CYCLE_INTERVAL_MINUTES)
+_funnel_gate = _IntervalGate(FUNNEL_EXPORT_INTERVAL_MINUTES)
+
+
 def run_cycle(args) -> None:
-    """Execute a single scan + position-refresh cycle for BOTH models:
-    position management for Biton then Livne, followed (unless --skip-scan)
-    by the market screen for Biton then Livne -- matching the order each
-    model's own alerts/paper-trades are generated in."""
-    _run_biton_phase("positions", args.asset_class, args.top_n, args.candidate_pool)
+    """Execute a single scan + position-refresh cycle.
+
+    Livne's own position management and scan run every cycle (every
+    CYCLE_INTERVAL_MINUTES, now 2 min). Biton is interleaved in the same
+    order as before -- positions then scan, Biton before Livne -- but only on
+    the cycles where its own 15-minute gate is due."""
+    biton_due = _biton_gate.due()
+
+    if biton_due:
+        _run_biton_phase("positions", args.asset_class, args.top_n, args.candidate_pool)
     print(f"[{MODEL_NAME}] Refreshing open paper trade positions...", file=sys.stderr)
     process_open_positions()
 
     if args.skip_scan:
         return
 
-    _run_biton_phase("scan", args.asset_class, args.top_n, args.candidate_pool)
-    reports = run(args.asset_class, args.top_n, args.candidate_pool)
+    if biton_due:
+        _run_biton_phase("scan", args.asset_class, args.top_n, args.candidate_pool)
+    reports = run(args.asset_class, args.top_n, args.candidate_pool,
+                  export_funnel=_funnel_gate.due())
 
     if not reports:
         print("No high-conviction setups found today across the scanned watchlist.")

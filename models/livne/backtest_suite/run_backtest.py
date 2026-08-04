@@ -1,5 +1,20 @@
 """Main CLI launcher for the backtesting suite.
 
+!! SCOPE WARNING -- READ BEFORE TRUSTING THESE RESULTS !!
+The live Livne model moved to an INTRADAY mapping (daily/weekly context,
+top-down zone map, 15m trigger with 5m/1h confirmation). This backtest still
+walks DAILY bars and approximates the trigger with a daily-bar proxy, because
+that is the only history this dataset holds -- neither yfinance nor the
+Binance pagination here supplies years of 15m candles.
+
+It therefore no longer reproduces the live entry logic: it cannot see the
+15m reversal formation, the directional volume confirmation, or the
+precision-refined zones. It remains useful for exercising the structural
+primitives (htf_pass, stop/target construction, the R:R gate) against real
+price history, but its win rate is NOT an estimate of live intraday
+performance. Validating the intraday rules needs an intraday dataset.
+
+
 Walks day-by-day through a historical window and, on each date T, feeds only
 data up to and including T into the *same* production structural building
 blocks used by the live pipeline: `ta.mtfa.htf_pass` (structure/OB/RSI
@@ -65,8 +80,8 @@ from backtest_suite.simulator import TradeOutcome, simulate_trade
 from config import (
     BACKTEST_TRADES_CSV,
     CRYPTO_BENCHMARK,
-    ITF_VOLUME_LOOKBACK,
-    ITF_VOLUME_SPIKE_MULT,
+    LTF_VOLUME_LOOKBACK,
+    LTF_VOLUME_SURGE_MULT,
     MIN_CRYPTO_DOLLAR_VOLUME_SMA20,
     MIN_STOCK_DOLLAR_VOLUME_SMA20,
     PRIMARY_MA_PERIOD,
@@ -178,7 +193,7 @@ def ta_mtfa_backtest(ticker: str, asset_class: str, sliced_daily: pd.DataFrame, 
     if not braking_found:
         return None
 
-    vol_ok, vol_ratio = volume_spike(sliced_daily, mult=ITF_VOLUME_SPIKE_MULT, lookback=ITF_VOLUME_LOOKBACK)
+    vol_ok, vol_ratio = volume_spike(sliced_daily, mult=LTF_VOLUME_SURGE_MULT, lookback=LTF_VOLUME_LOOKBACK)
     if not vol_ok:
         return None
 

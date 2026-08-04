@@ -20,7 +20,14 @@ from dataclasses import asdict, dataclass
 
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
-from config import CYCLE_INTERVAL_MINUTES, EMERGENCY_CANDLE_LOOKBACK, MAX_SLIPPAGE_PCT, PAPER_TRADING_STORE, TP1_CLOSE_PCT
+from config import (
+    CYCLE_INTERVAL_MINUTES,
+    EMERGENCY_CANDLE_LOOKBACK,
+    MAX_SLIPPAGE_PCT,
+    PAPER_TRADING_STORE,
+    PENDING_EXPIRY_HOURS,
+    TP1_CLOSE_PCT,
+)
 from core.utils.market_hours import is_market_open
 from paper_trading import journal
 from risk.risk_manager import detect_emergency_reversal
@@ -31,7 +38,11 @@ from utils.data_fetch import (
     get_stock_fast_info,
 )
 
-PENDING_EXPIRY_DAYS = 5  # a signal not triggered within this many days is stale
+# INTRADAY: expiry is now measured in HOURS, not days. A 15m-triggered setup
+# that has not filled within a few hours no longer reflects the structure that
+# produced it; leaving it PENDING for 5 days meant stale signals could fill
+# against a completely different market.
+PENDING_EXPIRY = dt.timedelta(hours=PENDING_EXPIRY_HOURS)
 
 
 @dataclass
@@ -243,7 +254,7 @@ def update_open_positions() -> list[dict]:
                 trade["current_status"] = "ACTIVE"
                 trade["entry_date"] = _now()
                 changed.append(trade)
-            elif (dt.datetime.now() - signal_dt).days >= PENDING_EXPIRY_DAYS:
+            elif (dt.datetime.now() - signal_dt) >= PENDING_EXPIRY:
                 trade["current_status"] = "EXPIRED"
                 trade["exit_date"] = _now()
                 changed.append(trade)

@@ -17,15 +17,43 @@ from config import (
     EMERGENCY_VOLUME_MULT,
     ILLUSTRATIVE_ACCOUNT_SIZE,
     MIN_RISK_REWARD,
+    STOP_ATR_BUFFER_MULT,
     STOP_MAX_ATR_MULT,
-    STOP_STRUCTURAL_BUFFER_PCT,
+    STOP_MIN_TICK_PCT,
     TP1_MAX_RR,
     TP1_MIN_RR,
+    TP2_MAX_RR,
+    TP2_TARGET_RR,
 )
 from ta.candles import is_bearish_engulfing, is_bullish_engulfing
 from ta.mtfa import MTFASetup
 from ta.order_blocks import nearest_unmitigated
 from ta.ta_engine import volume_spike
+
+
+def liquidity_sweep_buffer(price: float, atr_value: float | None) -> float:
+    """Dynamic cushion placed BEYOND the structural stop level, sized to the
+    noise actually present on the trigger timeframe:
+
+        buffer = max(STOP_ATR_BUFFER_MULT * ATR(15m), price * STOP_MIN_TICK_PCT)
+
+    Stops resting exactly on an obvious swing low / order-block edge are the
+    liquidity that gets swept: price pokes through, fills the resting stops,
+    and reverses. A cushion proportional to current ATR keeps the stop just
+    outside that noise band without inflating risk when the market is quiet.
+
+    This replaces a flat 0.5% cushion, which was wildly oversized once the
+    model moved intraday -- on a $200 stock it sat a full dollar beyond
+    structure while a typical 15m ATR is ~$0.15, so the buffer alone exceeded
+    any realistic intraday target and forced every setup below the R:R floor.
+
+    The tick floor keeps the buffer meaningful when ATR is missing or the
+    instrument is unusually quiet.
+    """
+    tick_floor = abs(price) * STOP_MIN_TICK_PCT
+    if not atr_value or atr_value <= 0:
+        return tick_floor
+    return max(atr_value * STOP_ATR_BUFFER_MULT, tick_floor)
 
 
 def _apply_atr_distance_cap(entry_price: float, raw_stop: float, atr_value: float | None, direction: str) -> float:
@@ -69,7 +97,7 @@ def compute_stop(direction: str, setup: MTFASetup, entry_price: float) -> float 
             candidates.append(setup.swing_low)
         raw_stop = min(candidates)
         raw_stop = _apply_atr_distance_cap(entry_price, raw_stop, setup.itf_atr, direction)
-        stop = raw_stop * (1 - STOP_STRUCTURAL_BUFFER_PCT)
+        stop = raw_stop - liquidity_sweep_buffer(entry_price, setup.itf_atr)
         return stop if stop < entry_price else None
     else:
         if setup.nearest_resistance:
@@ -88,8 +116,36 @@ def compute_stop(direction: str, setup: MTFASetup, entry_price: float) -> float 
             candidates.append(setup.swing_high)
         raw_stop = max(candidates)
         raw_stop = _apply_atr_distance_cap(entry_price, raw_stop, setup.itf_atr, direction)
-        stop = raw_stop * (1 + STOP_STRUCTURAL_BUFFER_PCT)
+        stop = raw_stop + liquidity_sweep_buffer(entry_price, setup.itf_atr)
         return stop if stop > entry_price else None
+
+
+def _intraday_target2(direction: str, setup: MTFASetup, entry_price: float, risk: float, target1: float) -> float:
+    """TP2 from the TRIGGER timeframe's swing extreme, clamped into
+    [TP1_MAX_RR, TP2_MAX_RR].
+
+    The swing-timeframe extreme (`setup.swing_high`/`swing_low`) is deliberately
+    NOT used here any more. Those come from the zone-DISCOVERY frames
+    (weekly/daily/12h), so on an intraday trade they sit an entire multi-month
+    leg away -- live examples priced TP2 at 7.5R on ETH and 14.3R on BTC, which
+    a position meant to live minutes to hours can never reach. The trade would
+    have run to the breakeven stop every time and TP2 would be decorative.
+
+    The 15m swing is the reachable structural objective; the clamp then keeps
+    TP2 sane when even that is unhelpfully close or far."""
+    itf_extreme = setup.itf_swing_high if direction == "LONG" else setup.itf_swing_low
+    lo_bound = entry_price + risk * TP1_MAX_RR if direction == "LONG" else entry_price - risk * TP1_MAX_RR
+    hi_bound = entry_price + risk * TP2_MAX_RR if direction == "LONG" else entry_price - risk * TP2_MAX_RR
+
+    candidate = itf_extreme if itf_extreme else 0.0
+    if direction == "LONG":
+        if candidate <= max(target1, lo_bound):
+            candidate = entry_price + risk * max(MIN_RISK_REWARD, TP2_TARGET_RR)
+        return min(candidate, hi_bound)
+
+    if candidate <= 0 or candidate >= min(target1, lo_bound):
+        candidate = entry_price - risk * max(MIN_RISK_REWARD, TP2_TARGET_RR)
+    return max(candidate, hi_bound)
 
 
 def compute_targets(direction: str, setup: MTFASetup, entry_price: float, stop: float) -> dict:
@@ -116,9 +172,7 @@ def compute_targets(direction: str, setup: MTFASetup, entry_price: float, stop: 
         else:
             target1 = structural_tp1
 
-        target2 = setup.swing_high
-        if target2 <= target1:
-            target2 = entry_price + risk * max(MIN_RISK_REWARD, TP1_MAX_RR * 1.5)
+        target2 = _intraday_target2("LONG", setup, entry_price, risk, target1)
     else:
         structural_tp1 = setup.nearest_support
         rr1 = (entry_price - structural_tp1) / risk if structural_tp1 else 0.0
@@ -129,9 +183,7 @@ def compute_targets(direction: str, setup: MTFASetup, entry_price: float, stop: 
         else:
             target1 = structural_tp1
 
-        target2 = setup.swing_low
-        if target2 >= target1:
-            target2 = entry_price - risk * max(MIN_RISK_REWARD, TP1_MAX_RR * 1.5)
+        target2 = _intraday_target2("SHORT", setup, entry_price, risk, target1)
 
     if target1 <= 0 or target2 <= 0:
         return {"target1": None, "target2": None}

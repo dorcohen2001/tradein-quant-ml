@@ -8,7 +8,18 @@ from __future__ import annotations
 
 import pandas as pd
 
-from config import BRAKING_PIN_BAR_WICK_RATIO, BRAKING_SMALL_BODY_RATIO, BRAKING_VOLUME_CLIMAX_MULT
+from config import (
+    BRAKING_PIN_BAR_WICK_RATIO,
+    BRAKING_SMALL_BODY_RATIO,
+    BRAKING_VOLUME_CLIMAX_MULT,
+    LTF_EXHAUSTION_LOOKBACK,
+    LTF_EXHAUSTION_MAX_RATIO,
+    LTF_VOLUME_LOOKBACK,
+    LTF_VOLUME_SURGE_MULT,
+    REVERSAL_CONVICTION,
+    REVERSAL_PIN_BAR_WICK_RATIO,
+    REVERSAL_SCAN_BARS,
+)
 from ta.ta_engine import volume_spike
 
 
@@ -126,6 +137,129 @@ def is_volume_climax(
         return False
     vol_ok, _ratio = volume_spike(df, mult=vol_mult, lookback=lookback)
     return vol_ok
+
+
+def _engulfs_range(prev: pd.Series, curr: pd.Series, direction: str) -> bool:
+    """Stronger than a textbook engulfing: `curr` must close beyond the whole
+    of `prev`'s range, in `direction`, on a body of its own colour. Used for
+    the doji-then-engulfing formation, where the doji has no meaningful body
+    for a conventional engulfing test to reference."""
+    if direction == "LONG":
+        return float(curr["Close"]) > float(prev["High"]) and float(curr["Close"]) > float(curr["Open"])
+    return float(curr["Close"]) < float(prev["Low"]) and float(curr["Close"]) < float(curr["Open"])
+
+
+def detect_reversal_formation(
+    df: pd.DataFrame, direction: str,
+    scan_bars: int = REVERSAL_SCAN_BARS, wick_ratio: float = REVERSAL_PIN_BAR_WICK_RATIO,
+) -> tuple[bool, str | None, float, int]:
+    """Explicit, direction-matching candlestick reversal formation on the
+    trigger timeframe. Returns `(found, pattern, conviction, bar_offset)`,
+    where `bar_offset` is how many bars back from the latest the formation
+    completed (0 = the current bar).
+
+    This REPLACES `detect_braking_event` as the entry trigger. The difference
+    is deliberate: the old detector accepted a volume climax or a market-
+    structure shift on their own, neither of which is a reversal *formation* --
+    both routinely fire mid-trend and, on a 15m chart, fire constantly. Here
+    an actual formation is required, and climax/MSS are demoted to confluence
+    flags scored elsewhere.
+
+    Formations, highest conviction first (see REVERSAL_CONVICTION):
+      doji_then_engulfing -- indecision immediately resolved in `direction`
+      engulfing           -- classic two-bar reversal
+      hammer / shooting_star -- single-bar exhaustion with a dominant wick
+      pin_bar_rejection   -- wick >= `wick_ratio` of range (stricter than the
+                             braking detector's 0.5, so a marginal wick no
+                             longer counts as high conviction)
+    """
+    if len(df) < 3:
+        return False, None, 0.0, 0
+
+    want_bullish = direction == "LONG"
+    best: tuple[str, float, int] | None = None
+
+    for offset in range(min(scan_bars, len(df) - 2)):
+        end = len(df) - offset
+        sub = df.iloc[:end]
+        prev, curr = sub.iloc[-2], sub.iloc[-1]
+
+        matches: list[str] = []
+        if is_doji(prev) and _engulfs_range(prev, curr, direction):
+            matches.append("doji_then_engulfing")
+        if (is_bullish_engulfing(prev, curr) if want_bullish else is_bearish_engulfing(prev, curr)):
+            matches.append("engulfing")
+        if want_bullish and is_hammer(curr):
+            matches.append("hammer")
+        if not want_bullish and is_shooting_star(curr):
+            matches.append("shooting_star")
+        if is_pin_bar_rejection(curr, direction, wick_ratio=wick_ratio):
+            matches.append("pin_bar_rejection")
+
+        for pattern in matches:
+            conviction = REVERSAL_CONVICTION.get(pattern, 0.5)
+            # Prefer the strongest formation; on a tie prefer the most recent
+            # bar, since a fresher signal is the one price is reacting to now.
+            if best is None or conviction > best[1]:
+                best = (pattern, conviction, offset)
+
+    if best is None:
+        return False, None, 0.0, 0
+    return True, best[0], best[1], best[2]
+
+
+def directional_volume_confirmation(
+    df: pd.DataFrame, direction: str,
+    surge_mult: float = LTF_VOLUME_SURGE_MULT, lookback: int = LTF_VOLUME_LOOKBACK,
+    exhaustion_lookback: int = LTF_EXHAUSTION_LOOKBACK,
+    exhaustion_max_ratio: float = LTF_EXHAUSTION_MAX_RATIO,
+) -> tuple[bool, dict]:
+    """MANDATORY directional volume proof on the reversal candle (the last bar
+    of `df`, so callers should slice to end at the formation bar).
+
+    A bare volume spike is not enough and never was -- an expansion bar
+    printing AGAINST the proposed direction is precisely what a failed
+    reversal looks like. So two things must both hold:
+
+      1. the candle itself leans in `direction` (by body, or by a dominant
+         rejection wick -- a hammer closing marginally red is still buyers
+         taking control of the range), and
+      2. its volume is at least `surge_mult` x its own N-bar average.
+
+    For LONG that is a buyer volume surge; for SHORT, seller volume expansion
+    on the rejection.
+
+    Buyer/seller EXHAUSTION into the extreme -- volume fading across the prior
+    push -- is computed and returned but is not required. Demanding it too
+    would reject sharp V-reversals that turn without a slow bleed first. It
+    feeds the conviction score and the alert thesis instead.
+    """
+    detail = {"ratio": 0.0, "direction_ok": False, "exhaustion": False, "prior_push_ratio": None}
+    if len(df) < 2:
+        return False, detail
+
+    curr = df.iloc[-1]
+    avg_vol = df["Volume"].tail(lookback + 1).iloc[:-1].mean()
+    if not avg_vol or pd.isna(avg_vol):
+        return False, detail
+
+    ratio = float(curr["Volume"]) / float(avg_vol)
+    detail["ratio"] = round(ratio, 2)
+
+    body_bullish = float(curr["Close"]) > float(curr["Open"])
+    rng = _range(curr)
+    lower_dominant = rng > 0 and (_lower_wick(curr) / rng) >= 0.5
+    upper_dominant = rng > 0 and (_upper_wick(curr) / rng) >= 0.5
+    direction_ok = (body_bullish or lower_dominant) if direction == "LONG" else ((not body_bullish) or upper_dominant)
+    detail["direction_ok"] = bool(direction_ok)
+
+    prior = df.iloc[-(exhaustion_lookback + 1):-1]
+    if len(prior) >= 2:
+        prior_ratio = float(prior["Volume"].mean()) / float(avg_vol)
+        detail["prior_push_ratio"] = round(prior_ratio, 2)
+        detail["exhaustion"] = prior_ratio <= exhaustion_max_ratio
+
+    return bool(direction_ok and ratio >= surge_mult), detail
 
 
 def is_structure_shift(df: pd.DataFrame, direction: str, lookback: int) -> bool:

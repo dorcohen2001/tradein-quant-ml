@@ -34,21 +34,32 @@ import pandas as pd
 from config import (
     BRAKING_STRUCTURE_LOOKBACK,
     BRAKING_WINDOW_BARS,
-    HTF_INTERVALS,
+    EMA200_ANCHOR_PROXIMITY_PCT,
     HTF_VOLUME_CONFLUENCE_LOOKBACK,
     HTF_VOLUME_CONFLUENCE_MULT,
     HTF_ZONE_PROXIMITY_PCT,
     FIB_REACTION_LOOKBACK_BARS,
     FIB_REACTION_TOLERANCE_PCT,
-    ITF_INTERVALS_CRYPTO,
-    ITF_MA200_MIN_ALIGNED,
-    ITF_RESAMPLE_RULES_STOCKS,
-    ITF_VOLUME_LOOKBACK,
-    ITF_VOLUME_SPIKE_MULT,
+    LTF_ALIGNMENT_TFS,
+    LTF_CONFIRM_TFS,
+    LTF_MA_MIN_ALIGNED,
+    LTF_TRIGGER_TF,
+    MIN_ZONE_HISTORY_BARS,
     PRIMARY_MA_PERIOD,
     SECONDARY_MA_PERIOD,
+    TF_INTERVALS,
+    ZONE_DISCOVERY_TFS,
+    ZONE_REFINE_PROXIMITY_PCT,
+    ZONE_REFINE_TFS,
 )
-from ta.candles import classify_reversal_candle, is_pin_bar_rejection, is_structure_shift, is_volume_climax
+from ta.candles import (
+    classify_reversal_candle,
+    detect_reversal_formation,
+    directional_volume_confirmation,
+    is_pin_bar_rejection,
+    is_structure_shift,
+    is_volume_climax,
+)
 from ta.divergence import DivergenceResult, rsi_divergence
 from ta.order_blocks import OrderBlock, find_order_blocks, nearest_unmitigated
 from ta.ta_engine import (
@@ -62,7 +73,13 @@ from ta.ta_engine import (
     pivot_points_indexed,
     volume_spike,
 )
-from utils.data_fetch import get_binance_klines, get_stock_history, get_stock_intraday_1h, resample_ohlc
+from utils.data_fetch import (
+    get_binance_klines,
+    get_stock_history,
+    get_stock_intraday,
+    get_stock_intraday_1h,
+    resample_ohlc,
+)
 
 
 def _within(price: float, a: float, b: float) -> bool:
@@ -169,29 +186,43 @@ def swing_excluding_recent(df: pd.DataFrame, lookback: int = 60, exclude_recent:
     return hi, lo
 
 
-def _fetch_htf(ticker: str, asset_class: str) -> dict[str, pd.DataFrame]:
-    if asset_class == "crypto":
-        return {
-            "weekly": get_binance_klines(ticker, interval=HTF_INTERVALS["crypto"]["weekly"], limit=300),
-            "monthly": get_binance_klines(ticker, interval=HTF_INTERVALS["crypto"]["monthly"], limit=200),
-        }
-    return {
-        "weekly": get_stock_history(ticker, period="10y", interval=HTF_INTERVALS["stocks"]["weekly"]),
-        "monthly": get_stock_history(ticker, period="max", interval=HTF_INTERVALS["stocks"]["monthly"]),
-    }
+_CRYPTO_LIMITS = {"weekly": 200, "daily": 400, "12h": 400, "4h": 500, "1h": 600, "15m": 600, "5m": 600}
 
 
-def _fetch_itf(ticker: str, asset_class: str) -> dict[str, pd.DataFrame]:
-    """12H/8H/4H drive the 200MA-alignment vote (Stage B); 1H is added
-    specifically for the Stage 7 multi-timeframe braking-event zoom-in
-    (`detect_braking_event` is checked on both 4H and 1H)."""
+def _fetch_frames(ticker: str, asset_class: str) -> dict[str, pd.DataFrame]:
+    """Every timeframe the intraday ladder needs, in one pass:
+
+        weekly / daily / 12h  -- top-down zone DISCOVERY
+        4h / 3h / 1h          -- precision REFINEMENT of those zones
+        1h / 15m / 5m         -- EXECUTION (trigger + confirmation + MA vote)
+
+    `1h` deliberately serves double duty as both the finest refinement frame
+    and the coarsest execution frame -- it is fetched once and shared.
+
+    Neither venue offers every interval natively, so `TF_INTERVALS` marks the
+    ones that must be resampled from 1h bars (3h for crypto; 12h/4h/3h for
+    stocks, where yfinance has no sub-daily bar above 90m)."""
+    intervals = TF_INTERVALS[asset_class]
+    frames: dict[str, pd.DataFrame] = {}
+
     if asset_class == "crypto":
-        frames = {tf: get_binance_klines(ticker, interval=tf, limit=400) for tf in ITF_INTERVALS_CRYPTO}
-        frames["1h"] = get_binance_klines(ticker, interval="1h", limit=400)
-        return frames
-    base = get_stock_intraday_1h(ticker)
-    frames = {tf: resample_ohlc(base, tf) for tf in ITF_RESAMPLE_RULES_STOCKS}
-    frames["1h"] = base
+        for tf, interval in intervals.items():
+            if interval is not None:
+                frames[tf] = get_binance_klines(ticker, interval=interval, limit=_CRYPTO_LIMITS.get(tf, 400))
+    else:
+        frames["weekly"] = get_stock_history(ticker, period="2y", interval=intervals["weekly"])
+        frames["daily"] = get_stock_history(ticker, period="1y", interval=intervals["daily"])
+        frames["1h"] = get_stock_intraday_1h(ticker)
+        frames["15m"] = get_stock_intraday(ticker, interval="15m")
+        frames["5m"] = get_stock_intraday(ticker, interval="5m")
+
+    # Fill in whatever the venue could not serve natively by resampling 1h.
+    base_1h = frames.get("1h")
+    if base_1h is not None and not base_1h.empty:
+        for tf, interval in intervals.items():
+            if interval is None and tf not in frames:
+                frames[tf] = resample_ohlc(base_1h, tf)
+
     return frames
 
 
@@ -218,9 +249,24 @@ class MTFASetup:
     itf_fib_levels: dict = field(default_factory=dict)
     itf_ema200: float | None = None
     itf_atr: float | None = None  # ATR on the trigger timeframe; used by RiskManager to bound stop distance
-    monthly_trend: str = "UNKNOWN"  # macro context/bias only -- never a hard veto, see htf_pass()
-    htf_volume_ratio: float = 0.0  # weekly volume vs its N-week average at the HTF zone -- scoring bonus, not a gate
+    monthly_trend: str = "UNKNOWN"  # highest-timeframe (weekly) bias -- context only, never a hard veto
+    htf_volume_ratio: float = 0.0  # zone-timeframe volume vs its N-bar average -- scoring bonus, not a gate
     thesis: str = ""
+    # --- intraday additions ---
+    zone_tf: str = ""                     # which timeframe supplied the zone actually used
+    zone_discovery_tfs: list[str] = field(default_factory=list)
+    zone_refined_tfs: list[str] = field(default_factory=list)
+    reversal_conviction: float = 0.0      # 0-1, per config.REVERSAL_CONVICTION
+    ema200_anchor: float | None = None    # EMA200 level price is reacting at, if any
+    ema200_anchor_tf: str | None = None
+    volume_detail: dict = field(default_factory=dict)  # ratio / direction_ok / exhaustion
+    confirm_agreement: int = 0            # how many LTF_CONFIRM_TFS agree with the direction
+    # Swing extremes measured on the TRIGGER timeframe. TP2 must be derived
+    # from these, not from the discovery-timeframe swing: a weekly/12h swing
+    # extreme is months of travel away and produces an intraday target that
+    # can never be reached (a live SHORT priced TP2 at 14R before this).
+    itf_swing_high: float = 0.0
+    itf_swing_low: float = 0.0
 
 
 def _trendline_zone(
@@ -332,6 +378,112 @@ def _direction_zone(
     return {"divergence_support": divergence_support, "trend_support": trend_support, "zones": zones}
 
 
+def _ema200_anchor(price: float, df: pd.DataFrame, tolerance_pct: float = EMA200_ANCHOR_PROXIMITY_PCT) -> float | None:
+    """The EMA200 level on `df` if price is currently pressed against it.
+
+    Treated as a high-certainty structural barrier in its own right: price
+    seldom slices the 200 EMA cleanly on first contact, so a reaction there is
+    among the most reliable intraday reversal locations. Returns the level so
+    callers can both score the confluence and use it for stop placement."""
+    if df is None or df.empty or len(df) < PRIMARY_MA_PERIOD // 2:
+        return None
+    with_ma = add_moving_averages(df, periods=(PRIMARY_MA_PERIOD,))
+    val = with_ma[f"EMA{PRIMARY_MA_PERIOD}"].iloc[-1]
+    if pd.isna(val):
+        return None
+    val = float(val)
+    if val > 0 and abs(price - val) / price <= tolerance_pct:
+        return val
+    return None
+
+
+def _zone_frame_ok(df: pd.DataFrame | None) -> bool:
+    return df is not None and not df.empty and len(df) >= MIN_ZONE_HISTORY_BARS
+
+
+def map_zones_top_down(
+    direction: str, price: float, frames: dict[str, pd.DataFrame],
+) -> dict | None:
+    """Top-down zone map: DISCOVER on weekly -> daily -> 12h, then precision-
+    REFINE on 4h -> 3h -> 1h.
+
+    Discovery answers "is price at a level that matters on a higher
+    timeframe", using the loose HTF_ZONE_PROXIMITY_PCT band. Refinement
+    answers "and is it precisely there right now", using the much tighter
+    ZONE_REFINE_PROXIMITY_PCT -- which is what makes an intraday stop
+    placeable at all. A discovery hit is mandatory; refinement hits raise
+    conviction and supply the tighter zone edges used downstream for stops.
+
+    Returns None when no discovery timeframe places price at a zone.
+    """
+    discovered: list[dict] = []
+    refined: list[dict] = []
+
+    for tf in ZONE_DISCOVERY_TFS:
+        df = frames.get(tf)
+        if not _zone_frame_ok(df):
+            continue
+        with_ma = add_moving_averages(df)
+        hi, lo, _, _ = find_swing_high_low(df, lookback=min(52, len(df) - 1))
+        fib = fibonacci_levels(hi, lo)
+        levels = pivot_levels(df, window=3, lookback=min(104, len(df)))
+        near = nearest_levels(price, levels)
+        obs = find_order_blocks(df)
+        signal = _direction_zone(direction, price, "MIXED", rsi_divergence(df), near, obs, fib, with_ma)
+        if signal:
+            for zone_type, zone in signal["zones"]:
+                discovered.append({"tf": tf, "type": zone_type, "zone": zone,
+                                    "support": near.get("nearest_support"),
+                                    "resistance": near.get("nearest_resistance"),
+                                    "obs": obs, "hi": hi, "lo": lo, "fib": fib})
+
+    if not discovered:
+        return None
+
+    ema_anchor_tf = None
+    ema_anchor_level = None
+    for tf in ZONE_REFINE_TFS:
+        df = frames.get(tf)
+        if not _zone_frame_ok(df):
+            continue
+        levels = pivot_levels(df, window=3, lookback=min(120, len(df)))
+        near = nearest_levels(price, levels)
+        key = "nearest_support" if direction == "LONG" else "nearest_resistance"
+        level = near.get(key)
+        if level and abs(price - level) / price <= ZONE_REFINE_PROXIMITY_PCT:
+            zone_type = "support" if direction == "LONG" else "resistance"
+            refined.append({"tf": tf, "type": zone_type,
+                             "zone": (level * (1 - ZONE_REFINE_PROXIMITY_PCT), level * (1 + ZONE_REFINE_PROXIMITY_PCT)),
+                             "support": near.get("nearest_support"),
+                             "resistance": near.get("nearest_resistance")})
+        if ema_anchor_level is None:
+            anchor = _ema200_anchor(price, df)
+            if anchor is not None:
+                ema_anchor_level, ema_anchor_tf = anchor, tf
+
+    primary = refined[0] if refined else discovered[0]
+    # Structural levels prefer the refined (tighter) read when one exists,
+    # falling back to the discovery frame's levels otherwise.
+    support = primary.get("support") or discovered[0].get("support")
+    resistance = primary.get("resistance") or discovered[0].get("resistance")
+
+    return {
+        "zone_type": primary["type"],
+        "zone": primary["zone"],
+        "zone_tf": primary["tf"],
+        "discovered": discovered,
+        "refined": refined,
+        "nearest_support": support,
+        "nearest_resistance": resistance,
+        "order_blocks": discovered[0]["obs"],
+        "swing_high": discovered[0]["hi"],
+        "swing_low": discovered[0]["lo"],
+        "fib": discovered[0]["fib"],
+        "ema200_anchor": ema_anchor_level,
+        "ema200_anchor_tf": ema_anchor_tf,
+    }
+
+
 def _monthly_trend(monthly: pd.DataFrame | None) -> str:
     if monthly is None or monthly.empty or len(monthly) < 60:
         return "UNKNOWN"  # not enough monthly history yet -- treated as non-contradictory, not bullish/bearish
@@ -396,101 +548,169 @@ def htf_pass(weekly: pd.DataFrame, monthly: pd.DataFrame | None = None) -> dict 
     }
 
 
-def analyze_mtfa(ticker: str, asset_class: str) -> MTFASetup | None:
-    htf_frames = _fetch_htf(ticker, asset_class)
-    htf = htf_pass(htf_frames["weekly"], htf_frames.get("monthly"))
-    if htf is None:
-        return None
-
-    direction = htf["direction"]
-    signal = htf["signal"]
-    zone_type, zone = htf["zone_type"], htf["zone"]
-    htf_trend, divergence, obs, near, fib, hi, lo = (
-        htf["htf_trend"], htf["divergence"], htf["obs"], htf["near"], htf["fib"], htf["hi"], htf["lo"],
-    )
-
-    # --- ITF trigger confirmation ---
+def _ma_alignment_vote(direction: str, frames: dict[str, pd.DataFrame]) -> int:
+    """How many of LTF_ALIGNMENT_TFS (1h/15m/5m) closed on the correct side of
+    the 200 EMA. A timeframe with too little history to compute the MA simply
+    does not vote rather than voting against."""
     primary_col = f"EMA{PRIMARY_MA_PERIOD}"
-    itf_frames = _fetch_itf(ticker, asset_class)
-    ma_aligned_count = 0
-    for tf in ITF_INTERVALS_CRYPTO:  # 12h/8h/4h only -- 1h is excluded from this vote, it's for Stage 7 below
-        tf_df = itf_frames.get(tf)
-        if tf_df is None or tf_df.empty or len(tf_df) < PRIMARY_MA_PERIOD + 10:
+    aligned = 0
+    for tf in LTF_ALIGNMENT_TFS:
+        df = frames.get(tf)
+        if df is None or df.empty or len(df) < PRIMARY_MA_PERIOD + 10:
             continue
-        tf_df = add_moving_averages(tf_df, periods=(PRIMARY_MA_PERIOD,))
-        last = tf_df.iloc[-1]
+        with_ma = add_moving_averages(df, periods=(PRIMARY_MA_PERIOD,))
+        last = with_ma.iloc[-1]
         if pd.isna(last.get(primary_col)):
             continue
         if direction == "LONG" and float(last["Close"]) >= float(last[primary_col]):
-            ma_aligned_count += 1
+            aligned += 1
         elif direction == "SHORT" and float(last["Close"]) <= float(last[primary_col]):
-            ma_aligned_count += 1
+            aligned += 1
+    return aligned
 
-    trigger_df = itf_frames.get("4h")
-    if trigger_df is None or trigger_df.empty or len(trigger_df) < 20:
-        return None
 
-    trigger_df_ma = add_moving_averages(trigger_df, periods=(PRIMARY_MA_PERIOD,))
-    ema200_val = trigger_df_ma[primary_col].iloc[-1]
-    itf_ema200 = float(ema200_val) if not pd.isna(ema200_val) else None
-    atr_val = atr(trigger_df).iloc[-1]
-    itf_atr = float(atr_val) if not pd.isna(atr_val) else None
-
-    # Stage 7 zoom-in: scan the last few bars on BOTH 4H and 1H for a braking/
-    # reversal event -- either timeframe qualifying is enough.
-    braking_pattern, braking_tf = None, None
-    for tf in ("4h", "1h"):
-        tf_df = itf_frames.get(tf)
-        if tf_df is None or tf_df.empty:
+def _confirm_agreement(direction: str, frames: dict[str, pd.DataFrame]) -> int:
+    """How many confirmation timeframes (5m, 1h) currently lean `direction`,
+    by close vs. their own short EMA. Scoring input only -- a confirmation
+    frame disagreeing does not veto a valid trigger."""
+    agree = 0
+    for tf in LTF_CONFIRM_TFS:
+        df = frames.get(tf)
+        if df is None or df.empty or len(df) < 25:
             continue
-        found, pattern = detect_braking_event(tf_df, direction)
-        if found:
-            braking_pattern, braking_tf = pattern, tf
-            break
-    if braking_pattern is None:
+        ema = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+        close = float(df["Close"].iloc[-1])
+        if pd.isna(ema):
+            continue
+        if (direction == "LONG" and close >= float(ema)) or (direction == "SHORT" and close <= float(ema)):
+            agree += 1
+    return agree
+
+
+def analyze_mtfa(ticker: str, asset_class: str) -> MTFASetup | None:
+    """Intraday MTFA: daily/weekly context -> top-down zone map -> 15m trigger.
+
+    Hard gates, in short-circuit order:
+      1. a top-down zone map exists for exactly one direction
+      2. an explicit reversal FORMATION on the 15m trigger
+      3. MANDATORY directional volume confirmation on that formation candle
+      4. >= LTF_MA_MIN_ALIGNED of 1h/15m/5m aligned with the 200 EMA
+      5. Fib containment or a 0.5/0.618 reaction on the trigger frame
+    """
+    frames = _fetch_frames(ticker, asset_class)
+
+    trigger_df = frames.get(LTF_TRIGGER_TF)
+    if trigger_df is None or trigger_df.empty or len(trigger_df) < 30:
+        return None
+    price = float(trigger_df["Close"].iloc[-1])
+
+    # --- Context / bias (daily drives regime, weekly is the higher bias) ---
+    daily = frames.get("daily")
+    weekly = frames.get("weekly")
+    htf_trend = determine_trend(add_moving_averages(daily)) if _zone_frame_ok(daily) else "UNKNOWN"
+    higher_trend = determine_trend(add_moving_averages(weekly)) if _zone_frame_ok(weekly) else "UNKNOWN"
+    zone_volume_ratio = htf_volume_ratio(daily) if _zone_frame_ok(daily) else 0.0
+    divergence = rsi_divergence(daily) if _zone_frame_ok(daily) else DivergenceResult()
+
+    # --- 1. Top-down zone map, evaluated for both directions ---
+    long_map = map_zones_top_down("LONG", price, frames)
+    short_map = map_zones_top_down("SHORT", price, frames)
+    if long_map and short_map:
+        # Price sits at both a support and a resistance read. Break the tie on
+        # the daily context trend; if that is neutral too, the location is
+        # genuinely ambiguous and is not worth trading intraday.
+        if htf_trend == "UPTREND":
+            direction, zone_map = "LONG", long_map
+        elif htf_trend == "DOWNTREND":
+            direction, zone_map = "SHORT", short_map
+        else:
+            return None
+    elif long_map:
+        direction, zone_map = "LONG", long_map
+    elif short_map:
+        direction, zone_map = "SHORT", short_map
+    else:
         return None
 
-    vol_spike_ok, vol_ratio = volume_spike(trigger_df, mult=ITF_VOLUME_SPIKE_MULT, lookback=ITF_VOLUME_LOOKBACK)
-    if not vol_spike_ok:
+    # --- 2. Explicit reversal formation on the 15m trigger (HARD) ---
+    found, pattern, conviction, bar_offset = detect_reversal_formation(trigger_df, direction)
+    if not found:
         return None
 
-    if ma_aligned_count < ITF_MA200_MIN_ALIGNED:
+    # --- 3. MANDATORY directional volume confirmation on the formation bar ---
+    formation_df = trigger_df.iloc[: len(trigger_df) - bar_offset]
+    volume_ok, volume_detail = directional_volume_confirmation(formation_df, direction)
+    if not volume_ok:
         return None
 
-    itf_price = float(trigger_df["Close"].iloc[-1])
+    # --- 4. 200 EMA alignment across the execution ladder (HARD) ---
+    ma_aligned_count = _ma_alignment_vote(direction, frames)
+    if ma_aligned_count < LTF_MA_MIN_ALIGNED:
+        return None
+
+    # --- 5. Fib confluence on the trigger frame (HARD) ---
     itf_hi, itf_lo = swing_excluding_recent(trigger_df)
     itf_fib = fibonacci_levels(itf_hi, itf_lo)
-    contained = _within(itf_price, itf_fib["0.5"], itf_fib["0.786"])
+    contained = _within(price, itf_fib["0.5"], itf_fib["0.786"])
     reacted = fib_reaction(trigger_df, itf_fib, direction)
     if not (contained or reacted):
         return None
 
+    # --- Trigger-frame derived values for RiskManager ---
+    trigger_ma = add_moving_averages(trigger_df, periods=(PRIMARY_MA_PERIOD,))
+    ema200_val = trigger_ma[f"EMA{PRIMARY_MA_PERIOD}"].iloc[-1]
+    itf_ema200 = float(ema200_val) if not pd.isna(ema200_val) else None
+    atr_val = atr(trigger_df).iloc[-1]
+    itf_atr = float(atr_val) if not pd.isna(atr_val) else None
+
+    confirm_agreement = _confirm_agreement(direction, frames)
+    discovery_tfs = sorted({d["tf"] for d in zone_map["discovered"]})
+    refined_tfs = sorted({r["tf"] for r in zone_map["refined"]})
+    zone = zone_map["zone"]
+
+    # --- Thesis ---
     thesis_bits = [
-        f"HTF ({htf_trend}) {zone_type} zone {zone[0]:.4g}-{zone[1]:.4g}",
+        f"Daily context {htf_trend} (weekly {higher_trend}); "
+        f"{zone_map['zone_type']} zone {zone[0]:.4g}-{zone[1]:.4g} discovered on "
+        f"{'/'.join(discovery_tfs)}" + (f", refined on {'/'.join(refined_tfs)}" if refined_tfs else "")
     ]
-    if signal["divergence_support"]:
+    if zone_map["ema200_anchor"] is not None:
+        thesis_bits.append(
+            f"price reacting at the {zone_map['ema200_anchor_tf']} {PRIMARY_MA_PERIOD} EMA "
+            f"({zone_map['ema200_anchor']:.4g}) -- high-certainty structural barrier"
+        )
+    if (direction == "LONG" and divergence.bullish) or (direction == "SHORT" and divergence.bearish):
         kind = "Bullish (accumulation)" if direction == "LONG" else "Bearish (distribution)"
-        thesis_bits.append(f"{kind} RSI divergence confirmed on weekly")
-    if htf["htf_volume_ratio"] >= HTF_VOLUME_CONFLUENCE_MULT:
-        thesis_bits.append(f"weekly volume confluence at zone ({htf['htf_volume_ratio']}x avg)")
-    else:
-        thesis_bits.append(f"low-volume weekly retest at zone ({htf['htf_volume_ratio']}x avg)")
+        thesis_bits.append(f"{kind} RSI divergence on daily")
+    vol_word = "buyer volume surge" if direction == "LONG" else "seller volume expansion"
+    vol_note = f"{vol_word} {volume_detail['ratio']}x avg on the {LTF_TRIGGER_TF} {pattern}"
+    if volume_detail.get("exhaustion"):
+        exhausted = "buyer" if direction == "SHORT" else "seller"
+        vol_note += f", preceded by {exhausted} exhaustion ({volume_detail['prior_push_ratio']}x avg into the extreme)"
+    thesis_bits.append(vol_note)
     fib_note = (
         f"inside Fib golden zone ({itf_fib['0.786']:.4g}-{itf_fib['0.5']:.4g})" if contained
         else "reacted off 0.5/0.618 Fib level"
     )
     thesis_bits.append(
-        f"{braking_tf.upper()} {braking_pattern} braking/reversal event on {vol_ratio}x volume, "
-        f"{ma_aligned_count}/3 ITF timeframes {PRIMARY_MA_PERIOD}MA-aligned, {fib_note}"
+        f"{ma_aligned_count}/{len(LTF_ALIGNMENT_TFS)} execution timeframes {PRIMARY_MA_PERIOD}MA-aligned, "
+        f"{confirm_agreement}/{len(LTF_CONFIRM_TFS)} confirmation frames agree, {fib_note}"
     )
 
     return MTFASetup(
-        ticker=ticker, asset_class=asset_class, price=itf_price, direction_bias=direction,
-        htf_trend=htf_trend, htf_zone_type=zone_type, htf_zone=zone, divergence=divergence,
-        order_blocks=obs, nearest_support=near.get("nearest_support"),
-        nearest_resistance=near.get("nearest_resistance"), swing_high=hi, swing_low=lo,
-        fib_levels=fib, monthly_trend=htf["monthly_trend"], itf_trigger_tf=braking_tf, itf_pattern=braking_pattern,
-        itf_volume_ratio=vol_ratio, itf_ma200_aligned_count=ma_aligned_count,
-        itf_fib_levels=itf_fib, itf_ema200=itf_ema200, itf_atr=itf_atr, thesis="; ".join(thesis_bits),
-        htf_volume_ratio=htf["htf_volume_ratio"],
+        ticker=ticker, asset_class=asset_class, price=price, direction_bias=direction,
+        htf_trend=htf_trend, htf_zone_type=zone_map["zone_type"], htf_zone=zone, divergence=divergence,
+        order_blocks=zone_map["order_blocks"], nearest_support=zone_map["nearest_support"],
+        nearest_resistance=zone_map["nearest_resistance"],
+        swing_high=zone_map["swing_high"], swing_low=zone_map["swing_low"],
+        fib_levels=zone_map["fib"], monthly_trend=higher_trend,
+        itf_trigger_tf=LTF_TRIGGER_TF, itf_pattern=pattern,
+        itf_volume_ratio=volume_detail["ratio"], itf_ma200_aligned_count=ma_aligned_count,
+        itf_fib_levels=itf_fib, itf_ema200=itf_ema200, itf_atr=itf_atr,
+        itf_swing_high=itf_hi, itf_swing_low=itf_lo,
+        thesis="; ".join(thesis_bits), htf_volume_ratio=zone_volume_ratio,
+        zone_tf=zone_map["zone_tf"], zone_discovery_tfs=discovery_tfs, zone_refined_tfs=refined_tfs,
+        reversal_conviction=conviction, ema200_anchor=zone_map["ema200_anchor"],
+        ema200_anchor_tf=zone_map["ema200_anchor_tf"], volume_detail=volume_detail,
+        confirm_agreement=confirm_agreement,
     )
