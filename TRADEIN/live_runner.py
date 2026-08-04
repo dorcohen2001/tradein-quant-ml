@@ -6,6 +6,24 @@ Ties together the screener, TA/macro/news engines, and trade generator to:
   3. Send the formatted trade alert to the configured Telegram chat.
   4. Refresh existing open paper trades against live prices and push
      Telegram status updates when a position triggers or closes.
+  5. Trace every scanned ticker through the same gates a second time
+     (`screener.funnel_diagnostics`) and export a two-sheet Excel report to
+     `funnel_logs/` -- a read-only diagnostic, independent of steps 1-4, that
+     can never affect scanning/alerting/paper-trading even if it fails.
+
+Dual-model execution: this codebase is the "Livne" model (current/refactored
+pipeline, MODEL_NAME in config.py). Each cycle also drives the "Biton" model
+-- the frozen legacy pipeline in the sibling ../backuptrade1 codebase -- as
+two fully isolated `python backuptrade1/live_runner.py` subprocesses (one for
+position management, one for the market scan), so the two pipelines never
+share a Python process, import namespace, or global state. Biton's own
+trades/journal/funnel-report file paths are repointed (via that codebase's
+own config.py) at TRADEIN/paper_trading/trades_biton.json,
+TRADEIN/journals/trade_journal_biton.xlsx, and TRADEIN/funnel_logs/
+live_funnel_biton_*.xlsx -- kept alongside but always distinct from Livne's
+own trades_livne.json / trade_journal_livne.xlsx / live_funnel_livne_*.xlsx.
+A failure in the Biton subprocess (missing folder, crashed cycle, etc.) is
+caught and logged; it can never block or affect Livne's own cycle.
 
 Usage:
     python live_runner.py --asset-class both --top-n 2
@@ -20,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
+import subprocess
 import sys
 import time
 import traceback
@@ -28,14 +48,43 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from config import CYCLE_INTERVAL_MINUTES, TOP_N_ASSETS
+from config import CYCLE_INTERVAL_MINUTES, MODEL_NAME, TOP_N_ASSETS
 from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
 from news.news_analyzer import analyze_sentiment
 from paper_trading.tracker import has_open_trade, log_trade, update_open_positions
+from screener.funnel_diagnostics import export_funnel_report, run_diagnostics
 from screener.market_screener import scan_crypto, scan_stocks
 from utils.chart_attachment import generate_chart_for_setup
-from utils.telegram_notifier import send_telegram_message, send_telegram_photo
+from utils.market_hours import is_market_open
+from utils.telegram_notifier import escape_markdown, escape_markdown_code, send_telegram_message, send_telegram_photo
+
+BITON_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "backuptrade1"))
+BITON_LIVE_RUNNER = os.path.join(BITON_DIR, "live_runner.py")
+
+
+def _run_biton_phase(phase: str, asset_class: str, top_n: int, candidate_pool: int) -> None:
+    """Invoke the Biton (legacy) model's own live_runner.py as a completely
+    separate OS process -- `phase` is "positions" or "scan", matching that
+    script's own `--skip-scan`/`--skip-positions` flags, so the two models'
+    position-management and market-screen phases interleave in the same
+    order every cycle. Never raises: a Biton failure is logged and skipped,
+    it can never block or affect Livne's own cycle below."""
+    if not os.path.isfile(BITON_LIVE_RUNNER):
+        print(f"[biton] {BITON_LIVE_RUNNER} not found -- skipping Biton {phase} phase.", file=sys.stderr)
+        return
+
+    cmd = [sys.executable, BITON_LIVE_RUNNER, "--asset-class", asset_class, "--once",
+           "--top-n", str(top_n), "--candidate-pool", str(candidate_pool)]
+    cmd.append("--skip-scan" if phase == "positions" else "--skip-positions")
+
+    print(f"[biton] Running Biton (legacy) {phase} phase...", file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, cwd=BITON_DIR)
+        if result.returncode != 0:
+            print(f"[biton] {phase} phase exited with code {result.returncode} (Livne unaffected).", file=sys.stderr)
+    except Exception as exc:
+        print(f"[biton] {phase} phase failed to launch (Livne unaffected): {exc}", file=sys.stderr)
 
 
 def _timestamp() -> str:
@@ -43,24 +92,39 @@ def _timestamp() -> str:
 
 _STATUS_EMOJI = {
     "ACTIVE": "🔵",
-    "WIN_TP1": "✅",
+    "PARTIAL_TP1": "✅",
     "WIN_TP2": "🏆",
     "LOSS_SL": "🛑",
+    "LOSS_SL_BE": "⚪",
+    "EMERGENCY_EXIT": "🚨",
     "EXPIRED": "⌛",
 }
 
 
 def _format_status_update(trade: dict) -> str:
+    """Status values like `PARTIAL_TP1`/`LOSS_SL_BE` contain underscores and
+    get bold-wrapped (`*{status}*`) below -- unescaped, that's the same class
+    of "unmatched Markdown entity" 400 error a snake_case pattern name caused
+    in a setup alert (see generator.trade_generator.format_telegram_message
+    and utils.telegram_notifier.escape_markdown). `status` itself stays raw
+    for the control-flow comparisons below; only the *displayed* copies are
+    escaped."""
     status = trade["current_status"]
     emoji = _STATUS_EMOJI.get(status, "ℹ️")
 
     lines = [
-        f"{emoji} *PAPER TRADE UPDATE* — `{trade['ticker']}` ({trade['direction']})",
-        f"Status: *{status}*",
+        f"[{escape_markdown(MODEL_NAME)}] 🔴 EXIT ALERT",
+        f"{emoji} *PAPER TRADE UPDATE* — `{escape_markdown_code(trade['ticker'])}` ({escape_markdown(trade['direction'])})",
+        f"Status: *{escape_markdown(status)}*",
     ]
     if status == "ACTIVE":
         lines.append("Price entered the planned entry zone.")
+    elif status == "PARTIAL_TP1":
+        lines.append(f"TP1 hit at `{trade['tp1_exit_price']:.4g}` — {int(trade['tp1_close_pct'] * 100)}% closed, "
+                      f"stop moved to breakeven (`{trade['breakeven_price']:.4g}`).")
     else:
+        if status == "EMERGENCY_EXIT" and trade.get("emergency_exit_reason"):
+            lines.append(f"Reason: {escape_markdown(trade['emergency_exit_reason'])}")
         if trade.get("exit_price") is not None:
             lines.append(f"Exit price: `{trade['exit_price']:.4g}`")
         if trade.get("pnl_pct") is not None:
@@ -82,22 +146,46 @@ def process_open_positions() -> None:
         )
 
 
-def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False) -> list[str]:
+def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False,
+        export_funnel: bool = True) -> list[str]:
     """Scan for setups. With dry_run=True, only report (no dedup against open
-    trades, no Telegram alerts, no paper-trade logging, no chart rendering)."""
+    trades, no Telegram alerts, no paper-trade logging, no chart rendering).
+
+    `export_funnel=True` (default) traces every scanned ticker through the
+    same gates a second time via `screener.funnel_diagnostics` and writes a
+    two-sheet Excel report to `FUNNEL_LOG_DIR` after each asset class's scan.
+    That tracer is fully independent, read-only, and wrapped so any failure
+    (network hiccup, a locked previous report) is caught and logged -- it can
+    never interrupt or affect the real scan/alert/paper-trading flow above."""
     reports: list[str] = []
     rejections: list[str] = []
+    funnel_records: dict[str, list] = {}
 
     classes = ["stocks", "crypto"] if asset_class == "both" else [asset_class]
 
     for cls in classes:
+        if cls == "stocks" and not is_market_open():
+            print(
+                "[market] US equities market is CLOSED — skipping stocks scan "
+                "(crypto continues 24/7).",
+                file=sys.stderr,
+            )
+            continue
+
         print(f"[macro] Analyzing {cls} market regime...", file=sys.stderr)
         macro = get_macro_context(cls)
         print(f"[macro] {macro.summary}", file=sys.stderr)
 
         print(f"[screener] Scanning {cls} watchlist...", file=sys.stderr)
-        candidates = scan_stocks() if cls == "stocks" else scan_crypto()
+        candidates = scan_stocks(macro) if cls == "stocks" else scan_crypto(macro)
         print(f"[screener] {len(candidates)} candidates passed liquidity/TA filters", file=sys.stderr)
+
+        if export_funnel:
+            try:
+                print(f"[funnel] Tracing {cls} watchlist for the diagnostic report...", file=sys.stderr)
+                funnel_records[cls] = run_diagnostics(cls, macro)
+            except Exception as exc:
+                print(f"[funnel] {cls} diagnostic trace failed (scan/alerts unaffected): {exc}", file=sys.stderr)
 
         accepted = 0
         for candidate in candidates[:candidate_pool]:
@@ -120,7 +208,7 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
                 rejections.append(reason)
                 continue
 
-            message = format_telegram_message(setup)
+            message = f"[{escape_markdown(MODEL_NAME)}] 🟢 SETUP ALERT\n" + format_telegram_message(setup)
 
             if not dry_run:
                 chart_path = generate_chart_for_setup(setup)
@@ -151,17 +239,32 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
         for r in rejections:
             print(f"  - {r}", file=sys.stderr)
 
+    if export_funnel and funnel_records:
+        try:
+            path = export_funnel_report(funnel_records)
+            if path:
+                print(f"[funnel] Diagnostic report written to {path}", file=sys.stderr)
+            else:
+                print("[funnel] Diagnostic report export failed (see above) -- scan/alerts unaffected.", file=sys.stderr)
+        except Exception as exc:
+            print(f"[funnel] Unexpected error exporting diagnostic report (scan/alerts unaffected): {exc}", file=sys.stderr)
+
     return reports
 
 
 def run_cycle(args) -> None:
-    """Execute a single scan + position-refresh cycle."""
-    print("[paper] Refreshing open paper trade positions...", file=sys.stderr)
+    """Execute a single scan + position-refresh cycle for BOTH models:
+    position management for Biton then Livne, followed (unless --skip-scan)
+    by the market screen for Biton then Livne -- matching the order each
+    model's own alerts/paper-trades are generated in."""
+    _run_biton_phase("positions", args.asset_class, args.top_n, args.candidate_pool)
+    print(f"[{MODEL_NAME}] Refreshing open paper trade positions...", file=sys.stderr)
     process_open_positions()
 
     if args.skip_scan:
         return
 
+    _run_biton_phase("scan", args.asset_class, args.top_n, args.candidate_pool)
     reports = run(args.asset_class, args.top_n, args.candidate_pool)
 
     if not reports:
@@ -188,7 +291,11 @@ def main():
     args = parser.parse_args()
 
     if args.once:
-        run_cycle(args)
+        try:
+            run_cycle(args)
+        except Exception as exc:
+            print(f"[runner] Cycle failed at {_timestamp()}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
         return
 
     print(f"[runner] Starting continuous execution loop "

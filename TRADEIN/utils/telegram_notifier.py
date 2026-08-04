@@ -3,7 +3,13 @@
 Thin wrapper around the official `sendMessage` endpoint. Uses legacy
 Telegram "Markdown" parse mode (not MarkdownV2) since that's what
 `generator.trade_generator.format_telegram_message` emits (single `*bold*`,
-backtick code spans, no escaping of `.`/`-`/`()`).
+backtick code spans). Deliberately NOT switched to MarkdownV2: that mode
+reserves a much longer character set (`_*[]()~`>#+-=|{}.!`) and would
+require re-escaping every literal `*bold*`/`` `code` `` marker already
+hand-written across this module's templates, for no correctness benefit --
+legacy Markdown only treats `_ * `` [` specially, which `escape_markdown`/
+`escape_markdown_code` below handle for any dynamic value interpolated into
+a message.
 """
 from __future__ import annotations
 
@@ -17,6 +23,35 @@ TELEGRAM_CAPTION_LIMIT = 1024  # hard Bot API limit for sendPhoto captions
 
 def is_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def escape_markdown(text) -> str:
+    """Escape this bot's legacy-Markdown reserved characters (`_ * `` [`) in
+    a dynamic value before interpolating it into PLAIN or `*bold*` message
+    text (NOT inside a `` `code` `` span -- see `escape_markdown_code` for
+    that). Without this, a value containing an odd/unmatched count of any of
+    these -- e.g. the snake_case pattern/zone names `ta.mtfa` emits
+    (`pin_bar_rejection`, `trendline_support`), a status like `PARTIAL_TP1`,
+    or a real news headline with arbitrary punctuation -- leaves an
+    unterminated formatting entity and Telegram rejects the ENTIRE message
+    with a 400 "can't parse entities" error, exactly what happened to the
+    AVGO alert's follow-up text (a lone `_` inside `pin_bar_rejection` had no
+    matching partner once combined with `trendline_support`'s single `_`)."""
+    s = str(text).replace("\\", "\\\\")
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
+def escape_markdown_code(text) -> str:
+    """Escape a dynamic value that will be placed INSIDE a `` `...` `` code
+    span. Telegram's legacy Markdown does not parse nested entities inside
+    code/pre, so only a literal backtick or backslash needs escaping there --
+    running the plain-text `escape_markdown` on it instead would incorrectly
+    render a visible backslash in front of any underscore/asterisk (e.g. a
+    ticker like `BRK_B` would show as `BRK\\_B`)."""
+    s = str(text).replace("\\", "\\\\")
+    return s.replace("`", "\\`")
 
 
 def send_telegram_message(

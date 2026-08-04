@@ -1,38 +1,23 @@
 """Technical Analysis Engine: moving averages, Fibonacci levels, structure, momentum."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
 import pandas as pd
 
-from config import FIB_ZONE, MA_PROXIMITY_PCT, VOLUME_SPIKE_MULT
+from config import PRIMARY_MA_PERIOD, SECONDARY_MA_PERIOD, VOLUME_SPIKE_MULT
 
 
 # ---------------------------------------------------------------------------
-# Moving averages
+# Moving averages -- EMA20/EMA50 are deprecated as trend inputs; PRIMARY_MA_PERIOD
+# (200) is the absolute primary trend benchmark, SECONDARY_MA_PERIOD (150) the
+# secondary filter. Both come from config.py as the single source of truth.
 # ---------------------------------------------------------------------------
-def add_moving_averages(df: pd.DataFrame, periods=(20, 50, 200)) -> pd.DataFrame:
+def add_moving_averages(df: pd.DataFrame, periods=(SECONDARY_MA_PERIOD, PRIMARY_MA_PERIOD)) -> pd.DataFrame:
     out = df.copy()
     for p in periods:
         out[f"EMA{p}"] = out["Close"].ewm(span=p, adjust=False).mean()
         out[f"SMA{p}"] = out["Close"].rolling(p).mean()
     return out
-
-
-def ma_confluence(price: float, df: pd.DataFrame, tolerance_pct: float = MA_PROXIMITY_PCT) -> list[dict]:
-    """Return list of MAs (50/200 EMA) the price is currently hugging within tolerance."""
-    hits = []
-    last = df.iloc[-1]
-    for p in (50, 200):
-        col = f"EMA{p}"
-        if col not in df.columns or pd.isna(last[col]):
-            continue
-        ma_val = float(last[col])
-        dist_pct = (price - ma_val) / ma_val
-        if abs(dist_pct) <= tolerance_pct:
-            hits.append({"ma": col, "value": round(ma_val, 4), "distance_pct": round(dist_pct * 100, 2)})
-    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +42,6 @@ def fibonacci_levels(swing_high: float, swing_low: float) -> dict[str, float]:
     }
 
 
-def in_golden_zone(price: float, fib: dict[str, float], zone: tuple[float, float] = FIB_ZONE) -> bool:
-    lower, upper = sorted((fib[str(zone[0])], fib[str(zone[1])]))
-    return lower <= price <= upper
-
-
 # ---------------------------------------------------------------------------
 # Support / Resistance via simple pivot detection
 # ---------------------------------------------------------------------------
@@ -76,6 +56,25 @@ def pivot_levels(df: pd.DataFrame, window: int = 5, lookback: int = 120) -> dict
             lows.append(float(l[i]))
     return {"resistance": sorted(set(round(x, 4) for x in highs), reverse=True)[:5],
             "support": sorted(set(round(x, 4) for x in lows))[-5:]}
+
+
+def pivot_points_indexed(df: pd.DataFrame, window: int = 3, lookback: int = 104) -> tuple[list, list]:
+    """Same fractal pivot-high/low detection as `pivot_levels`, but keeping
+    each pivot's integer bar position (not just its price) so a caller can
+    fit a line through them -- used by `ta.mtfa`'s diagonal trendline zone
+    detection, which needs two pivots' relative *positions* to compute a
+    slope, not just their price levels. Returns (highs, lows), each a list
+    of (position, price) tuples in chronological order, position being the
+    row index within `df.tail(lookback)` (0 = oldest bar in that window)."""
+    d = df.tail(lookback).reset_index(drop=True)
+    h, l = d["High"].values, d["Low"].values
+    highs, lows = [], []
+    for i in range(window, len(d) - window):
+        if h[i] == max(h[i - window:i + window + 1]):
+            highs.append((i, float(h[i])))
+        if l[i] == min(l[i - window:i + window + 1]):
+            lows.append((i, float(l[i])))
+    return highs, lows
 
 
 def nearest_levels(price: float, levels: dict[str, list[float]]) -> dict:
@@ -108,6 +107,19 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
     return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": macd_line - signal_line})
 
 
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range (Wilder smoothing), used for order-block impulse
+    strength and stop-buffer sizing."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
 def volume_spike(df: pd.DataFrame, mult: float = VOLUME_SPIKE_MULT, lookback: int = 20) -> tuple[bool, float]:
     avg_vol = df["Volume"].tail(lookback + 1).iloc[:-1].mean()
     last_vol = df["Volume"].iloc[-1]
@@ -118,89 +130,19 @@ def volume_spike(df: pd.DataFrame, mult: float = VOLUME_SPIKE_MULT, lookback: in
 
 
 # ---------------------------------------------------------------------------
-# Aggregate result
+# Trend classification
 # ---------------------------------------------------------------------------
-@dataclass
-class TAResult:
-    ticker: str
-    price: float
-    trend_1d: str
-    ma_hits: list = field(default_factory=list)
-    fib_levels: dict = field(default_factory=dict)
-    in_golden_zone: bool = False
-    swing_high: float = 0.0
-    swing_low: float = 0.0
-    levels: dict = field(default_factory=dict)
-    rsi_value: float = 50.0
-    macd_bullish: bool = False
-    vol_spike: bool = False
-    vol_ratio: float = 0.0
-    direction_bias: str = "NEUTRAL"  # LONG / SHORT / NEUTRAL
-    thesis: str = ""
-
-
 def determine_trend(df: pd.DataFrame) -> str:
+    """UPTREND/DOWNTREND requires Close and the secondary EMA to both be on
+    the same side of the primary EMA (150/200 by default) -- the same
+    fast-above-slow structure the old 50/200 pairing used, just with
+    EMA20/EMA50 deprecated as trend inputs per config.py."""
+    secondary_col, primary_col = f"EMA{SECONDARY_MA_PERIOD}", f"EMA{PRIMARY_MA_PERIOD}"
     last = df.iloc[-1]
-    if pd.isna(last.get("EMA50")) or pd.isna(last.get("EMA200")):
+    if pd.isna(last.get(secondary_col)) or pd.isna(last.get(primary_col)):
         return "UNKNOWN"
-    if last["Close"] > last["EMA50"] > last["EMA200"]:
+    if last["Close"] > last[secondary_col] > last[primary_col]:
         return "UPTREND"
-    if last["Close"] < last["EMA50"] < last["EMA200"]:
+    if last["Close"] < last[secondary_col] < last[primary_col]:
         return "DOWNTREND"
     return "MIXED"
-
-
-def analyze(ticker: str, df_1d: pd.DataFrame, swing_lookback: int = 60) -> TAResult:
-    df_1d = add_moving_averages(df_1d)
-    price = float(df_1d["Close"].iloc[-1])
-    trend = determine_trend(df_1d)
-    hits = ma_confluence(price, df_1d)
-    hi, lo, _, _ = find_swing_high_low(df_1d, lookback=swing_lookback)
-    fib = fibonacci_levels(hi, lo)
-    golden = in_golden_zone(price, fib)
-    levels = pivot_levels(df_1d)
-    near = nearest_levels(price, levels)
-    rsi_series = rsi(df_1d["Close"])
-    rsi_val = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-    macd_df = macd(df_1d["Close"])
-    macd_bull = bool(macd_df["hist"].iloc[-1] > 0)
-    spike, ratio = volume_spike(df_1d)
-
-    direction = "NEUTRAL"
-    thesis_bits = []
-    if trend == "UPTREND" and (hits or golden):
-        direction = "LONG"
-    elif trend == "DOWNTREND" and (hits or golden):
-        direction = "SHORT"
-
-    if hits:
-        thesis_bits.append(
-            "Price hugging " + ", ".join(f"{h['ma']} ({h['distance_pct']:+.2f}%)" for h in hits)
-        )
-    if golden:
-        thesis_bits.append(f"Inside Fibonacci golden zone ({fib['0.618']:.4g}-{fib['0.5']:.4g})")
-    if near.get("nearest_support"):
-        thesis_bits.append(f"Support near {near['nearest_support']:.4g}")
-    if near.get("nearest_resistance"):
-        thesis_bits.append(f"Resistance near {near['nearest_resistance']:.4g}")
-    thesis_bits.append(f"Trend: {trend}, RSI {rsi_val:.1f}, MACD {'bullish' if macd_bull else 'bearish'}")
-    if spike:
-        thesis_bits.append(f"Volume spike {ratio}x 20-day avg")
-
-    return TAResult(
-        ticker=ticker,
-        price=price,
-        trend_1d=trend,
-        ma_hits=hits,
-        fib_levels=fib,
-        in_golden_zone=golden,
-        swing_high=hi,
-        swing_low=lo,
-        levels={**levels, **near},
-        rsi_value=rsi_val,
-        macd_bullish=macd_bull,
-        vol_spike=spike,
-        vol_ratio=ratio,
-        direction_bias=direction,
-        thesis="; ".join(thesis_bits),
-    )

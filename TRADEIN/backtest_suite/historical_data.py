@@ -23,13 +23,21 @@ from config import BINANCE_BASE_URL, REQUEST_TIMEOUT
 
 # Calendar-day buffer fetched *before* the requested start date so that on
 # day 1 of the backtest window there is already enough history for a 200-day
-# EMA, the swing-high/low lookback (60), and the pivot lookback (120).
-WARMUP_CALENDAR_DAYS = 400
+# EMA, the swing-high/low lookback (60), the pivot lookback (120), and >=60
+# weekly bars once resampled for the HTF MTFA pass (60 weeks ~ 420 days).
+WARMUP_CALENDAR_DAYS = 500
 
 # Calendar-day buffer fetched *after* the requested end date so a signal
-# generated on the last day of the window still has forward bars available
-# to simulate against.
-FORWARD_CALENDAR_DAYS = 30
+# generated late in the window still has forward bars available to simulate
+# against. Trades are no longer force-closed at a fixed day count (see
+# simulator.py) -- they run until TP/SL/a dynamic reversal exit, which for
+# this MTFA/weekly-structure strategy can realistically take weeks to
+# months, not the old 10-trading-day assumption. 180 days gives that room.
+# A trade that still hasn't resolved when this buffer runs out is reported
+# as OPEN (unresolved), not force-closed -- there is a hard limit on how
+# much *real* historical data can exist beyond `end`, and fabricating an
+# exit at an arbitrary cutoff is exactly the behavior being removed here.
+FORWARD_CALENDAR_DAYS = 180
 
 
 def fetch_stock_history(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
@@ -99,8 +107,10 @@ def trading_dates(df: pd.DataFrame, start: dt.date, end: dt.date) -> list[pd.Tim
     return list(df.index[mask])
 
 
-def forward_window(df: pd.DataFrame, signal_date: pd.Timestamp, n_days: int) -> pd.DataFrame:
-    """Rows strictly after `signal_date`, up to `n_days` trading sessions -- the
-    only data the simulator is allowed to look at when grading a trade."""
+def forward_window(df: pd.DataFrame, signal_date: pd.Timestamp, n_days: int | None = None) -> pd.DataFrame:
+    """Rows strictly after `signal_date` -- the only data the simulator is
+    allowed to look at when grading a trade. `n_days=None` (the default)
+    returns every available forward row, i.e. no fixed-duration cutoff;
+    pass an int to cap it to that many trading sessions."""
     future = df.loc[df.index > signal_date]
     return future.iloc[:n_days]

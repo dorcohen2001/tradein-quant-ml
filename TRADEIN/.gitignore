@@ -1,5 +1,10 @@
 .env
 __pycache__/
 *.pyc
-paper_trading/trades.json
-paper_trading/paper_trades_journal.xlsx
+paper_trading/trades_livne.json
+paper_trading/trades_biton.json
+journals/trade_journal_livne.xlsx
+journals/trade_journal_biton.xlsx
+macro/market_snapshots.json
+funnel_logs/
+.cache/

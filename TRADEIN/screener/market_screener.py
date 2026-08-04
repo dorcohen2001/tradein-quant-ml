@@ -1,12 +1,19 @@
 """Market Screener & Asset Selection Engine.
 
-Scans stock and crypto watchlists, applies liquidity/technical/relative-strength/
-catalyst filters, assigns a weighted confluence score (0-100), and selects the
-top-scoring candidates for downstream analysis.
+Cheap liquidity/market-cap/earnings-blackout filters run first (a single 1D
+fetch each), then `strategy.strategy_engine.evaluate_setup` runs the full
+MTFA + liquidity + correlation-gate + RiskManager chain -- that's the
+expensive part (HTF weekly/monthly + ITF 12H/8H/4H fetches per ticker), so it
+only runs on names that already cleared the cheap gates. Passing setups are
+assigned a weighted confluence score (0-100) and the top-scoring candidates
+are selected for downstream alerting.
 
-Per-ticker work is I/O-bound (HTTP fetches), so the watchlist is scanned with a
-thread pool; results are re-sorted by score at the end so output ordering is
-deterministic regardless of completion order.
+There is no static minimum-price filter -- liquidity (a 20-day SMA of dollar
+volume) and market cap are what actually gate out unsuitable names.
+
+Per-ticker work is I/O-bound (HTTP fetches), so the watchlist is scanned with
+a thread pool; results are re-sorted by score at the end so output ordering
+is deterministic regardless of completion order.
 """
 from __future__ import annotations
 
@@ -19,27 +26,52 @@ import pandas as pd
 
 from config import (
     CRYPTO_BENCHMARK,
+    DOLLAR_VOLUME_SMA_LOOKBACK,
     EARNINGS_BLACKOUT_HOURS,
-    MIN_DOLLAR_VOLUME,
+    HTF_VOLUME_CONFLUENCE_MULT,
+    ITF_VOLUME_SPIKE_MULT,
+    MIN_CRYPTO_DOLLAR_VOLUME_SMA20,
+    MIN_STOCK_DOLLAR_VOLUME_SMA20,
     MIN_STOCK_MARKET_CAP,
-    MIN_STOCK_PRICE,
     RS_LOOKBACK_DAYS,
     SCORE_WEIGHTS,
     STOCK_BENCHMARKS,
     TOP_N_ASSETS,
-    VOLUME_SPIKE_MULT,
     WATCHLIST_CRYPTO,
     WATCHLIST_STOCKS,
 )
-from ta.ta_engine import TAResult, analyze, volume_spike
+from macro.macro_analyzer import MacroContext
+from strategy.strategy_engine import StrategyDecision, evaluate_setup
 from utils.data_fetch import (
     get_binance_klines,
     get_next_earnings_date,
     get_stock_history,
-    get_stock_fast_info,
+    get_stock_market_cap,
 )
 
 SCAN_WORKERS = 8  # concurrent fetch/analyze workers per watchlist scan
+
+
+def _dollar_volume_sma(df: pd.DataFrame, lookback: int = DOLLAR_VOLUME_SMA_LOOKBACK) -> float:
+    """20-day SMA of Close * Volume -- a dynamic liquidity metric that a
+    single noisy bar can't flip in or out, unlike a last-bar dollar-volume
+    check."""
+    dollar_volume = df["Close"] * df["Volume"]
+    return float(dollar_volume.tail(lookback).mean())
+
+
+def _monthly_bias_score(direction: str, monthly_trend: str) -> float:
+    """Monthly HTF structure is macro context/bias for scoring, not a hard
+    rejection gate (see `ta.mtfa.htf_pass`) -- a monthly uptrend doesn't
+    block a legitimate weekly/daily SHORT pullback, it just scores lower on
+    macro alignment than a setup the monthly trend actually agrees with."""
+    agreeing = "UPTREND" if direction == "LONG" else "DOWNTREND"
+    conflicting = "DOWNTREND" if direction == "LONG" else "UPTREND"
+    if monthly_trend == agreeing:
+        return 1.0
+    if monthly_trend == conflicting:
+        return 0.0
+    return 0.5  # MIXED / UNKNOWN -- neutral, not enough monthly signal either way
 
 
 @dataclass
@@ -47,9 +79,8 @@ class Candidate:
     ticker: str
     asset_class: str
     score: float
-    ta: TAResult
+    decision: StrategyDecision
     dollar_volume: float
-    vol_ratio: float
     rs_pct: float
     earnings_hours_away: float | None
     breakdown: dict = field(default_factory=dict)
@@ -61,26 +92,38 @@ def _n_day_return(df: pd.DataFrame, n: int) -> float:
     return float(df["Close"].iloc[-1] / df["Close"].iloc[-1 - n] - 1)
 
 
-def _score_candidate(ta: TAResult, vol_ratio: float, dollar_volume: float, rs_pct: float,
+def _score_candidate(decision: StrategyDecision, dollar_volume: float, rs_pct: float,
                       earnings_hours_away: float | None) -> tuple[float, dict]:
     w = SCORE_WEIGHTS
     breakdown = {}
+    setup = decision.setup
 
-    # --- TA confluence (0-1) ---
-    ta_score = 0.0
-    if ta.ma_hits:
-        ta_score += 0.5
-    if ta.in_golden_zone:
-        ta_score += 0.3
-    if ta.trend_1d in ("UPTREND", "DOWNTREND"):
-        ta_score += 0.2
+    # --- TA confluence (0-1): HTF zone + divergence + ITF primary-MA alignment + monthly bias + weekly volume bonus ---
+    ta_score = 0.25  # a decision only exists if a valid HTF zone was already matched
+    if (setup.direction_bias == "LONG" and setup.divergence.bullish) or \
+       (setup.direction_bias == "SHORT" and setup.divergence.bearish):
+        ta_score += 0.20
+    ta_score += (setup.itf_ma200_aligned_count / 3) * 0.20
+    ta_score += _monthly_bias_score(decision.direction, setup.monthly_trend) * 0.15
+    # Weekly volume confluence at the HTF zone is a scoring bonus, not a gate
+    # (see ta.mtfa.htf_pass) -- a low-volume retest still qualifies, it just
+    # scores lower on this component than a zone touch backed by real volume.
+    if setup.htf_volume_ratio >= HTF_VOLUME_CONFLUENCE_MULT:
+        ta_score += 0.20
     ta_score = min(ta_score, 1.0)
     breakdown["ta_confluence"] = round(ta_score * w["ta_confluence"], 1)
 
-    # --- Volume (0-1): liquidity gate already applied upstream; reward spike magnitude ---
-    liquidity_ok = dollar_volume >= MIN_DOLLAR_VOLUME
-    vol_score = (0.5 if liquidity_ok else 0.0) + min(vol_ratio / VOLUME_SPIKE_MULT, 1.0) * 0.5
-    vol_score = min(vol_score, 1.0)
+    # --- Volume / liquidity (0-1): SMA20 dollar-volume gate + ITF volume spike + liquidity-cluster confluence ---
+    liquidity_floor = MIN_CRYPTO_DOLLAR_VOLUME_SMA20 if decision.asset_class == "crypto" else MIN_STOCK_DOLLAR_VOLUME_SMA20
+    liquidity_gate = 1.0 if dollar_volume >= liquidity_floor else 0.0
+    itf_vol_component = min(setup.itf_volume_ratio / ITF_VOLUME_SPIKE_MULT, 1.0)
+    if decision.liquidity.favored_direction == decision.direction:
+        liquidity_confluence = 1.0
+    elif decision.liquidity.favored_direction is None:
+        liquidity_confluence = 0.5
+    else:
+        liquidity_confluence = 0.0
+    vol_score = (liquidity_gate + itf_vol_component + liquidity_confluence) / 3
     breakdown["volume"] = round(vol_score * w["volume"], 1)
 
     # --- Relative strength (0-1): scaled, +/-5% outperformance maps to full score ---
@@ -98,23 +141,20 @@ def _score_candidate(ta: TAResult, vol_ratio: float, dollar_volume: float, rs_pc
     return round(total, 1), breakdown
 
 
-def _scan_stock_ticker(ticker: str, bench_ret: float) -> Candidate | None:
+def _scan_stock_ticker(ticker: str, bench_ret: float, macro: MacroContext) -> Candidate | None:
     try:
         df = get_stock_history(ticker, period="1y", interval="1d")
         if df.empty or len(df) < 60:
             return None
 
-        price = float(df["Close"].iloc[-1])
-        volume = float(df["Volume"].iloc[-1])
-        dollar_volume = price * volume
-        if dollar_volume < MIN_DOLLAR_VOLUME:
+        dollar_volume = _dollar_volume_sma(df)
+        if dollar_volume < MIN_STOCK_DOLLAR_VOLUME_SMA20:
             return None
 
-        # Safety filter: hard exclude penny stocks / micro-caps regardless
-        # of how they ended up on the watchlist.
-        if price < MIN_STOCK_PRICE:
-            return None
-        market_cap = get_stock_fast_info(ticker).get("market_cap")
+        # Safety filter: hard exclude micro-caps regardless of how they
+        # ended up on the watchlist. No static minimum price -- liquidity
+        # and market cap are what actually gate this.
+        market_cap = get_stock_market_cap(ticker)
         if market_cap is not None and market_cap < MIN_STOCK_MARKET_CAP:
             return None
 
@@ -126,19 +166,17 @@ def _scan_stock_ticker(ticker: str, bench_ret: float) -> Candidate | None:
             if 0 <= hours_away <= EARNINGS_BLACKOUT_HOURS:
                 return None  # Catalyst Safety Filter: hard exclude
 
-        ta_result = analyze(ticker, df)
-        spike, ratio = volume_spike(df)
+        decision, reason = evaluate_setup(ticker, "stocks", macro)
+        if decision is None:
+            return None
+
         asset_ret = _n_day_return(df, RS_LOOKBACK_DAYS)
         rs_pct = (asset_ret - bench_ret) * 100
 
-        has_setup = bool(ta_result.ma_hits) or ta_result.in_golden_zone
-        if not has_setup:
-            return None
-
-        score, breakdown = _score_candidate(ta_result, ratio, dollar_volume, rs_pct, hours_away)
+        score, breakdown = _score_candidate(decision, dollar_volume, rs_pct, hours_away)
         return Candidate(
-            ticker=ticker, asset_class="stocks", score=score, ta=ta_result,
-            dollar_volume=dollar_volume, vol_ratio=ratio, rs_pct=rs_pct,
+            ticker=ticker, asset_class="stocks", score=score, decision=decision,
+            dollar_volume=dollar_volume, rs_pct=rs_pct,
             earnings_hours_away=hours_away, breakdown=breakdown,
         )
     except Exception as exc:
@@ -146,31 +184,27 @@ def _scan_stock_ticker(ticker: str, bench_ret: float) -> Candidate | None:
         return None
 
 
-def _scan_crypto_symbol(symbol: str, bench_ret: float) -> Candidate | None:
+def _scan_crypto_symbol(symbol: str, bench_ret: float, macro: MacroContext) -> Candidate | None:
     try:
         df = get_binance_klines(symbol, interval="1d", limit=300)
         if df.empty or len(df) < 60:
             return None
 
-        price = float(df["Close"].iloc[-1])
-        volume = float(df["Volume"].iloc[-1])
-        dollar_volume = price * volume
-        if dollar_volume < MIN_DOLLAR_VOLUME:
+        dollar_volume = _dollar_volume_sma(df)
+        if dollar_volume < MIN_CRYPTO_DOLLAR_VOLUME_SMA20:
             return None
 
-        ta_result = analyze(symbol, df)
-        spike, ratio = volume_spike(df)
+        decision, reason = evaluate_setup(symbol, "crypto", macro)
+        if decision is None:
+            return None
+
         asset_ret = _n_day_return(df, RS_LOOKBACK_DAYS)
         rs_pct = (asset_ret - bench_ret) * 100 if symbol != CRYPTO_BENCHMARK else 0.0
 
-        has_setup = bool(ta_result.ma_hits) or ta_result.in_golden_zone
-        if not has_setup:
-            return None
-
-        score, breakdown = _score_candidate(ta_result, ratio, dollar_volume, rs_pct, None)
+        score, breakdown = _score_candidate(decision, dollar_volume, rs_pct, None)
         return Candidate(
-            ticker=symbol, asset_class="crypto", score=score, ta=ta_result,
-            dollar_volume=dollar_volume, vol_ratio=ratio, rs_pct=rs_pct,
+            ticker=symbol, asset_class="crypto", score=score, decision=decision,
+            dollar_volume=dollar_volume, rs_pct=rs_pct,
             earnings_hours_away=None, breakdown=breakdown,
         )
     except Exception as exc:
@@ -178,24 +212,24 @@ def _scan_crypto_symbol(symbol: str, bench_ret: float) -> Candidate | None:
         return None
 
 
-def scan_stocks(watchlist: list[str] | None = None) -> list[Candidate]:
+def scan_stocks(macro: MacroContext, watchlist: list[str] | None = None) -> list[Candidate]:
     watchlist = watchlist or WATCHLIST_STOCKS
     benchmark_df = get_stock_history(STOCK_BENCHMARKS["default"], period="6mo", interval="1d")
     bench_ret = _n_day_return(benchmark_df, RS_LOOKBACK_DAYS)
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        results = pool.map(lambda t: _scan_stock_ticker(t, bench_ret), watchlist)
+        results = pool.map(lambda t: _scan_stock_ticker(t, bench_ret, macro), watchlist)
     candidates = [c for c in results if c is not None]
     return sorted(candidates, key=lambda c: c.score, reverse=True)
 
 
-def scan_crypto(watchlist: list[str] | None = None) -> list[Candidate]:
+def scan_crypto(macro: MacroContext, watchlist: list[str] | None = None) -> list[Candidate]:
     watchlist = watchlist or WATCHLIST_CRYPTO
     benchmark_df = get_binance_klines(CRYPTO_BENCHMARK, interval="1d", limit=300)
     bench_ret = _n_day_return(benchmark_df, RS_LOOKBACK_DAYS)
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        results = pool.map(lambda s: _scan_crypto_symbol(s, bench_ret), watchlist)
+        results = pool.map(lambda s: _scan_crypto_symbol(s, bench_ret, macro), watchlist)
     candidates = [c for c in results if c is not None]
     return sorted(candidates, key=lambda c: c.score, reverse=True)
 

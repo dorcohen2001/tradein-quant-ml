@@ -16,8 +16,9 @@ from config import PAPER_TRADING_JOURNAL_XLSX
 
 COLUMNS = [
     "ID", "Signal Date", "Ticker", "Asset Class", "Direction",
-    "Entry Zone", "Stop Loss", "Target 1", "Target 2", "Status",
-    "Telegram Message ID", "Exit Date", "Exit Price", "PnL %",
+    "Entry Zone", "Stop Loss", "Initial Stop", "Target 1", "Target 2", "Status",
+    "TP1 Hit", "TP1 Exit Price", "Breakeven Price", "Remaining Size %",
+    "Emergency Exit Reason", "Telegram Message ID", "Exit Date", "Exit Price", "PnL %",
 ]
 
 
@@ -35,9 +36,15 @@ def _row_values(trade: dict) -> list:
         trade["direction"],
         _entry_zone_str(trade),
         trade["stop_loss"],
+        trade.get("initial_stop_loss"),
         trade["target1"],
         trade["target2"],
         trade["current_status"],
+        trade.get("tp1_hit", False),
+        trade.get("tp1_exit_price"),
+        trade.get("breakeven_price"),
+        trade.get("remaining_size_pct"),
+        trade.get("emergency_exit_reason"),
         trade.get("telegram_message_id"),
         trade.get("exit_date"),
         trade.get("exit_price"),

@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+paper_trading/trades.json
+paper_trading/paper_trades_journal.xlsx
