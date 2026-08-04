@@ -1,0 +1,28 @@
+# Consolidated dependencies for the whole repository: both model pipelines
+# (models/livne, models/biton), the shared core/ package, the Steve analyzer
+# (agents/steve), and the mail sender (mail/). Previously duplicated across
+# four separate requirements.txt files that had already drifted apart (numpy
+# >=1.24 vs >=1.26); the stricter pin wins wherever they disagreed.
+#
+#     pip install -r requirements.txt
+
+# --- Market data / analysis ---------------------------------------------
+yfinance>=0.2.40
+pandas>=2.0
+pandas_market_calendars>=4.0     # NYSE session calendar (core/utils/market_hours.py)
+numpy>=1.26
+requests>=2.31
+
+# --- News / sentiment ----------------------------------------------------
+feedparser>=6.0
+vaderSentiment>=3.3.2
+
+# --- Config / secrets ----------------------------------------------------
+python-dotenv>=1.0
+
+# --- Excel journals + funnel diagnostics ---------------------------------
+openpyxl>=3.1
+
+# --- Chart rendering (core/charting) -------------------------------------
+plotly>=5.18,<6
+kaleido==0.2.1

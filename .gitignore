@@ -1,20 +1,29 @@
-# Secrets
+# Single .gitignore for the whole repository. Previously there were three
+# (root, TRADEIN/, backuptrade1/) with overlapping and already-stale rules
+# pointing at paths that no longer exist.
+
+# --- Secrets -------------------------------------------------------------
 .env
 **/.env
 
-# Python
+# --- Python --------------------------------------------------------------
 __pycache__/
 *.pyc
 
-# Runtime data / generated artifacts
-# (wildcarded so these still match after Steve's script location changes)
-**/llm_request.json
-**/analyzer.log*
-Agents/Steve - Daily Analyst/narrative_*.md
-TRADEIN/paper_trading/trades.json
-TRADEIN/paper_trading/paper_trades_journal.xlsx
-Graphs/*.png
-MailToMail/Scripts/
+# --- Runtime state -------------------------------------------------------
+# Everything mutable now lives under runtime/. Ignored wholesale rather than
+# rule-by-rule, so a new artifact type can't silently start being committed.
+# The one deliberate exception: .gitkeep files, so the directory skeleton is
+# versioned and a fresh clone starts with the layout already in place.
+runtime/*
+!runtime/.gitkeep
+!runtime/*/
+runtime/*/*
+!runtime/*/.gitkeep
+!runtime/cache/*/
+runtime/cache/*/*
+!runtime/cache/*/.gitkeep
 
-# Manual backups (superseded by git history)
-BackUp/
+# --- Generated reports / narratives --------------------------------------
+mail/reports/
+agents/steve/narrative_*.md
