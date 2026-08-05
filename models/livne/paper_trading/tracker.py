@@ -307,6 +307,13 @@ def update_open_positions() -> list[dict]:
                 _close_trade(trade, "WIN_TP2", trade["target2"], entry_price)
                 changed.append(trade)
 
+    # Stamp every transition in one place. `exit_date` alone is not enough for
+    # the daily summary: PARTIAL_TP1 is a status CHANGE but not a close, so it
+    # never sets exit_date, and a trade that entered days ago but hit TP1 today
+    # would be invisible to a 24-hour reporting window.
+    for trade in changed:
+        trade["last_status_change"] = _now()
+
     _save(trades)
     for trade in changed:
         journal.upsert_trade_row(trade)

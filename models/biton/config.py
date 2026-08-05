@@ -174,6 +174,28 @@ YF_RETRY_DELAYS = (2, 5, 10)
 CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
 
 # ---------------------------------------------------------------------------
+# Scheduled Telegram summaries (core.reporting.summary)
+#
+# Same schedule as Livne but reported SEPARATELY, with its own state file --
+# the two models must never share a send-once marker or whichever ran first
+# would suppress the other's report.
+#
+# The check lives in run_cycle rather than the main loop because this runner is
+# normally launched by Livne with `--once`: the loop never executes, so a
+# loop-level check would mean Biton never reported at all. For the same reason
+# the marker must be file-persisted -- the process exits every cycle.
+# ---------------------------------------------------------------------------
+DAILY_REPORT_HOUR = 21
+WEEKLY_REPORT_WEEKDAY = 4  # Friday
+REPORT_STATE_STORE = os.path.join(RUNTIME_DIR, "stores", "report_state_biton.json")
+SEND_EMPTY_DAILY_REPORT = True
+
+# Biton's lifecycle: single-shot TP, so every reportable status is terminal
+# and there are no non-terminal update statuses.
+REPORT_CLOSED_STATUSES = ("WIN_TP1", "WIN_TP2", "LOSS_SL", "EXPIRED")
+REPORT_UPDATE_STATUSES = ()
+
+# ---------------------------------------------------------------------------
 # Execution / fill-price simulation
 # ---------------------------------------------------------------------------
 MAX_SLIPPAGE_PCT = 0.0015  # 0.15% max adverse slippage modeled on a stop-loss fill

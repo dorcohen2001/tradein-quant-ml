@@ -490,6 +490,30 @@ FUNNEL_EXPORT_INTERVAL_MINUTES = 15
 PENDING_EXPIRY_HOURS = 6
 
 # ---------------------------------------------------------------------------
+# Scheduled Telegram summaries (core.reporting.summary)
+#
+# Daily at DAILY_REPORT_HOUR local, weekly additionally on WEEKLY_REPORT_WEEKDAY
+# (0=Mon .. 4=Fri). Fired from run_cycle, guarded by a date marker in
+# REPORT_STATE_STORE so each report goes out exactly once per day regardless of
+# how many cycles fall inside the hour (at a 2-minute cadence, ~30 do).
+#
+# The state file is per-model: Livne and Biton report independently and must
+# never share a marker, or whichever ran first would suppress the other.
+# ---------------------------------------------------------------------------
+DAILY_REPORT_HOUR = 21
+WEEKLY_REPORT_WEEKDAY = 4  # Friday
+REPORT_STATE_STORE = os.path.join(RUNTIME_DIR, "stores", "report_state_livne.json")
+# Send the daily summary even when nothing happened. Kept on by default: a
+# short "none / none" message each evening is a useful liveness signal that
+# the runner is still up. Set False to only report on activity.
+SEND_EMPTY_DAILY_REPORT = True
+
+# Livne's lifecycle. CLOSED are terminal; UPDATE are non-terminal status
+# changes still worth surfacing (PARTIAL_TP1 banks half the position).
+REPORT_CLOSED_STATUSES = ("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT", "EXPIRED")
+REPORT_UPDATE_STATUSES = ("PARTIAL_TP1",)
+
+# ---------------------------------------------------------------------------
 # Execution / fill-price simulation
 # ---------------------------------------------------------------------------
 MAX_SLIPPAGE_PCT = 0.0015  # 0.15% max adverse slippage modeled on a stop-loss fill

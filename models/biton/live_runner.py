@@ -30,14 +30,33 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
-from config import CHART_OUTPUT_DIR, CYCLE_INTERVAL_MINUTES, MODEL_NAME, TOP_N_ASSETS
+from config import (
+    CHART_OUTPUT_DIR,
+    CYCLE_INTERVAL_MINUTES,
+    DAILY_REPORT_HOUR,
+    MODEL_NAME,
+    REPORT_CLOSED_STATUSES,
+    REPORT_STATE_STORE,
+    REPORT_UPDATE_STATUSES,
+    SEND_EMPTY_DAILY_REPORT,
+    TOP_N_ASSETS,
+    WEEKLY_REPORT_WEEKDAY,
+)
+from core.reporting.summary import (
+    build_daily_summary,
+    build_weekly_summary,
+    daily_report_due,
+    load_report_state,
+    save_report_state,
+    weekly_report_due,
+)
 from core.news.news_analyzer import analyze_sentiment
 from core.utils.chart_attachment import generate_chart_for_setup
 from core.utils.market_hours import is_market_open
 from core.utils.telegram_notifier import escape_markdown, escape_markdown_code, send_telegram_message, send_telegram_photo
 from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
-from paper_trading.tracker import has_open_trade, log_trade, update_open_positions
+from paper_trading.tracker import get_all_trades, has_open_trade, log_trade, update_open_positions
 from screener.funnel_diagnostics import export_funnel_report, run_diagnostics
 from screener.market_screener import scan_crypto, scan_stocks
 from utils.data_fetch import get_binance_klines, get_stock_history
@@ -214,6 +233,55 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
     return reports
 
 
+def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
+    """Emit the daily (and, on Friday, weekly) summary if they are due.
+
+    Deliberately called from `run_cycle`, not from the main loop: this runner
+    is normally launched by Livne with `--once`, so the loop never executes and
+    a loop-level check would mean Biton never reported at all. For the same
+    reason the send-once marker is file-persisted -- the process exits every
+    cycle, so an in-memory variable would reset and re-send each time.
+
+    Biton keeps its OWN state file, so its reports are fully independent of
+    Livne's; neither model can suppress the other's summary.
+
+    Wrapped so a reporting failure can never interrupt scanning or position
+    management."""
+    now = now or dt.datetime.now()
+    sent: list[str] = []
+    try:
+        state = load_report_state(REPORT_STATE_STORE)
+        trades = get_all_trades()
+
+        if daily_report_due(state, now, DAILY_REPORT_HOUR):
+            message = build_daily_summary(
+                MODEL_NAME, trades, now,
+                closed_statuses=REPORT_CLOSED_STATUSES,
+                update_statuses=REPORT_UPDATE_STATUSES,
+            )
+            has_activity = "_none_" not in message or message.count("_none_") < 2
+            if has_activity or SEND_EMPTY_DAILY_REPORT:
+                send_telegram_message(message)
+                sent.append("daily")
+            state["last_daily_report_date"] = now.date().isoformat()
+
+        if weekly_report_due(state, now, DAILY_REPORT_HOUR, WEEKLY_REPORT_WEEKDAY):
+            send_telegram_message(build_weekly_summary(
+                MODEL_NAME, trades, now, closed_statuses=REPORT_CLOSED_STATUSES,
+            ))
+            state["last_weekly_report_date"] = now.date().isoformat()
+            sent.append("weekly")
+
+        if sent:
+            save_report_state(REPORT_STATE_STORE, state)
+            print(f"[report] Sent {'/'.join(sent)} summary for {MODEL_NAME}.", file=sys.stderr)
+        elif state.get("last_daily_report_date") == now.date().isoformat():
+            save_report_state(REPORT_STATE_STORE, state)
+    except Exception as exc:
+        print(f"[report] Summary dispatch failed (scan/positions unaffected): {exc}", file=sys.stderr)
+    return sent
+
+
 def run_cycle(args) -> None:
     """Execute a single scan + position-refresh cycle. `--skip-scan` runs
     positions only; `--skip-positions` runs the scan only -- used by the
@@ -223,6 +291,12 @@ def run_cycle(args) -> None:
     if not args.skip_positions:
         print("[paper] Refreshing open paper trade positions...", file=sys.stderr)
         process_open_positions()
+
+    # After position management, so a close that just happened this cycle is
+    # already reflected in the summary. Outside the skip_positions guard: the
+    # summary must still go out on the scan-phase invocation, because Livne
+    # splits Biton's cycle into a positions phase and a scan phase.
+    send_scheduled_summaries()
 
     if args.skip_scan:
         return

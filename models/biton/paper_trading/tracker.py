@@ -218,6 +218,12 @@ def update_open_positions() -> list[dict]:
             trade["pnl_pct"] = _pnl_pct(direction, entry_price, exit_price)
             changed.append(trade)
 
+    # Stamp every transition in one place, so the daily summary can filter on
+    # "changed in the last 24h" rather than on exit_date, which is only written
+    # for a full close.
+    for trade in changed:
+        trade["last_status_change"] = _now()
+
     _save(trades)
     for trade in changed:
         journal.upsert_trade_row(trade)

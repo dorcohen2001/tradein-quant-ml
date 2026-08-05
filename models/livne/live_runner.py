@@ -62,9 +62,23 @@ from config import (
     BITON_PHASE_TIMEOUT_SECONDS,
     CHART_OUTPUT_DIR,
     CYCLE_INTERVAL_MINUTES,
+    DAILY_REPORT_HOUR,
     FUNNEL_EXPORT_INTERVAL_MINUTES,
     MODEL_NAME,
+    REPORT_CLOSED_STATUSES,
+    REPORT_STATE_STORE,
+    REPORT_UPDATE_STATUSES,
+    SEND_EMPTY_DAILY_REPORT,
     TOP_N_ASSETS,
+    WEEKLY_REPORT_WEEKDAY,
+)
+from core.reporting.summary import (
+    build_daily_summary,
+    build_weekly_summary,
+    daily_report_due,
+    load_report_state,
+    save_report_state,
+    weekly_report_due,
 )
 from core.news.news_analyzer import analyze_sentiment
 from core.utils.chart_attachment import generate_chart_for_setup
@@ -72,7 +86,7 @@ from core.utils.market_hours import is_market_open
 from core.utils.telegram_notifier import escape_markdown, escape_markdown_code, send_telegram_message, send_telegram_photo
 from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
-from paper_trading.tracker import has_open_trade, log_trade, update_open_positions
+from paper_trading.tracker import get_all_trades, has_open_trade, log_trade, update_open_positions
 from screener.funnel_diagnostics import export_funnel_report, run_diagnostics
 from screener.market_screener import scan_crypto, scan_stocks
 from utils.data_fetch import get_binance_klines, get_stock_history
@@ -332,6 +346,57 @@ _biton_gate = _IntervalGate(BITON_CYCLE_INTERVAL_MINUTES)
 _funnel_gate = _IntervalGate(FUNNEL_EXPORT_INTERVAL_MINUTES)
 
 
+def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
+    """Emit the daily (and, on Friday, weekly) summary if they are due.
+
+    Called once per cycle from `run_cycle`. Returns the labels actually sent,
+    for logging and tests.
+
+    Placed in `run_cycle` rather than the main loop on purpose: it is the one
+    code path that executes under BOTH `--once` and the continuous loop, which
+    keeps this identical in shape to Biton's copy (whose loop never runs at
+    all, since Livne always invokes it with `--once`).
+
+    Wrapped so a reporting failure -- a locked state file, a Telegram outage --
+    can never interrupt scanning or position management. A missed summary is an
+    inconvenience; a crashed cycle with open positions is not."""
+    now = now or dt.datetime.now()
+    sent: list[str] = []
+    try:
+        state = load_report_state(REPORT_STATE_STORE)
+        trades = get_all_trades()
+
+        if daily_report_due(state, now, DAILY_REPORT_HOUR):
+            message = build_daily_summary(
+                MODEL_NAME, trades, now,
+                closed_statuses=REPORT_CLOSED_STATUSES,
+                update_statuses=REPORT_UPDATE_STATUSES,
+            )
+            has_activity = "_none_" not in message or message.count("_none_") < 2
+            if has_activity or SEND_EMPTY_DAILY_REPORT:
+                send_telegram_message(message)
+                sent.append("daily")
+            # Mark the day done either way, so a quiet day is not retried every
+            # cycle for the rest of the evening.
+            state["last_daily_report_date"] = now.date().isoformat()
+
+        if weekly_report_due(state, now, DAILY_REPORT_HOUR, WEEKLY_REPORT_WEEKDAY):
+            send_telegram_message(build_weekly_summary(
+                MODEL_NAME, trades, now, closed_statuses=REPORT_CLOSED_STATUSES,
+            ))
+            state["last_weekly_report_date"] = now.date().isoformat()
+            sent.append("weekly")
+
+        if sent:
+            save_report_state(REPORT_STATE_STORE, state)
+            print(f"[report] Sent {'/'.join(sent)} summary for {MODEL_NAME}.", file=sys.stderr)
+        elif state.get("last_daily_report_date") == now.date().isoformat():
+            save_report_state(REPORT_STATE_STORE, state)
+    except Exception as exc:
+        print(f"[report] Summary dispatch failed (scan/positions unaffected): {exc}", file=sys.stderr)
+    return sent
+
+
 def run_cycle(args) -> None:
     """Execute a single scan + position-refresh cycle.
 
@@ -345,6 +410,10 @@ def run_cycle(args) -> None:
         _run_biton_phase("positions", args.asset_class, args.top_n, args.candidate_pool)
     print(f"[{MODEL_NAME}] Refreshing open paper trade positions...", file=sys.stderr)
     process_open_positions()
+
+    # After position management, so a close that just happened this cycle is
+    # already reflected in the summary.
+    send_scheduled_summaries()
 
     if args.skip_scan:
         return
