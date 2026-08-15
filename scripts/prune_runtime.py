@@ -27,6 +27,8 @@ from core.settings import (  # noqa: E402
     CANDLE_CACHE_DIR,
     CANDLE_CACHE_RETENTION_DAYS,
     CHART_RETENTION_DAYS,
+    FUNNEL_RETENTION_DAYS,
+    LOG_RETENTION_DAYS,
     RUNTIME_CACHE_RETENTION_DAYS,
 )
 
@@ -62,6 +64,11 @@ def main() -> int:
                     help="max age for runtime/charts (default: %(default)s; 0 disables)")
     ap.add_argument("--candle-days", type=float, default=CANDLE_CACHE_RETENTION_DAYS,
                     help="max age for the data/ candle cache (default: %(default)s; 0 disables)")
+    ap.add_argument("--log-days", type=float, default=LOG_RETENTION_DAYS,
+                    help="max age for ROTATED tenant logs (default: %(default)s; the live "
+                         "<key>.log is never aged out, only size-rotated; 0 disables)")
+    ap.add_argument("--funnel-days", type=float, default=FUNNEL_RETENTION_DAYS,
+                    help="max age for funnel reports (default: %(default)s; 0 disables)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be removed, delete nothing")
     args = ap.parse_args()
 
@@ -70,6 +77,8 @@ def main() -> int:
         "yfinance cache": os.path.join(runtime_dir, "cache", "yfinance"),
         "charts": os.path.join(runtime_dir, "charts"),
         "candle cache": CANDLE_CACHE_DIR,
+        "logs": os.path.join(runtime_dir, "logs"),
+        "funnel reports": os.path.join(runtime_dir, "funnel_logs"),
     }
 
     print("before:")
@@ -78,7 +87,8 @@ def main() -> int:
         print(f"  {label:15} {count:5} files  {mb:8.1f} MB")
 
     results = sweep_runtime(runtime_dir, args.cache_days, args.chart_days, dry_run=args.dry_run,
-                            candle_dir=CANDLE_CACHE_DIR, candle_days=args.candle_days)
+                            candle_dir=CANDLE_CACHE_DIR, candle_days=args.candle_days,
+                            log_days=args.log_days, funnel_days=args.funnel_days)
 
     if not args.dry_run:
         print("after:")

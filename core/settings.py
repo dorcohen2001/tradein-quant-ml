@@ -201,6 +201,19 @@ CHART_RETENTION_DAYS = _int_env("CHART_RETENTION_DAYS", 14)
 # the file on every save, which refreshes its mtime.
 CANDLE_CACHE_RETENTION_DAYS = _int_env("CANDLE_CACHE_RETENTION_DAYS", 30)
 CANDLE_CACHE_DIR = os.path.join(REPO_ROOT, "data")
+
+# --- Per-tenant logs (core.observability) -------------------------------
+# Each tenant's subprocess output goes to runtime/logs/<key>.log. Rotated by
+# the SUPERVISOR just before launching a child, because renaming a file a
+# running process holds open fails on Windows.
+#
+# LOG_RETENTION_DAYS ages out ROTATED backups (.log.1 ...) in the sweep. The
+# live <key>.log is never deleted by age -- only rotated by size -- so an
+# operator opening it always finds the current cycle.
+LOG_MAX_BYTES = _int_env("LOG_MAX_BYTES", 5 * 1024 * 1024)
+LOG_BACKUP_COUNT = _int_env("LOG_BACKUP_COUNT", 3)
+LOG_RETENTION_DAYS = _int_env("LOG_RETENTION_DAYS", 7)
+FUNNEL_RETENTION_DAYS = _int_env("FUNNEL_RETENTION_DAYS", 14)
 # How often the supervisor runs the sweep. Daily is plenty for directories
 # that accumulate over weeks.
 MAINTENANCE_INTERVAL_MINUTES = _int_env("MAINTENANCE_INTERVAL_MINUTES", 1440)

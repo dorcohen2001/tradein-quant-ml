@@ -89,7 +89,8 @@ def prune_by_age(directory: str, max_age_days: float, suffix: str | None = None,
 
 def sweep_runtime(runtime_dir: str, cache_days: float, chart_days: float,
                   dry_run: bool = False, candle_dir: str | None = None,
-                  candle_days: float | None = None) -> dict[str, tuple[int, int]]:
+                  candle_days: float | None = None, log_days: float | None = None,
+                  funnel_days: float | None = None) -> dict[str, tuple[int, int]]:
     """Run every retention sweep. Returns `{label: (removed, bytes)}`.
 
     `candle_dir` is the `data/` tree written by `core.backtesting.CandleCache`.
@@ -114,6 +115,43 @@ def sweep_runtime(runtime_dir: str, cache_days: float, chart_days: float,
     # non-recursive) is applied per leaf rather than being made to recurse: a
     # recursive delete pointed at the wrong root is far more destructive than
     # this is verbose.
+    # Rotated tenant logs. ONLY the rotated backups (<key>.log.1, .2 ...) are
+    # aged out -- the live `<key>.log` is deliberately excluded, because it is
+    # the file an operator opens to see the current cycle and deleting it out
+    # from under a running supervisor would silently stop capture until the
+    # next launch. Size rotation, not age, is what bounds the live file.
+    if log_days and log_days > 0:
+        logs_dir = os.path.join(runtime_dir, "logs")
+        removed = reclaimed = 0
+        if os.path.isdir(logs_dir):
+            cutoff = time.time() - (log_days * 86400)
+            for name in os.listdir(logs_dir):
+                # `.log.1`, `.log.12` -- a rotated backup, never a live `.log`.
+                if ".log." not in name:
+                    continue
+                path = os.path.join(logs_dir, name)
+                try:
+                    if not os.path.isfile(path):
+                        continue
+                    stat = os.stat(path)
+                    if stat.st_mtime >= cutoff:
+                        continue
+                    if not dry_run:
+                        os.remove(path)
+                    removed += 1
+                    reclaimed += stat.st_size
+                except OSError:
+                    continue
+        results["rotated_logs"] = (removed, reclaimed)
+
+    # Funnel diagnostics. The exporters already keep the newest N per model;
+    # this ages out anything that survived a model being retired or renamed,
+    # which per-prefix count retention can never reclaim.
+    if funnel_days and funnel_days > 0:
+        results["funnel_reports"] = prune_by_age(
+            os.path.join(runtime_dir, "funnel_logs"), funnel_days, suffix=".xlsx", dry_run=dry_run,
+        )
+
     if candle_dir and os.path.isdir(candle_dir):
         age = cache_days if candle_days is None else candle_days
         removed = reclaimed = 0

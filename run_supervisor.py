@@ -79,10 +79,21 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from core.maintenance import sweep_runtime  # noqa: E402
+from core.observability import (  # noqa: E402
+    format_age,
+    heartbeat_age,
+    is_stale,
+    open_tenant_log,
+    write_heartbeat,
+)
 from core.registry import ModelConfig, active_models, disabled_models, get_model  # noqa: E402
 from core.scheduling import PersistentIntervalGate  # noqa: E402
 from core.settings import (  # noqa: E402
     CANDLE_CACHE_DIR,
+    FUNNEL_RETENTION_DAYS,
+    LOG_BACKUP_COUNT,
+    LOG_MAX_BYTES,
+    LOG_RETENTION_DAYS,
     CANDLE_CACHE_RETENTION_DAYS,
     CHART_RETENTION_DAYS,
     MAINTENANCE_INTERVAL_MINUTES,
@@ -90,6 +101,8 @@ from core.settings import (  # noqa: E402
 )
 
 RUNTIME_DIR = os.path.join(REPO_ROOT, "runtime")
+LOGS_DIR = os.path.join(RUNTIME_DIR, "logs")
+STATE_DIR = os.path.join(RUNTIME_DIR, "state")
 
 _stop = threading.Event()
 # stderr is shared by every thread; without this, two models logging at the
@@ -124,28 +137,65 @@ def _child_args(model: ModelConfig, args) -> list[str]:
 
 def run_model_cycle(model: ModelConfig, args) -> str:
     """Run one cycle of one model. Never raises -- returns a short outcome
-    string for logging. Every failure mode here is contained to this model."""
+    string for logging. Every failure mode here is contained to this model.
+
+    The child's stdout/stderr go to `runtime/logs/<key>.log` rather than being
+    inherited: N tenants sharing one stream produce interleaved, unattributable
+    output. The log is rotated here, immediately BEFORE the child opens it --
+    renaming a file a running process holds fails on Windows, and this is the
+    one moment no child has the handle.
+
+    A heartbeat is stamped on every outcome, success or not, so the fleet view
+    can distinguish "ran and found nothing" from "has not run since Tuesday".
+    """
     if not model.exists:
+        write_heartbeat(STATE_DIR, model.key, status="skipped", detail="no live_runner on disk")
         return f"skipped (no live_runner at {model.live_runner})"
 
     cmd = _child_args(model, args)
     started = time.monotonic()
+    handle = open_tenant_log(LOGS_DIR, model.key, max_bytes=LOG_MAX_BYTES, backups=LOG_BACKUP_COUNT)
+
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=model.model_dir,  # each model's own directory is its sys.path root
-            timeout=model.phase_timeout_seconds,
-        )
-        elapsed = time.monotonic() - started
-        if result.returncode != 0:
-            return f"exit code {result.returncode} after {elapsed:.0f}s (other models unaffected)"
-        return f"ok in {elapsed:.0f}s"
-    except subprocess.TimeoutExpired:
-        # subprocess.run has already killed the child before raising.
-        return (f"TIMEOUT after {model.phase_timeout_seconds}s -- child killed; "
-                f"retries next cycle (other models unaffected)")
-    except Exception as exc:  # noqa: BLE001 -- a supervisor must never die of a child
-        return f"failed to launch: {exc} (other models unaffected)"
+        if handle is not None:
+            handle.write(f"\n{'=' * 70}\n[cycle] {dt.datetime.now():%Y-%m-%d %H:%M:%S} "
+                         f"{model.key} -> {' '.join(cmd[1:])}\n{'=' * 70}\n")
+            handle.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=model.model_dir,  # each model's own directory is its sys.path root
+                timeout=model.phase_timeout_seconds,
+                # Falls back to inherited output if the log could not be opened:
+                # losing log capture is an inconvenience, skipping a trading
+                # cycle is not.
+                stdout=handle, stderr=subprocess.STDOUT if handle is not None else None,
+            )
+            elapsed = time.monotonic() - started
+            if result.returncode != 0:
+                outcome = f"exit code {result.returncode} after {elapsed:.0f}s (other models unaffected)"
+                write_heartbeat(STATE_DIR, model.key, status="error", detail=outcome,
+                                duration_seconds=elapsed)
+                return outcome
+            write_heartbeat(STATE_DIR, model.key, status="ok", duration_seconds=elapsed)
+            return f"ok in {elapsed:.0f}s"
+        except subprocess.TimeoutExpired:
+            # subprocess.run has already killed the child before raising.
+            outcome = (f"TIMEOUT after {model.phase_timeout_seconds}s -- child killed; "
+                       f"retries next cycle (other models unaffected)")
+            write_heartbeat(STATE_DIR, model.key, status="timeout", detail=outcome,
+                            duration_seconds=time.monotonic() - started)
+            return outcome
+        except Exception as exc:  # noqa: BLE001 -- a supervisor must never die of a child
+            outcome = f"failed to launch: {exc} (other models unaffected)"
+            write_heartbeat(STATE_DIR, model.key, status="error", detail=str(exc))
+            return outcome
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
 
 
 def _supervise(model: ModelConfig, args) -> None:
@@ -168,6 +218,14 @@ def _supervise(model: ModelConfig, args) -> None:
         # Schedule from cycle START, so a slow cycle does not push the model's
         # effective cadence out indefinitely. If a cycle overran the interval,
         # the next one begins immediately.
+        # Warn if this tenant has drifted past its schedule. Checked here,
+        # after the cycle, so the warning names the model that is actually
+        # behind rather than being a periodic sweep over everything.
+        if is_stale(STATE_DIR, model.key, model.cycle_interval_minutes):
+            _log(f"[{model.key}] WARNING: stale -- last successful heartbeat "
+                 f"{format_age(heartbeat_age(STATE_DIR, model.key))} ago, "
+                 f"interval is {model.cycle_interval_minutes} min")
+
         sleep_for = max(0.0, interval - (time.monotonic() - cycle_started))
         if sleep_for:
             _log(f"[{model.key}] next cycle in {sleep_for / 60:.1f} min")
@@ -196,7 +254,9 @@ def _maintenance_loop() -> None:
                 _log("[maintenance] running retention sweep")
                 sweep_runtime(RUNTIME_DIR, RUNTIME_CACHE_RETENTION_DAYS, CHART_RETENTION_DAYS,
                               candle_dir=CANDLE_CACHE_DIR,
-                              candle_days=CANDLE_CACHE_RETENTION_DAYS)
+                              candle_days=CANDLE_CACHE_RETENTION_DAYS,
+                              log_days=LOG_RETENTION_DAYS,
+                              funnel_days=FUNNEL_RETENTION_DAYS)
         except Exception as exc:  # noqa: BLE001
             _log(f"[maintenance] sweep failed (models unaffected): {exc}")
         _stop.wait(300)  # re-check every 5 min; the gate decides if it actually runs
@@ -271,6 +331,9 @@ def main() -> int:
         for m in models:
             print(f"  {m.key:8} cwd={m.model_dir}")
             print(f"           cmd={' '.join(_child_args(m, args))}")
+        _log(f"[supervisor] per-tenant logs -> "
+             f"{os.path.join(os.path.relpath(LOGS_DIR, REPO_ROOT), '<key>.log')} "
+             f"(rotated at {LOG_MAX_BYTES // (1024 * 1024)}MB, {LOG_BACKUP_COUNT} kept)")
         _log("[supervisor] dry run -- nothing launched.")
         return 0
 

@@ -353,3 +353,142 @@ def test_sweep_without_a_candle_dir_is_unchanged(tmp_path):
     (runtime / "charts").mkdir(parents=True)
     results = sweep_runtime(str(runtime), cache_days=7, chart_days=14)
     assert "candle_cache" not in results
+
+
+# --------------------------------------------------------------------------
+# Shared market-data layer
+# --------------------------------------------------------------------------
+def test_interval_minutes_parsing():
+    from core.data.market import interval_minutes
+    assert interval_minutes("15m") == 15
+    assert interval_minutes("1h") == 60
+    assert interval_minutes("1d") == 1440
+    with pytest.raises(ValueError):
+        interval_minutes("nonsense")
+
+
+def test_window_end_is_quantized_so_tenants_request_the_same_range():
+    """THE deduplication mechanism. Two tenant processes calling seconds apart
+    must floor to the SAME instant, or the second sees a 'missing' trailing
+    segment and downloads it."""
+    from core.data.market import quantized_end
+    a = quantized_end("15m", dt.datetime(2026, 8, 15, 12, 0, 17))
+    b = quantized_end("15m", dt.datetime(2026, 8, 15, 12, 0, 43))
+    assert a == b
+    # ...and a bucket later it does advance, so data never goes stale.
+    later = quantized_end("15m", dt.datetime(2026, 8, 15, 12, 5, 0))
+    assert later > a
+
+
+def test_second_tenant_reuses_the_cache_with_zero_downloads():
+    """Model A fetches BTCUSDT 15m; Model B asking for the same symbol and
+    interval inside the cache window must cost no network call."""
+    import pandas as pd
+
+    from core.data.market import get_candles
+
+    class StubFeed:
+        """Stands in for IntradayDataFeed: serves from a dict, counting only
+        genuine cache misses as downloads."""
+        def __init__(self):
+            self.download_count = 0
+            self._cache = {}
+
+        def get_candles(self, symbol, asset_class, interval, start, end):
+            key = (symbol, asset_class, interval, start, end)
+            if key not in self._cache:
+                self.download_count += 1
+                idx = pd.date_range(end - dt.timedelta(minutes=15 * 5), periods=5, freq="15min")
+                self._cache[key] = pd.DataFrame(
+                    {"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5, "Volume": 10}, index=idx)
+            return self._cache[key]
+
+    feed = StubFeed()
+    now = dt.datetime(2026, 8, 15, 12, 0, 5)
+
+    get_candles("BTCUSDT", "crypto", "15m", bars=5, now=now, feed=feed)          # tenant A
+    assert feed.download_count == 1
+    get_candles("BTCUSDT", "crypto", "15m", bars=5,
+                now=now + dt.timedelta(seconds=30), feed=feed)                    # tenant B
+    assert feed.download_count == 1, "tenant B should have hit the shared cache"
+
+    # A different symbol is genuinely a new fetch.
+    get_candles("ETHUSDT", "crypto", "15m", bars=5, now=now, feed=feed)
+    assert feed.download_count == 2
+
+
+def test_shared_layer_returns_the_canonical_frame_shape():
+    """Every consumer in this repo expects OHLCV columns on a naive-UTC index,
+    oldest first -- the shape core.backtesting.cache.normalize_frame produces."""
+    import pandas as pd
+
+    from core.data.market import get_candles
+
+    class StubFeed:
+        download_count = 0
+
+        def get_candles(self, symbol, asset_class, interval, start, end):
+            idx = pd.date_range(end - dt.timedelta(minutes=15 * 10), periods=10, freq="15min")
+            return pd.DataFrame(
+                {"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5, "Volume": 10}, index=idx)
+
+    frame = get_candles("BTCUSDT", "crypto", "15m", bars=4, feed=StubFeed())
+    assert list(frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert frame.index.tz is None
+    assert len(frame) == 4                      # tail-sliced to `bars`
+    assert frame.index.is_monotonic_increasing  # oldest first
+
+
+def test_empty_result_is_returned_not_raised():
+    """One unlisted pair must skip, not abort a whole watchlist scan."""
+    import pandas as pd
+
+    from core.data.market import get_candles
+
+    class EmptyFeed:
+        download_count = 0
+
+        def get_candles(self, *a, **k):
+            return pd.DataFrame()
+
+    assert len(get_candles("NOPEUSDT", "crypto", "15m", feed=EmptyFeed())) == 0
+
+
+# --------------------------------------------------------------------------
+# Sweep safety: ephemeral only, never persistent state
+# --------------------------------------------------------------------------
+def test_sweep_never_touches_stores_journals_or_backtest_logs(tmp_path):
+    """The non-negotiable rule: PnL history and audit trails are permanent.
+    Every one of these is ancient and must survive a full sweep."""
+    runtime = tmp_path / "runtime"
+    for sub in ("stores", "journals", "backtest", "logs", "charts", "funnel_logs"):
+        (runtime / sub).mkdir(parents=True)
+
+    permanent = [
+        runtime / "stores" / "trades_livne.json",
+        runtime / "stores" / "trades_client_alpha.json",
+        runtime / "stores" / "report_state_livne.json",
+        runtime / "journals" / "trade_journal_livne.xlsx",
+        runtime / "backtest" / "trades_log_livne.csv",
+    ]
+    for path in permanent:
+        _aged(path, 9999)
+
+    ephemeral = [
+        runtime / "charts" / "livne_BTCUSDT_15M_2020-01-01.png",
+        runtime / "logs" / "livne.log.1",
+        runtime / "funnel_logs" / "live_funnel_livne_20200101_000000.xlsx",
+    ]
+    for path in ephemeral:
+        _aged(path, 9999)
+
+    live_log = runtime / "logs" / "livne.log"
+    _aged(live_log, 9999)  # ancient, but it is the LIVE log
+
+    sweep_runtime(str(runtime), cache_days=7, chart_days=14, log_days=7, funnel_days=14)
+
+    for path in permanent:
+        assert path.exists(), f"PERMANENT STATE DELETED: {path.name}"
+    for path in ephemeral:
+        assert not path.exists(), f"ephemeral file survived: {path.name}"
+    assert live_log.exists(), "the live log must be size-rotated, never aged out"
