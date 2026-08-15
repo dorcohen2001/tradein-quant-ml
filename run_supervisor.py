@@ -13,8 +13,13 @@ That worked, but it made one model the scheduler for another:
   * Adding a third model meant editing Livne.
 
 Here, no model knows any other exists. The supervisor reads `core.registry`
-and gives each model its own scheduler thread, its own interval, its own
-timeout, and its own CLI arguments.
+and gives each ENABLED model its own scheduler thread, its own interval, its
+own timeout, and its own CLI arguments.
+
+Models marked `enabled=False` in the registry are not scheduled -- not even
+when named via `--models`, since naming one on the command line is a weaker
+statement than the deliberate pause recorded in the registry. Use
+`--include-disabled` to override. Deactivation never touches stored state.
 
 ISOLATION MODEL
 ---------------
@@ -74,7 +79,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from core.maintenance import sweep_runtime  # noqa: E402
-from core.registry import ModelConfig, all_models, get_model  # noqa: E402
+from core.registry import ModelConfig, active_models, disabled_models, get_model  # noqa: E402
 from core.scheduling import PersistentIntervalGate  # noqa: E402
 from core.settings import (  # noqa: E402
     CHART_RETENTION_DAYS,
@@ -198,7 +203,10 @@ def main() -> int:
         description="Run every registered TRADEIN model independently",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--models", help="comma-separated subset of model keys (default: all registered)")
+    ap.add_argument("--models", help="comma-separated subset of model keys (default: all ENABLED models)")
+    ap.add_argument("--include-disabled", action="store_true",
+                    help="also run models marked enabled=False in core/registry.py "
+                         "(explicit override of a deliberate pause)")
     ap.add_argument("--once", action="store_true", help="run one cycle per model, then exit")
     ap.add_argument("--dry-run", action="store_true", help="print the schedule and the exact commands, launch nothing")
     ap.add_argument("--asset-class", choices=["stocks", "crypto", "both"], default=None,
@@ -218,10 +226,28 @@ def main() -> int:
             print(f"[supervisor] {exc}", file=sys.stderr)
             return 1
     else:
-        models = all_models()
+        models = active_models()
+
+    # Deactivated models are filtered out even when named explicitly. Naming a
+    # model on the command line says "run this one", not "override the pause" --
+    # the pause is the more deliberate statement of the two, and silently
+    # honouring the CLI would make `--models biton` a way to restart a model
+    # someone stopped on purpose. `--include-disabled` is the explicit override.
+    if not args.include_disabled:
+        paused = [m for m in models if not m.enabled]
+        models = tuple(m for m in models if m.enabled)
+        for m in paused:
+            _log(f"[supervisor] {m.key} is DEACTIVATED in core/registry.py -- not scheduling it "
+                 f"(its stored state is untouched; set enabled=True to resume)")
+
+    # Always name every paused model, not just ones the caller asked for: the
+    # failure mode of a flag like this is forgetting it is set.
+    for m in disabled_models():
+        if m not in models:
+            _log(f"[supervisor] note: {m.key} ({m.label}) is currently disabled")
 
     if not models:
-        print("[supervisor] no models registered -- nothing to run.", file=sys.stderr)
+        print("[supervisor] no enabled models to run -- nothing to do.", file=sys.stderr)
         return 1
 
     missing = [m.key for m in models if not m.exists]

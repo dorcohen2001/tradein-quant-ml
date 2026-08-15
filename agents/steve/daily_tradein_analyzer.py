@@ -4,10 +4,11 @@ No external LLM API is called and no API key is required. The strategic
 narrative is produced by a *local* LLM operator (Claude Code running on this
 machine) through a two-phase handoff:
 
-Covers EVERY model registered in `core.registry` in one report -- currently
-Livne (multi-timeframe intraday pipeline) and Biton (frozen legacy pipeline),
-but the roster, the per-model report sections and the email subject are all
-derived from the registry, so a newly registered model appears automatically.
+Covers every ACTIVE model in `core.registry` in one report. The roster, the
+per-model report sections, the narrative brief and the email subject are all
+derived from the registry, so a newly registered model appears automatically
+and a model marked `enabled=False` drops out of all of them -- without its
+stored history being touched or lost.
 Each model gets its own clearly separated section -- their numbers are never
 pooled, because they are different strategies with different lifecycles,
 different status vocabularies and different minimum R:R.
@@ -78,7 +79,7 @@ _REPO_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from core.registry import all_models
+from core.registry import active_models, disabled_models
 from core.settings import (
     ANALYZER_LOG_PATH,
     LLM_REQUEST_PATH,
@@ -104,9 +105,14 @@ logger.addHandler(logging.StreamHandler(sys.stderr))
 # or every analyzer log line after the email stage prints twice.
 logger.propagate = False
 
-# Every registered model, in canonical report order. Previously a hard-coded
-# tuple here plus a separate hard-coded CLOSED_WITH_PNL dict; both are now the
+# Every ACTIVE model, in canonical report order. Previously a hard-coded tuple
+# here plus a separate hard-coded CLOSED_WITH_PNL dict; both are now the
 # registry's job, so adding a model needs no edit in this file.
+#
+# Deactivated models are excluded entirely -- no metrics computed, no report
+# section, no mention in the narrative brief or the email subject. Their stored
+# history is left completely intact and reappears verbatim the moment the model
+# is re-enabled; nothing here reads or writes a disabled model's files.
 #
 # The per-model status vocabulary that `CLOSED_WITH_PNL` used to hold now lives
 # on each ModelConfig as `closed_with_pnl`. It stays strictly per-model for the
@@ -117,7 +123,7 @@ logger.propagate = False
 # carrying a real pnl_pct -- from win rate, profit factor, expectancy and
 # drawdown. EXPIRED is excluded for every model: it never entered, so it has
 # no P&L.
-MODELS = all_models()
+MODELS = active_models()
 
 
 def _model_roster() -> str:
@@ -458,7 +464,18 @@ def main() -> int:
     args = parser.parse_args()
 
     logger.info("=== daily_tradein_analyzer start ===")
+    logger.info("Reporting on %d active model(s): %s",
+                len(MODELS), ", ".join(m.label for m in MODELS) or "none")
+    # Named explicitly so a paused model is never silently missing from a
+    # report someone is using to judge overall performance.
+    for model in disabled_models():
+        logger.info("EXCLUDED (deactivated in core/registry.py): %s -- its stored history at "
+                    "%s is untouched.", model.label, os.path.basename(model.trade_store))
     failed = False
+
+    if not MODELS:
+        logger.error("No active models registered -- nothing to report on.")
+        return EXIT_FAILED
 
     # Stage 1 — analyze EVERY registered model. One model failing must not
     # suppress another's report: each is captured independently and an error is

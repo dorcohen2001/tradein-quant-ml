@@ -56,6 +56,7 @@ from config import (
     DAILY_REPORT_HOUR,
     FUNNEL_EXPORT_INTERVAL_MINUTES,
     GATE_STATE_STORE,
+    MODEL_ENABLED,
     MODEL_KEY,
     MODEL_NAME,
     REPORT_CLOSED_STATUSES,
@@ -378,7 +379,20 @@ def main():
                          help="Skip the new-signal scan and only refresh existing open paper trades")
     parser.add_argument("--once", action="store_true",
                          help="Run a single cycle and exit instead of looping forever")
+    parser.add_argument("--force", action="store_true",
+                         help="Run even if this model is marked enabled=False in core/registry.py")
     args = parser.parse_args()
+
+    # A deactivated model must not trade or alert even when invoked directly.
+    # Without this, a Task Scheduler entry or a stale shell command pointing at
+    # this file would keep running a model someone deliberately paused -- while
+    # the registry, the supervisor and the daily report all say it is off.
+    if not MODEL_ENABLED and not args.force:
+        print(f"[runner] {MODEL_NAME} is DEACTIVATED in core/registry.py -- refusing to run.",
+              file=sys.stderr)
+        print("[runner] Stored state is untouched. Set enabled=True to resume, "
+              "or pass --force for a one-off run.", file=sys.stderr)
+        return
 
     if args.once:
         try:

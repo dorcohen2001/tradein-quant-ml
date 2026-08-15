@@ -75,6 +75,18 @@ class ModelConfig:
     update_statuses: tuple[str, ...]
     closed_with_pnl: tuple[str, ...]
     description: str = ""
+    # Whether this model participates in scheduled execution and reporting.
+    #
+    # Deactivating is deliberately a FLAG rather than deleting the entry: the
+    # record stays, so every path below still resolves, the model's own
+    # config.py still imports cleanly, its history stays readable, and
+    # re-enabling is a one-word edit. Removing the entry instead would orphan
+    # runtime/stores/trades_<key>.json behind a KeyError.
+    #
+    # Disabling affects ONLY what runs and what gets reported from here on.
+    # It never touches stored state: trades, journals, funnel exports and
+    # backtest logs are all left exactly as they are.
+    enabled: bool = True
     # Which entry in `core.settings.TELEGRAM_ROUTES` this model's messages go
     # to. "default" is the historical single-destination behaviour, so an
     # unconfigured deployment keeps sending exactly where it always did.
@@ -152,6 +164,25 @@ _MODELS: tuple[ModelConfig, ...] = (
         update_statuses=(),
         closed_with_pnl=("WIN_TP1", "WIN_TP2", "LOSS_SL"),
         telegram_route="biton",
+        # TEMPORARILY DEACTIVATED (2026-08-15). Biton no longer runs under the
+        # supervisor and is excluded from Steve's daily report and email.
+        #
+        # Its state is fully preserved and untouched: 36 trades in
+        # runtime/stores/trades_biton.json, the Excel journal, 50 funnel
+        # exports and the backtest log all remain on disk exactly as they were.
+        #
+        # OPERATIONAL WARNING -- this is a PAUSE, not a wind-down. 13 positions
+        # were non-terminal at deactivation (12 ACTIVE + 1 PENDING, plus the
+        # long-stuck PARTIAL_TP1 GOOGL record). While disabled, nothing
+        # refreshes them: no stop or target is checked and no exit alert is
+        # sent. Their recorded status simply freezes. On re-enable they are
+        # graded against whatever the price is AT THAT MOMENT, so a stop or
+        # target crossed during the pause is not detected retroactively -- the
+        # resulting P&L for those 13 will not reflect what actually happened.
+        # If that matters, close them out before pausing rather than after.
+        #
+        # To re-enable: set this back to True. Nothing else needs changing.
+        enabled=False,
     ),
 )
 
@@ -159,8 +190,31 @@ _BY_KEY: dict[str, ModelConfig] = {m.key: m for m in _MODELS}
 
 
 def all_models() -> tuple[ModelConfig, ...]:
-    """Every registered model, in canonical (report) order."""
+    """EVERY registered model, enabled or not, in canonical (report) order.
+
+    Use `active_models()` for anything that runs or reports. This one is for
+    tooling that must see the full roster regardless of state -- diagnostics,
+    "what exists on disk" checks, and the tests that pin path derivation.
+    """
     return _MODELS
+
+
+def active_models() -> tuple[ModelConfig, ...]:
+    """Models that should actually execute and be reported on.
+
+    This is the roster the supervisor schedules and Steve reports on. A
+    disabled model keeps its registry entry -- so its paths resolve, its
+    history stays readable, and its own config.py still imports -- it simply
+    stops running and stops appearing in reports.
+    """
+    return tuple(m for m in _MODELS if m.enabled)
+
+
+def disabled_models() -> tuple[ModelConfig, ...]:
+    """Registered but deactivated. Surfaced by the supervisor at startup so a
+    paused model is visible rather than silently absent -- the failure mode of
+    a flag like this is forgetting it is set."""
+    return tuple(m for m in _MODELS if not m.enabled)
 
 
 def model_keys() -> tuple[str, ...]:

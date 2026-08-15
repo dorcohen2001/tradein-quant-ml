@@ -482,6 +482,10 @@ CHART_SPEC = ChartSpec.intraday_15m()
 # this file's business any more -- see core/registry.py and run_supervisor.py.
 # ---------------------------------------------------------------------------
 MODEL_NAME = _MODEL.label
+# Whether this model participates in scheduled execution. The runner refuses
+# to run when False unless --force, so a Task Scheduler entry pointing
+# straight at live_runner.py cannot quietly bypass a deliberate pause.
+MODEL_ENABLED = _MODEL.enabled
 
 # This model no longer knows that any OTHER model exists. `BITON_MODEL_DIR`,
 # `BITON_LIVE_RUNNER` and `BITON_PHASE_TIMEOUT_SECONDS` lived here because

@@ -203,6 +203,27 @@ a `config.py` deriving its paths from `get_model("<key>")`, and a
 `live_runner.py` exposing `--once`. Registered-but-missing directories are
 skipped with a warning rather than crashing the supervisor.
 
+## Pausing a model
+
+Set `enabled=False` on its registry entry. That model then stops being
+scheduled by the supervisor, stops appearing in Steve's report, narrative brief
+and email subject, and its own `live_runner.py` refuses to run directly — so a
+stale Task Scheduler entry cannot quietly keep it alive. `--include-disabled`
+(supervisor) and `--force` (runner) are the deliberate overrides.
+
+Pausing **never touches stored state**: the trade store, journal, funnel
+exports and backtest log stay exactly as they are, every derived path is
+unchanged, and re-enabling is the same one-word edit in reverse.
+
+> **It is a pause, not a wind-down.** Open positions are not refreshed while a
+> model is off — no stop or target is checked and no exit alert fires. On
+> re-enable they are graded against the price *at that moment*, so a level
+> crossed during the pause is not detected retroactively. Close positions out
+> first if that matters.
+
+**Currently paused: `biton`** (since 2026-08-15), with 13 non-terminal
+positions frozen.
+
 ## Tests
 
 ```bash

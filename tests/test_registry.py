@@ -13,7 +13,15 @@ import os
 
 import pytest
 
-from core.registry import ModelConfig, all_models, available_models, get_model, model_keys
+from core.registry import (
+    ModelConfig,
+    active_models,
+    all_models,
+    available_models,
+    disabled_models,
+    get_model,
+    model_keys,
+)
 
 
 # Exactly what each model's config.py contained before Phase 1.
@@ -123,6 +131,65 @@ def test_new_model_needs_no_path_declarations():
     assert fresh.chart_prefix == "demo_"
     assert fresh.telegram_route == "default"  # inherits the shared chat until configured
     assert fresh.exists is False  # models/demo/ does not exist
+
+
+# --------------------------------------------------------------------------
+# Enable / disable
+# --------------------------------------------------------------------------
+def test_active_and_disabled_partition_the_roster():
+    """Every registered model is in exactly one of the two buckets -- a model
+    that fell out of both would silently stop running AND stop being reported
+    as paused, which is the worst of both."""
+    active = {m.key for m in active_models()}
+    disabled = {m.key for m in disabled_models()}
+    assert active | disabled == set(model_keys())
+    assert active & disabled == set()
+
+
+def test_disabled_model_keeps_resolving_everything():
+    """Deactivation is a flag, not a deletion. Its paths must still resolve --
+    its own config.py calls get_model() at import, and its history has to stay
+    readable and re-enable cleanly."""
+    for model in disabled_models():
+        assert get_model(model.key) is model
+        assert model.trade_store.endswith(f"trades_{model.key}.json")
+        assert model.journal_xlsx.endswith(f"trade_journal_{model.key}.xlsx")
+        assert model.closed_with_pnl  # lifecycle vocabulary intact for later re-enable
+
+
+def test_models_are_enabled_unless_explicitly_disabled():
+    """The default must be 'on': a newly registered model that silently did
+    nothing would be a miserable debugging session."""
+    fresh = ModelConfig(
+        key="demo2", label="Demo", cycle_interval_minutes=5,
+        closed_statuses=("WIN",), update_statuses=(), closed_with_pnl=("WIN",),
+    )
+    assert fresh.enabled is True
+
+
+def test_disabling_does_not_change_any_derived_path():
+    """The exact guarantee behind 'preserve all state': toggling the flag must
+    not move a single file, or re-enabling would find an empty store."""
+    on = ModelConfig(
+        key="demo3", label="Demo", cycle_interval_minutes=5,
+        closed_statuses=("WIN",), update_statuses=(), closed_with_pnl=("WIN",),
+    )
+    off = ModelConfig(
+        key="demo3", label="Demo", cycle_interval_minutes=5,
+        closed_statuses=("WIN",), update_statuses=(), closed_with_pnl=("WIN",),
+        enabled=False,
+    )
+    for attr in ("trade_store", "report_state_store", "journal_xlsx",
+                 "backtest_csv", "funnel_prefix", "chart_prefix"):
+        assert getattr(on, attr) == getattr(off, attr), attr
+
+
+def test_biton_is_currently_deactivated_and_livne_is_not():
+    """Pins the current operational intent. If Biton is re-enabled later, this
+    test is the reminder to update it deliberately rather than by accident."""
+    assert get_model("biton").enabled is False
+    assert get_model("livne").enabled is True
+    assert [m.key for m in active_models()] == ["livne"]
 
 
 def test_chart_prefixes_are_distinct_per_model():

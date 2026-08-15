@@ -161,6 +161,10 @@ CHART_SPEC = ChartSpec.daily()
 # they share no Python process, only these output file paths.
 # ---------------------------------------------------------------------------
 MODEL_NAME = _MODEL.label
+# Whether this model participates in scheduled execution. The runner refuses
+# to run when False unless --force, so a Task Scheduler entry pointing
+# straight at live_runner.py cannot quietly bypass a deliberate pause.
+MODEL_ENABLED = _MODEL.enabled
 
 # ---------------------------------------------------------------------------
 # Paper trading -- Biton's own isolated store/journal, sitting beside Livne's
