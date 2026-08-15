@@ -227,6 +227,46 @@ rather than a price level and is live-only by design (the backtest does not
 simulate it either) — replaying it would invent exits the live system would not
 have taken.
 
+## Onboarding a client strategy
+
+Client strategies are scaffolded into their own sandbox — never by copying an
+existing model:
+
+```bash
+python scripts/create_client_model.py --key alpha --name "Alpha Capital" --interval 5 --timeframe 15m
+```
+
+That writes to exactly two places: a new `models/client_alpha/` directory, and
+one entry between the `CLIENT MODELS` markers in `core/registry.py`. It never
+touches an existing model or anything under `runtime/`. `--remove alpha`
+reverses it cleanly, keeping any runtime history.
+
+The new model is registered as **`stage="incubating"`** with a **dedicated
+Telegram route**:
+
+| Guarantee | Mechanism |
+|---|---|
+| Runs like any other model | Supervisor schedules it on its own interval, in its own process, with its own timeout |
+| Cannot leak signals | `dedicated_route=True` disables the shared-chat fallback — unconfigured means it sends *nothing* |
+| Cannot collide | Every runtime path derives from the model key |
+| Cannot skew the numbers | Excluded from Steve's report until graduated (`--include-incubating` to peek) |
+| Cannot take others down | A crash or hang is contained by the supervisor's per-model subprocess + timeout |
+
+**→ Full walkthrough: [`docs/CLIENT_ONBOARDING_GUIDE.md`](docs/CLIENT_ONBOARDING_GUIDE.md)**
+— written as a protocol an AI session can execute step by step, including the
+Telegram bot setup instructions to hand the user and the graduation checklist
+for promoting `incubating` → `production`.
+
+## Model stages
+
+`stage` controls **visibility, not execution** — every enabled model runs.
+
+| Stage | Runs | In the executive report |
+|---|---|---|
+| `incubating` | yes | no (unless `--include-incubating`) |
+| `production` | yes | yes |
+| `deprecated` | yes | no |
+
 ## Pausing a model
 
 Set `enabled=False` on its registry entry. That model then stops being

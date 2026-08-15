@@ -186,10 +186,19 @@ def test_disabling_does_not_change_any_derived_path():
 
 def test_biton_is_currently_deactivated_and_livne_is_not():
     """Pins the current operational intent. If Biton is re-enabled later, this
-    test is the reminder to update it deliberately rather than by accident."""
+    test is the reminder to update it deliberately rather than by accident.
+
+    Asserts MEMBERSHIP, not an exact roster: onboarding a client strategy adds
+    an enabled model, and a test that broke on every onboarding would be a
+    tripwire pointing at the wrong thing."""
     assert get_model("biton").enabled is False
     assert get_model("livne").enabled is True
-    assert [m.key for m in active_models()] == ["livne"]
+
+    active = {m.key for m in active_models()}
+    assert "livne" in active
+    assert "biton" not in active
+    # Among the FIRST-PARTY models, Livne is the only active one.
+    assert active.intersection({"livne", "biton"}) == {"livne"}
 
 
 def test_chart_prefixes_are_distinct_per_model():

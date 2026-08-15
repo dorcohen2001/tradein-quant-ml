@@ -28,6 +28,14 @@ time of writing), and a path that changed by even one character would silently
 orphan that history and start an empty store. `tests/test_registry.py` pins
 the derived values against the literals the models used before this refactor.
 
+STAGES AND CLIENT MODELS
+------------------------
+`stage` separates "is running" from "is reported on". Client strategies are
+scaffolded by `scripts/create_client_model.py` as `client_<key>`, land here as
+`stage="incubating"` with `dedicated_route=True`, and are appended between the
+CLIENT MODELS markers at the end of `_MODELS` so the generator can add and
+remove them without ever touching the first-party entries above.
+
 STATUS VOCABULARIES ARE PER-MODEL AND NOT INTERCHANGEABLE
 ---------------------------------------------------------
 The two models run genuinely different lifecycles, and conflating them
@@ -87,6 +95,35 @@ class ModelConfig:
     # It never touches stored state: trades, journals, funnel exports and
     # backtest logs are all left exactly as they are.
     enabled: bool = True
+
+    # Lifecycle stage. Controls VISIBILITY, never execution -- the supervisor
+    # runs every enabled model regardless of stage, because an incubating
+    # strategy that is not actually traded produces no evidence to graduate on.
+    #
+    #   incubating  runs on its own interval, alerts to its own route, and is
+    #               EXCLUDED from the executive report unless asked for
+    #               (`--include-incubating`). A client trialling a strategy
+    #               must not silently move the headline numbers the primary
+    #               models are judged by.
+    #   production  fully integrated: executive report, consolidated
+    #               dashboards, central oversight.
+    #   deprecated  retained for its history; reported only on request. Prefer
+    #               `enabled=False` to actually stop it.
+    #
+    # Defaults to "incubating" so a newly scaffolded model cannot land in the
+    # executive report by omission -- the safe direction. The two live models
+    # therefore declare "production" EXPLICITLY below.
+    stage: str = "incubating"
+
+    # When True, this model NEVER falls back to the shared default Telegram
+    # chat. An unconfigured route means its sends are skipped entirely rather
+    # than being delivered to the primary channel.
+    #
+    # This is the blast-radius guarantee for client work. Route resolution is
+    # otherwise deliberately forgiving (unset -> shared default), which is
+    # right for first-party models and exactly wrong for a client: a typo in
+    # one env var would publish that client's signals into the main group.
+    dedicated_route: bool = False
     # Which entry in `core.settings.TELEGRAM_ROUTES` this model's messages go
     # to. "default" is the historical single-destination behaviour, so an
     # unconfigured deployment keeps sending exactly where it always did.
@@ -154,6 +191,10 @@ _MODELS: tuple[ModelConfig, ...] = (
         update_statuses=("PARTIAL_TP1",),
         closed_with_pnl=("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT"),
         telegram_route="livne",
+        # Explicit, not inherited: the field defaults to "incubating" so new
+        # models stay out of the executive report by default, which would
+        # silently drop this one out of it.
+        stage="production",
     ),
     ModelConfig(
         key="biton",
@@ -164,6 +205,7 @@ _MODELS: tuple[ModelConfig, ...] = (
         update_statuses=(),
         closed_with_pnl=("WIN_TP1", "WIN_TP2", "LOSS_SL"),
         telegram_route="biton",
+        stage="production",  # explicit -- see the Livne entry
         # TEMPORARILY DEACTIVATED (2026-08-15). Biton no longer runs under the
         # supervisor and is excluded from Steve's daily report and email.
         #
@@ -184,6 +226,16 @@ _MODELS: tuple[ModelConfig, ...] = (
         # To re-enable: set this back to True. Nothing else needs changing.
         enabled=False,
     ),
+    # ------------------------------------------------------------------
+    # CLIENT MODELS BEGIN -- managed by scripts/create_client_model.py
+    #
+    # Entries between these two markers are generated. Each is wrapped in its
+    # own `# >>> client:<key> >>>` / `# <<< client:<key> <<<` pair so the tool
+    # can add and remove one cleanly without parsing Python or going anywhere
+    # near the first-party models above. Hand-editing an entry is fine; just
+    # leave the markers intact.
+    # ------------------------------------------------------------------
+    # CLIENT MODELS END
 )
 
 _BY_KEY: dict[str, ModelConfig] = {m.key: m for m in _MODELS}
@@ -208,6 +260,31 @@ def active_models() -> tuple[ModelConfig, ...]:
     stops running and stops appearing in reports.
     """
     return tuple(m for m in _MODELS if m.enabled)
+
+
+def models_by_stage(stage: str) -> tuple[ModelConfig, ...]:
+    """Enabled models at one lifecycle stage."""
+    return tuple(m for m in active_models() if m.stage == stage)
+
+
+def production_models() -> tuple[ModelConfig, ...]:
+    """The roster the executive report covers by default.
+
+    Enabled AND production. An incubating client strategy runs and alerts, but
+    must not move the numbers the primary models are judged by until it has
+    earned it (see the graduation checklist in
+    docs/CLIENT_ONBOARDING_GUIDE.md).
+    """
+    return models_by_stage("production")
+
+
+def incubating_models() -> tuple[ModelConfig, ...]:
+    return models_by_stage("incubating")
+
+
+def client_models() -> tuple[ModelConfig, ...]:
+    """Every scaffolded client strategy, whatever its stage."""
+    return tuple(m for m in _MODELS if m.key.startswith("client_"))
 
 
 def disabled_models() -> tuple[ModelConfig, ...]:

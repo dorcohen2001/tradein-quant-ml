@@ -79,7 +79,7 @@ _REPO_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from core.registry import active_models, disabled_models
+from core.registry import active_models, disabled_models, incubating_models, production_models
 from core.settings import (
     ANALYZER_LOG_PATH,
     LLM_REQUEST_PATH,
@@ -123,7 +123,16 @@ logger.propagate = False
 # carrying a real pnl_pct -- from win rate, profit factor, expectancy and
 # drawdown. EXPIRED is excluded for every model: it never entered, so it has
 # no P&L.
-MODELS = active_models()
+# PRODUCTION models only by default. An incubating strategy (a client trial,
+# a new idea) runs and alerts on its own route, but must not move the headline
+# numbers the primary models are judged by until it has graduated -- see the
+# checklist in docs/CLIENT_ONBOARDING_GUIDE.md. `--include-incubating` widens
+# the roster for a one-off look.
+#
+# Rebound in main() when that flag is passed; every helper below reads this
+# global at call time, so the roster, report sections, narrative brief and
+# email subject all follow automatically.
+MODELS = production_models()
 
 
 def _model_roster() -> str:
@@ -458,10 +467,17 @@ def main() -> int:
                         help="skip the narrative handoff; deliver the deterministic report")
     parser.add_argument("--narrative", metavar="FILE",
                         help="phase 2: deliver an externally generated narrative Markdown file")
+    parser.add_argument("--include-incubating", action="store_true",
+                        help="also report on incubating models (client trials); "
+                             "by default only production models are covered")
     parser.add_argument("--min-closed", type=int, default=MIN_CLOSED_TRADES_FOR_LLM,
                         help="minimum closed live trades before requesting a narrative "
                              "(default: %(default)s)")
     args = parser.parse_args()
+
+    global MODELS
+    if args.include_incubating:
+        MODELS = active_models()
 
     logger.info("=== daily_tradein_analyzer start ===")
     logger.info("Reporting on %d active model(s): %s",
@@ -471,6 +487,14 @@ def main() -> int:
     for model in disabled_models():
         logger.info("EXCLUDED (deactivated in core/registry.py): %s -- its stored history at "
                     "%s is untouched.", model.label, os.path.basename(model.trade_store))
+    if not args.include_incubating:
+        # Named rather than silently absent: a reader must be able to tell the
+        # difference between "no client strategies exist" and "they were gated
+        # out of this report".
+        for model in incubating_models():
+            logger.info("EXCLUDED (incubating): %s -- running and alerting on route %r, "
+                        "but not in the executive report. Use --include-incubating to add it.",
+                        model.label, model.telegram_route)
     failed = False
 
     if not MODELS:

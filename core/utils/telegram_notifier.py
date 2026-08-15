@@ -56,10 +56,10 @@ TELEGRAM_CAPTION_LIMIT = 1024  # hard Bot API limit for sendPhoto captions
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
-def is_configured(route: str | None = None) -> bool:
+def is_configured(route: str | None = None, strict: bool = False) -> bool:
     """Whether `route` has both a token and a chat id. Kept parameterless-safe:
     existing callers pass nothing and get the default route, as before."""
-    return get_telegram_route(route).is_configured
+    return get_telegram_route(route, strict=strict).is_configured
 
 
 def escape_markdown(text) -> str:
@@ -177,6 +177,7 @@ def send_telegram_message(
     route: str | None = None,
     chat_id: str | None = None,
     token: str | None = None,
+    strict_route: bool = False,
 ) -> dict:
     """Send `text` to a Telegram chat.
 
@@ -190,11 +191,13 @@ def send_telegram_message(
     Returns `{"ok": bool, "message_id": int | None}`. Never raises — network
     errors and an unconfigured bot both come back as `ok: False`.
     """
-    resolved = get_telegram_route(route)
+    resolved = get_telegram_route(route, strict=strict_route)
     token = token or resolved.token
     chat_id = chat_id or resolved.chat_id
     if not (token and chat_id):
-        print(f"[telegram] route {resolved.name!r} has no token/chat id set, skipping send.")
+        detail = (" (dedicated route -- deliberately NOT falling back to the default "
+                  "chat; set its env vars to enable sends)") if strict_route else ""
+        print(f"[telegram] route {resolved.name!r} has no token/chat id set, skipping send.{detail}")
         return {"ok": False, "message_id": None}
 
     payload = {
@@ -216,6 +219,7 @@ def send_telegram_photo(
     route: str | None = None,
     chat_id: str | None = None,
     token: str | None = None,
+    strict_route: bool = False,
 ) -> dict:
     """Send a photo to the chat, with `caption` as its text.
 
@@ -229,11 +233,13 @@ def send_telegram_photo(
     Never raises — failures come back as `ok: False` so callers can fall back
     to a plain text alert.
     """
-    resolved = get_telegram_route(route)
+    resolved = get_telegram_route(route, strict=strict_route)
     token = token or resolved.token
     chat_id = chat_id or resolved.chat_id
     if not (token and chat_id):
-        print(f"[telegram] route {resolved.name!r} has no token/chat id set, skipping send.")
+        detail = (" (dedicated route -- deliberately NOT falling back to the default "
+                  "chat; set its env vars to enable sends)") if strict_route else ""
+        print(f"[telegram] route {resolved.name!r} has no token/chat id set, skipping send.{detail}")
         return {"ok": False, "message_id": None}
 
     caption_fits = caption is not None and len(caption) <= TELEGRAM_CAPTION_LIMIT
@@ -265,7 +271,7 @@ def send_telegram_photo(
     if result["ok"] and caption is not None and not caption_fits:
         follow_up = send_telegram_message(
             caption, parse_mode=parse_mode, reply_to_message_id=result["message_id"],
-            chat_id=chat_id, token=token,
+            chat_id=chat_id, token=token, strict_route=strict_route,
         )
         if not follow_up["ok"]:
             print("[telegram] Photo sent but full-text follow-up failed.")

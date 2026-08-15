@@ -254,9 +254,14 @@ def main() -> int:
     if missing:
         _log(f"[supervisor] WARNING: registered but not on disk, will be skipped: {', '.join(missing)}")
 
+    # Stage is shown because it changes REPORTING, not execution: an incubating
+    # model runs on exactly the same footing as a production one, and only the
+    # executive report treats them differently. Making that visible here stops
+    # "why is my client strategy missing from the report" being a mystery.
     _log(f"[supervisor] {len(models)} model(s): "
-         + ", ".join(f"{m.key} every {m.cycle_interval_minutes}min "
-                     f"(timeout {m.phase_timeout_seconds}s, route {m.telegram_route})" for m in models))
+         + ", ".join(f"{m.key} [{m.stage}] every {m.cycle_interval_minutes}min "
+                     f"(timeout {m.phase_timeout_seconds}s, route {m.telegram_route}"
+                     f"{', dedicated' if m.dedicated_route else ''})" for m in models))
 
     if args.dry_run:
         for m in models:

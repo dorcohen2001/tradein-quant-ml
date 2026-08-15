@@ -106,34 +106,62 @@ class TelegramRoute:
     name: str
     token: str
     chat_id: str
+    # True when this route was resolved with fallback DISABLED. Carried so
+    # diagnostics can distinguish "misconfigured" from "deliberately silent".
+    strict: bool = False
 
     @property
     def is_configured(self) -> bool:
         return bool(self.token and self.chat_id)
 
 
-def get_telegram_route(name: str | None = None) -> TelegramRoute:
+def route_env_names(name: str) -> tuple[str, str]:
+    """The (token, chat_id) environment variable names for a route.
+
+    Exposed so the onboarding guide and the scaffolder print exactly what the
+    resolver reads, rather than a second copy of the convention that can drift
+    from it.
+    """
+    suffix = name.strip().upper().replace("-", "_").replace(" ", "_")
+    return (f"TELEGRAM_ROUTE_{suffix}_TOKEN", f"TELEGRAM_ROUTE_{suffix}_CHAT_ID")
+
+
+def get_telegram_route(name: str | None = None, strict: bool = False) -> TelegramRoute:
     """Resolve a route name to credentials, per the order documented above.
 
     Resolved at CALL time, not import time, so a test (or a supervisor that
     sets per-child environment) can change the destination without reimporting
     the module.
+
+    `strict=True` REMOVES the shared-default fallback: a route with no
+    configuration of its own resolves to empty credentials, and the notifier
+    then skips the send instead of delivering it. That is the isolation
+    guarantee for client strategies -- with the normal forgiving behaviour, one
+    unset environment variable would publish a client's signals straight into
+    the primary production channel. Silence is recoverable; a leak is not.
     """
     name = name or DEFAULT_TELEGRAM_ROUTE
     entry = _ROUTES.get(name, {})
+    token_var, chat_var = route_env_names(name)
     suffix = name.strip().upper().replace("-", "_").replace(" ", "_")
 
     token = (
         str(entry.get("token") or "")
+        or os.environ.get(token_var, "")
+        # Legacy form, kept working so existing deployments are unaffected.
         or os.environ.get(f"TELEGRAM_BOT_TOKEN_{suffix}", "")
-        or TELEGRAM_BOT_TOKEN
     )
     chat_id = (
         str(entry.get("chat_id") or "")
+        or os.environ.get(chat_var, "")
         or os.environ.get(f"TELEGRAM_CHAT_ID_{suffix}", "")
-        or TELEGRAM_CHAT_ID
     )
-    return TelegramRoute(name=name, token=token, chat_id=chat_id)
+
+    if not strict:
+        token = token or TELEGRAM_BOT_TOKEN
+        chat_id = chat_id or TELEGRAM_CHAT_ID
+
+    return TelegramRoute(name=name, token=token, chat_id=chat_id, strict=strict)
 
 
 def configured_route_names() -> tuple[str, ...]:
