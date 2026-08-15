@@ -36,6 +36,7 @@ from config import (
     CRYPTO_BENCHMARK,
     EARNINGS_BLACKOUT_HOURS,
     FUNNEL_LOG_DIR,
+    FUNNEL_LOG_PREFIX,
     FUNNEL_LOG_RETENTION_PER_MODEL,
     MIN_DOLLAR_VOLUME,
     MIN_RISK_REWARD,
@@ -346,15 +347,16 @@ def _prune_old_reports(prefix: str, keep: int) -> int:
 
 
 def export_funnel_report(records_by_class: dict[str, list[TickerFunnelRecord]]) -> str | None:
-    """Writes the two-sheet Excel report to FUNNEL_LOG_DIR (shared with
-    Livne, see config.py), timestamped as
-    `live_funnel_biton_YYYYMMDD_HHMMSS.xlsx`. Returns the written path, or
-    None (after logging why) if the write failed. Never raises, so a bad
-    export can't interrupt the live scan/alert loop."""
+    """Writes the two-sheet Excel report to FUNNEL_LOG_DIR (shared with every
+    other model, see config.py), timestamped as
+    `{FUNNEL_LOG_PREFIX}YYYYMMDD_HHMMSS.xlsx`. The prefix comes from this
+    model's `core.registry` entry rather than a literal here. Returns the
+    written path, or None (after logging why) if the write failed. Never
+    raises, so a bad export can't interrupt the live scan/alert loop."""
     try:
         os.makedirs(FUNNEL_LOG_DIR, exist_ok=True)
         timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(FUNNEL_LOG_DIR, f"live_funnel_biton_{timestamp}.xlsx")
+        path = os.path.join(FUNNEL_LOG_DIR, f"{FUNNEL_LOG_PREFIX}{timestamp}.xlsx")
 
         wb = Workbook()
         summary_ws = wb.active
@@ -366,7 +368,7 @@ def export_funnel_report(records_by_class: dict[str, list[TickerFunnelRecord]]) 
 
         wb.save(path)
 
-        pruned = _prune_old_reports("live_funnel_biton_", FUNNEL_LOG_RETENTION_PER_MODEL)
+        pruned = _prune_old_reports(FUNNEL_LOG_PREFIX, FUNNEL_LOG_RETENTION_PER_MODEL)
         if pruned:
             print(f"[funnel_diagnostics] Pruned {pruned} old Biton report(s), "
                   f"keeping the newest {FUNNEL_LOG_RETENTION_PER_MODEL}.", file=sys.stderr)

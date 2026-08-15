@@ -45,3 +45,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # --- News / sentiment ---------------------------------------------------
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 NEWS_LOOKBACK_HOURS = _int_env("NEWS_LOOKBACK_HOURS", 48)
+
+# --- Daily analyzer ("Steve", agents/steve) -----------------------------
+# These belong to the ANALYZER, not to any model. They previously lived in
+# models/livne/config.py, which made one model's config the carrier for a tool
+# that reports on ALL models -- so Steve could not run if Livne were ever
+# renamed or retired, and a third model inherited the same asymmetry. They are
+# model-agnostic by definition, so `core` is where they belong.
+MIN_CLOSED_TRADES_FOR_LLM = _int_env("MIN_CLOSED_TRADES_FOR_LLM", 20)
+REPORT_ARCHIVE_DIR = os.path.join(REPO_ROOT, "mail", "reports")
+MAIL_DIR = os.path.join(REPO_ROOT, "mail")
+ANALYZER_LOG_PATH = os.path.join(REPO_ROOT, "runtime", "logs", "analyzer.log")
+LLM_REQUEST_PATH = os.path.join(REPO_ROOT, "runtime", "logs", "llm_request.json")

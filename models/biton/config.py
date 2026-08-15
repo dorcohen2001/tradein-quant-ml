@@ -16,8 +16,22 @@ RUNTIME_DIR = os.path.join(REPO_ROOT, "runtime")
 
 # Single repo-root .env shared with Livne. Previously this codebase had its
 # own duplicate .env, so a rotated Telegram token had to be updated twice or
-# one model would silently stop alerting.
+# one model would silently stop alerting. (That stale models/biton/.env has
+# since been deleted outright -- it was byte-identical and nothing loaded it.)
 load_dotenv(os.path.join(REPO_ROOT, ".env"))
+
+# ---------------------------------------------------------------------------
+# Identity + derived runtime paths come from `core.registry` -- see
+# models/livne/config.py for the full rationale. Biton's RULES remain frozen;
+# only the path/identity plumbing is now shared, and every value it produces is
+# byte-identical to the literals this file used before.
+# ---------------------------------------------------------------------------
+import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
+
+from core.registry import get_model  # noqa: E402
+
+MODEL_KEY = "biton"
+_MODEL = get_model(MODEL_KEY)
 
 # ---------------------------------------------------------------------------
 # Watchlists (used because full-market screening via free APIs is impractical
@@ -136,15 +150,15 @@ CHART_OUTPUT_DIR = os.environ.get("CHART_OUTPUT_DIR", os.path.join(RUNTIME_DIR, 
 # without this codebase importing (or being imported by) TRADEIN's modules --
 # they share no Python process, only these output file paths.
 # ---------------------------------------------------------------------------
-MODEL_NAME = "Biton model"
+MODEL_NAME = _MODEL.label
 
 # ---------------------------------------------------------------------------
 # Paper trading -- Biton's own isolated store/journal, sitting beside Livne's
 # in the shared runtime/ tree. Distinct filenames; neither model ever reads
 # or writes the other's files.
 # ---------------------------------------------------------------------------
-PAPER_TRADING_STORE = os.path.join(RUNTIME_DIR, "stores", "trades_biton.json")
-PAPER_TRADING_JOURNAL_XLSX = os.path.join(RUNTIME_DIR, "journals", "trade_journal_biton.xlsx")
+PAPER_TRADING_STORE = _MODEL.trade_store
+PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 
 # ---------------------------------------------------------------------------
 # Live funnel diagnostics (screener/funnel_diagnostics.py) -- shared directory
@@ -154,6 +168,7 @@ PAPER_TRADING_JOURNAL_XLSX = os.path.join(RUNTIME_DIR, "journals", "trade_journa
 # ---------------------------------------------------------------------------
 FUNNEL_LOG_DIR = os.path.join(RUNTIME_DIR, "funnel_logs")
 FUNNEL_LOG_RETENTION_PER_MODEL = 50
+FUNNEL_LOG_PREFIX = _MODEL.funnel_prefix
 
 # ---------------------------------------------------------------------------
 # yfinance disk cache (core.utils.yf_cache) -- the same physical directory
@@ -171,7 +186,7 @@ YF_RETRY_DELAYS = (2, 5, 10)
 # ---------------------------------------------------------------------------
 # Live runner
 # ---------------------------------------------------------------------------
-CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
+CYCLE_INTERVAL_MINUTES = _MODEL.cycle_interval_minutes  # minutes between background scan/refresh cycles
 
 # ---------------------------------------------------------------------------
 # Scheduled Telegram summaries (core.reporting.summary)
@@ -187,13 +202,13 @@ CYCLE_INTERVAL_MINUTES = 15  # minutes between background scan/refresh cycles
 # ---------------------------------------------------------------------------
 DAILY_REPORT_HOUR = 21
 WEEKLY_REPORT_WEEKDAY = 4  # Friday
-REPORT_STATE_STORE = os.path.join(RUNTIME_DIR, "stores", "report_state_biton.json")
+REPORT_STATE_STORE = _MODEL.report_state_store
 SEND_EMPTY_DAILY_REPORT = True
 
 # Biton's lifecycle: single-shot TP, so every reportable status is terminal
 # and there are no non-terminal update statuses.
-REPORT_CLOSED_STATUSES = ("WIN_TP1", "WIN_TP2", "LOSS_SL", "EXPIRED")
-REPORT_UPDATE_STATUSES = ()
+REPORT_CLOSED_STATUSES = _MODEL.closed_statuses
+REPORT_UPDATE_STATUSES = _MODEL.update_statuses
 
 # ---------------------------------------------------------------------------
 # Execution / fill-price simulation
@@ -205,4 +220,4 @@ MAX_SLIPPAGE_PCT = 0.0015  # 0.15% max adverse slippage modeled on a stop-loss f
 # REPORT_ARCHIVE_DIR, MAILTOMAIL_DIR) used to be duplicated here but were dead
 # code: Steve imports Livne's config exclusively and never this one. Removed.
 # ---------------------------------------------------------------------------
-BACKTEST_TRADES_CSV = os.path.join(RUNTIME_DIR, "backtest", "trades_log_biton.csv")
+BACKTEST_TRADES_CSV = _MODEL.backtest_csv

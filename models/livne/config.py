@@ -24,6 +24,27 @@ RUNTIME_DIR = os.path.join(REPO_ROOT, "runtime")
 load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
 # ---------------------------------------------------------------------------
+# Model identity + derived runtime paths come from `core.registry`, the single
+# place that knows which models exist. Everything below that used to be a
+# hand-written path literal (`.../trades_livne.json`) is now derived from
+# MODEL_KEY, so a third model needs no edit here at all.
+#
+# `_bootstrap` must be imported BEFORE `core.*`: this module is imported
+# directly by main.py and by the Steve analyzer, neither of which has
+# necessarily put the repo root on sys.path yet.
+#
+# The paths this produces are byte-identical to the literals used before --
+# they hold live paper-trading state, and a one-character change would orphan
+# that history behind a freshly-created empty store.
+# ---------------------------------------------------------------------------
+import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
+
+from core.registry import get_model  # noqa: E402
+
+MODEL_KEY = "livne"
+_MODEL = get_model(MODEL_KEY)
+
+# ---------------------------------------------------------------------------
 # Watchlists (used because full-market screening via free APIs is impractical
 # to run daily without paid data feeds). Extend these lists as needed.
 #
@@ -366,6 +387,9 @@ EMERGENCY_CANDLE_LOOKBACK = 20  # bars of recent intraday history fetched for th
 # trace exported to Excel at the end of every live scan cycle.
 # ---------------------------------------------------------------------------
 FUNNEL_LOG_DIR = os.path.join(RUNTIME_DIR, "funnel_logs")
+# Namespaced per model so the shared directory never collides and retention
+# prunes per prefix -- derived from the key rather than written out again.
+FUNNEL_LOG_PREFIX = _MODEL.funnel_prefix
 # Retention: keep only the newest N reports PER MODEL in that shared
 # directory. Unbounded before -- at 4 cycles/hour x 2 models this directory
 # grew by ~200 files/day forever. Pruning is per-model-prefix so neither
@@ -441,7 +465,7 @@ CHART_OUTPUT_DIR = os.environ.get("CHART_OUTPUT_DIR", os.path.join(RUNTIME_DIR, 
 # model (current/refactored pipeline), run alongside the "Biton" model (the
 # frozen legacy pipeline in ../biton) as two fully isolated processes.
 # ---------------------------------------------------------------------------
-MODEL_NAME = "Livne model"
+MODEL_NAME = _MODEL.label
 
 # Livne's runner drives Biton each cycle as a subprocess. BITON_PHASE_TIMEOUT
 # bounds that call: without it a hung child blocks Livne's own position
@@ -458,8 +482,8 @@ BITON_PHASE_TIMEOUT_SECONDS = 480  # 8 minutes per phase
 # beside them in the same runtime/ tree under its own filenames; the two
 # models never read or write each other's files.
 # ---------------------------------------------------------------------------
-PAPER_TRADING_STORE = os.path.join(RUNTIME_DIR, "stores", "trades_livne.json")
-PAPER_TRADING_JOURNAL_XLSX = os.path.join(RUNTIME_DIR, "journals", "trade_journal_livne.xlsx")
+PAPER_TRADING_STORE = _MODEL.trade_store
+PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 
 # ---------------------------------------------------------------------------
 # Live runner -- INTRADAY cadence
@@ -481,7 +505,7 @@ PAPER_TRADING_JOURNAL_XLSX = os.path.join(RUNTIME_DIR, "journals", "trade_journa
 #   reports/hour, which would churn through the 50-file retention in under two
 #   hours and roughly double scan cost for a purely diagnostic artifact.
 # ---------------------------------------------------------------------------
-CYCLE_INTERVAL_MINUTES = 2
+CYCLE_INTERVAL_MINUTES = _MODEL.cycle_interval_minutes
 BITON_CYCLE_INTERVAL_MINUTES = 15
 FUNNEL_EXPORT_INTERVAL_MINUTES = 15
 
@@ -502,7 +526,7 @@ PENDING_EXPIRY_HOURS = 6
 # ---------------------------------------------------------------------------
 DAILY_REPORT_HOUR = 21
 WEEKLY_REPORT_WEEKDAY = 4  # Friday
-REPORT_STATE_STORE = os.path.join(RUNTIME_DIR, "stores", "report_state_livne.json")
+REPORT_STATE_STORE = _MODEL.report_state_store
 # Send the daily summary even when nothing happened. Kept on by default: a
 # short "none / none" message each evening is a useful liveness signal that
 # the runner is still up. Set False to only report on activity.
@@ -510,8 +534,8 @@ SEND_EMPTY_DAILY_REPORT = True
 
 # Livne's lifecycle. CLOSED are terminal; UPDATE are non-terminal status
 # changes still worth surfacing (PARTIAL_TP1 banks half the position).
-REPORT_CLOSED_STATUSES = ("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT", "EXPIRED")
-REPORT_UPDATE_STATUSES = ("PARTIAL_TP1",)
+REPORT_CLOSED_STATUSES = _MODEL.closed_statuses
+REPORT_UPDATE_STATUSES = _MODEL.update_statuses
 
 # ---------------------------------------------------------------------------
 # Execution / fill-price simulation
@@ -521,16 +545,18 @@ MAX_SLIPPAGE_PCT = 0.0015  # 0.15% max adverse slippage modeled on a stop-loss f
 # ---------------------------------------------------------------------------
 # Daily analyzer (agents/steve/daily_tradein_analyzer.py)
 #
-# Steve reports on BOTH models, so it needs each model's store/journal paths.
-# It imports THIS config (Livne's) as the canonical one and derives Biton's
-# siblings from the shared runtime/ tree, rather than importing two configs
-# with clashing top-level module names.
+# Steve reports on ALL models and no longer takes ANYTHING model-specific from
+# this file. Two groups of constants moved out:
+#
+#   PAPER_TRADING_STORE_BITON / BACKTEST_TRADES_CSV_BITON -> `core.registry`.
+#   Livne's config was carrying Biton's runtime layout: the wrong direction,
+#   and it does not survive a third model. Steve now iterates the registry and
+#   asks each ModelConfig for its own paths.
+#
+#   MIN_CLOSED_TRADES_FOR_LLM / REPORT_ARCHIVE_DIR / MAIL_DIR /
+#   ANALYZER_LOG_PATH / LLM_REQUEST_PATH -> `core.settings`. Those are the
+#   analyzer's own settings; nothing in this model ever read them.
+#
+# What remains here is only Livne's OWN backtest output path.
 # ---------------------------------------------------------------------------
-MIN_CLOSED_TRADES_FOR_LLM = 20  # below this, skip the narrative handoff (sample too small)
-REPORT_ARCHIVE_DIR = os.path.join(REPO_ROOT, "mail", "reports")
-MAIL_DIR = os.path.join(REPO_ROOT, "mail")
-BACKTEST_TRADES_CSV = os.path.join(RUNTIME_DIR, "backtest", "trades_log_livne.csv")
-BACKTEST_TRADES_CSV_BITON = os.path.join(RUNTIME_DIR, "backtest", "trades_log_biton.csv")
-PAPER_TRADING_STORE_BITON = os.path.join(RUNTIME_DIR, "stores", "trades_biton.json")
-ANALYZER_LOG_PATH = os.path.join(RUNTIME_DIR, "logs", "analyzer.log")
-LLM_REQUEST_PATH = os.path.join(RUNTIME_DIR, "logs", "llm_request.json")
+BACKTEST_TRADES_CSV = _MODEL.backtest_csv

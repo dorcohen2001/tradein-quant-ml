@@ -36,6 +36,7 @@ from config import (
     CRYPTO_BENCHMARK,
     EARNINGS_BLACKOUT_HOURS,
     FUNNEL_LOG_DIR,
+    FUNNEL_LOG_PREFIX,
     FUNNEL_LOG_RETENTION_PER_MODEL,
     LTF_ALIGNMENT_TFS,
     LTF_MA_MIN_ALIGNED,
@@ -386,17 +387,17 @@ def _prune_old_reports(prefix: str, keep: int) -> int:
 
 def export_funnel_report(records_by_class: dict[str, list[TickerFunnelRecord]]) -> str | None:
     """Writes the two-sheet Excel report to FUNNEL_LOG_DIR, timestamped as
-    `live_funnel_livne_YYYYMMDD_HHMMSS.xlsx` -- the `livne` infix keeps this
-    model's reports distinct from the Biton (legacy) model's own
-    `live_funnel_biton_*.xlsx` reports in the same shared directory (see
-    models/biton/screener/funnel_diagnostics.py). Returns the written path,
+    `{FUNNEL_LOG_PREFIX}YYYYMMDD_HHMMSS.xlsx`. The prefix now comes from this
+    model's `core.registry` entry rather than being written out here as a
+    literal, so every model's reports stay distinct in the shared directory
+    without each exporter hard-coding its own name. Returns the written path,
     or None (after logging why) if the write failed -- e.g. a previous report
     still open/locked in Excel. Never raises, so a bad export can't interrupt
     the live scan/alert loop."""
     try:
         os.makedirs(FUNNEL_LOG_DIR, exist_ok=True)
         timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(FUNNEL_LOG_DIR, f"live_funnel_livne_{timestamp}.xlsx")
+        path = os.path.join(FUNNEL_LOG_DIR, f"{FUNNEL_LOG_PREFIX}{timestamp}.xlsx")
 
         wb = Workbook()
         summary_ws = wb.active
@@ -408,7 +409,7 @@ def export_funnel_report(records_by_class: dict[str, list[TickerFunnelRecord]]) 
 
         wb.save(path)
 
-        pruned = _prune_old_reports("live_funnel_livne_", FUNNEL_LOG_RETENTION_PER_MODEL)
+        pruned = _prune_old_reports(FUNNEL_LOG_PREFIX, FUNNEL_LOG_RETENTION_PER_MODEL)
         if pruned:
             print(f"[funnel_diagnostics] Pruned {pruned} old Livne report(s), "
                   f"keeping the newest {FUNNEL_LOG_RETENTION_PER_MODEL}.", file=sys.stderr)

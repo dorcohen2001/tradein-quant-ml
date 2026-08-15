@@ -4,10 +4,13 @@ No external LLM API is called and no API key is required. The strategic
 narrative is produced by a *local* LLM operator (Claude Code running on this
 machine) through a two-phase handoff:
 
-Covers BOTH production models in one report: Livne (current MTFA pipeline)
-and Biton (frozen legacy pipeline). Each gets its own clearly separated
-section -- their numbers are never pooled, because they are different
-strategies with different lifecycles and different minimum R:R.
+Covers EVERY model registered in `core.registry` in one report -- currently
+Livne (multi-timeframe intraday pipeline) and Biton (frozen legacy pipeline),
+but the roster, the per-model report sections and the email subject are all
+derived from the registry, so a newly registered model appears automatically.
+Each model gets its own clearly separated section -- their numbers are never
+pooled, because they are different strategies with different lifecycles,
+different status vocabularies and different minimum R:R.
 
   Phase 1 (analyze + request):
       python agents/steve/daily_tradein_analyzer.py
@@ -26,7 +29,7 @@ strategies with different lifecycles and different minimum R:R.
         deterministic data appendix, archives the report as
         mail/reports/report_YYYY-MM-DD.md (overwrite; idempotent), and
         emails it as a SINGLE message covering both models (subject
-        "TRADEIN Daily Report — YYYY-MM-DD (Livne + Biton)", .md attached,
+        "TRADEIN Daily Report — YYYY-MM-DD (<registered models>)", .md attached,
         executive summary in the body).
 
 Other usage:
@@ -53,32 +56,34 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# This script lives in agents/steve/. Livne's model directory is added to
-# sys.path so `config` resolves regardless of the caller's cwd — mirroring how
-# config.py itself anchors every path to its own __file__ rather than to
-# whoever imports it.
+# This script lives in agents/steve/ and no longer imports ANY model's config.
 #
-# Only ONE model's config is imported, deliberately: the two models define
-# clashing top-level module names (`config`, `paper_trading`, `utils`), so
-# importing both into one process is not possible. Livne's config is treated
-# as canonical and exposes both models' store/CSV paths (they all live in the
-# shared runtime/ tree anyway). Biton's trades are read straight from JSON
-# rather than through its tracker, which also avoids running Livne's schema
-# migration over Biton-shaped records.
+# It used to insert Livne's model directory on sys.path and import its
+# `config` as "the canonical one", because the two models define clashing
+# top-level module names (`config`, `paper_trading`, `utils`) and cannot both
+# be imported into one process. That worked, but it made a tool which reports
+# on every model depend on one specific model existing, and it meant Biton's
+# paths were declared inside Livne's config.
+#
+# Both problems disappear by importing from `core` instead: `core.registry`
+# knows every model's paths and status vocabulary, and `core.settings` holds
+# the analyzer's own settings. No model package is imported at all, so the
+# name-clash constraint simply does not apply any more.
+#
+# Each model's trades are still read straight from its JSON store rather than
+# through its tracker -- that avoids running one model's schema migration over
+# another model's records.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_LIVNE_MODEL_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "..", "models", "livne"))
-if _LIVNE_MODEL_DIR not in sys.path:
-    sys.path.insert(0, _LIVNE_MODEL_DIR)
+_REPO_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from config import (
+from core.registry import all_models
+from core.settings import (
     ANALYZER_LOG_PATH,
-    BACKTEST_TRADES_CSV,
-    BACKTEST_TRADES_CSV_BITON,
     LLM_REQUEST_PATH,
     MAIL_DIR,
     MIN_CLOSED_TRADES_FOR_LLM,
-    PAPER_TRADING_STORE,
-    PAPER_TRADING_STORE_BITON,
     REPORT_ARCHIVE_DIR,
 )
 
@@ -99,39 +104,51 @@ logger.addHandler(logging.StreamHandler(sys.stderr))
 # or every analyzer log line after the email stage prints twice.
 logger.propagate = False
 
-# Terminal statuses that carry a realized `pnl_pct`, PER MODEL. These are not
-# interchangeable and getting them wrong silently corrupts every downstream
-# metric:
+# Every registered model, in canonical report order. Previously a hard-coded
+# tuple here plus a separate hard-coded CLOSED_WITH_PNL dict; both are now the
+# registry's job, so adding a model needs no edit in this file.
 #
-#   Livne runs a multi-tier TP1/breakeven lifecycle and never emits WIN_TP1 at
-#   all -- a TP1 fill moves it to PARTIAL_TP1 (still open), and it later closes
-#   as WIN_TP2, LOSS_SL_BE, or EMERGENCY_EXIT. The previous shared constant
-#   ("WIN_TP1", "WIN_TP2", "LOSS_SL") was Biton's set applied to both, so every
-#   Livne LOSS_SL_BE and EMERGENCY_EXIT trade -- each carrying a real pnl_pct --
-#   was dropped from win rate, profit factor, expectancy and drawdown.
-#
-#   Biton runs the older single-shot lifecycle and does emit WIN_TP1.
-#
-# EXPIRED is excluded from both: it never entered, so it has no P&L.
-CLOSED_WITH_PNL = {
-    "livne": ("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT"),
-    "biton": ("WIN_TP1", "WIN_TP2", "LOSS_SL"),
-}
+# The per-model status vocabulary that `CLOSED_WITH_PNL` used to hold now lives
+# on each ModelConfig as `closed_with_pnl`. It stays strictly per-model for the
+# reason it was split in the first place: Livne runs a multi-tier
+# TP1/breakeven lifecycle and never emits WIN_TP1 at all, while Biton runs the
+# older single-shot lifecycle and does. Applying one model's set to the other
+# silently dropped every Livne LOSS_SL_BE and EMERGENCY_EXIT trade -- each
+# carrying a real pnl_pct -- from win rate, profit factor, expectancy and
+# drawdown. EXPIRED is excluded for every model: it never entered, so it has
+# no P&L.
+MODELS = all_models()
 
-# Each model's live store + backtest CSV, in report order.
-MODELS = (
-    ("livne", "Livne model", PAPER_TRADING_STORE, BACKTEST_TRADES_CSV),
-    ("biton", "Biton model", PAPER_TRADING_STORE_BITON, BACKTEST_TRADES_CSV_BITON),
-)
 
-NARRATIVE_INSTRUCTIONS = """\
+def _model_roster() -> str:
+    """The 'which models exist' paragraph of the narrative prompt, built from
+    the registry so a newly registered model is described to the analyst
+    automatically instead of silently missing from the brief."""
+    return "\n".join(
+        f'  - "{m.label}" — {m.description or "no description registered."}'
+        for m in MODELS
+    )
+
+
+def _model_sections() -> str:
+    """The per-model heading block of the requested report structure."""
+    return "\n".join(
+        f"## {m.label}\n"
+        f"### Performance Snapshot  (live vs. simulated, clearly labeled)\n"
+        f"### Weaknesses & Loss Patterns"
+        for m in MODELS
+    )
+
+
+def narrative_instructions() -> str:
+    """Built at call time rather than as a module constant, so the roster and
+    the section list always reflect the models actually registered."""
+    count = len(MODELS)
+    return f"""\
 You are a senior trading-strategy analyst reviewing a systematic paper-trading
-program that runs TWO INDEPENDENT MODELS CONCURRENTLY in production:
+program that runs {count} INDEPENDENT MODELS CONCURRENTLY in production:
 
-  - "Livne" — the current multi-timeframe (MTFA) pipeline, with a multi-tier
-    TP1/breakeven/TP2 lifecycle and a 1:3 minimum R:R.
-  - "Biton" — the frozen legacy single-timeframe pipeline, single-shot TP,
-    1:2 minimum R:R.
+{_model_roster()}
 
 They are separate strategies on the same watchlists. The payload below gives,
 per model, a "live" sample (real-time paper trades) and a "backtest" sample
@@ -139,15 +156,10 @@ per model, a "live" sample (real-time paper trades) and a "backtest" sample
 assumption is slightly optimistic).
 
 Write a daily strategy report in Markdown with exactly this structure:
-# TRADEIN Daily Report — {date}
-## Executive Summary  (3-5 sentences, blunt, decision-oriented, covering BOTH models)
-## Livne Model
-### Performance Snapshot  (live vs. simulated, clearly labeled)
-### Weaknesses & Loss Patterns
-## Biton Model
-### Performance Snapshot  (live vs. simulated, clearly labeled)
-### Weaknesses & Loss Patterns
-## Comparative Read  (where the two models agree/diverge, and what that implies)
+# TRADEIN Daily Report — {{date}}
+## Executive Summary  (3-5 sentences, blunt, decision-oriented, covering ALL models)
+{_model_sections()}
+## Comparative Read  (where the models agree/diverge, and what that implies)
 ## Strategic Proposals  (ranked by expected impact; bold high-level ideas —
    new indicator families, risk-management frameworks, macro filters, revised
    entry/exit logic, position sizing — each tied to a specific weakness above,
@@ -158,8 +170,8 @@ Hard rules:
 - STRICTLY NO CODE: no code blocks, no snippets, no syntax. Plain prose only.
 - Use ONLY numbers present in the payload. If a metric is null or absent, say
   it could not be computed — never invent a value.
-- NEVER pool the two models' numbers into a single blended figure, and never
-  compare a Livne number against a Biton number without saying which is which.
+- NEVER pool different models' numbers into a single blended figure, and never
+  compare one model's number against another's without saying which is which.
 - If a live sample is small, say so and weight that model's backtest instead.
 - Keep it under ~1200 words.
 
@@ -232,13 +244,19 @@ def _read_store(path: str) -> list[dict]:
         return json.load(f)
 
 
-def compute_live_metrics(model_key: str, store_path: str) -> dict:
+def compute_live_metrics(model) -> dict:
+    """Aggregate one model's live paper trades. Takes the ModelConfig itself
+    rather than a (key, path) pair so the store location and the P&L-bearing
+    status set can never be mismatched -- pairing one model's store with
+    another's vocabulary is exactly the bug that once zeroed out Livne's
+    LOSS_SL_BE and EMERGENCY_EXIT trades."""
+    store_path = model.trade_store
     trades = _read_store(store_path)
     by_status: dict[str, int] = {}
     for t in trades:
         by_status[t["current_status"]] = by_status.get(t["current_status"], 0) + 1
 
-    closed_statuses = CLOSED_WITH_PNL[model_key]
+    closed_statuses = model.closed_with_pnl
     closed = [t for t in trades
               if t["current_status"] in closed_statuses and t.get("pnl_pct") is not None]
     closed.sort(key=lambda t: t.get("exit_date") or t["signal_date"])
@@ -317,7 +335,7 @@ def _metrics_markdown(title: str, m: dict | None) -> str:
 
 def _model_section(label: str, sample: dict) -> str:
     """One model's block: its live sample and its own backtest sample, always
-    labelled, so the two models' numbers can never be read as one pooled
+    labelled, so different models' numbers can never be read as one pooled
     figure. They run different strategies and are expected to disagree."""
     return (
         f"## {label}\n\n"
@@ -328,21 +346,22 @@ def _model_section(label: str, sample: dict) -> str:
 
 def _data_appendix(samples: dict[str, dict]) -> str:
     out = ["\n\n---\n\n# Data Appendix (computed, not narrative)\n"]
-    for _key, label, sample in _ordered(samples):
-        out.append(_model_section(label, sample))
+    for model, sample in _ordered(samples):
+        out.append(_model_section(model.label, sample))
     return "\n".join(out)
 
 
 def _ordered(samples: dict[str, dict]):
-    """(key, label, sample) in the canonical MODELS order."""
-    return [(key, label, samples[key]) for key, label, _s, _c in MODELS if key in samples]
+    """(ModelConfig, sample) pairs in canonical registry order, skipping any
+    model that produced no sample this run."""
+    return [(m, samples[m.key]) for m in MODELS if m.key in samples]
 
 
 def build_deterministic_report(samples: dict[str, dict], gate_note: str) -> str:
     today = dt.date.today().isoformat()
     parts = [f"# TRADEIN Daily Report — {today}\n", f"## Executive Summary\n\n{gate_note}\n"]
-    for _key, label, sample in _ordered(samples):
-        parts.append(_model_section(label, sample))
+    for model, sample in _ordered(samples):
+        parts.append(_model_section(model.label, sample))
     return "\n".join(parts)
 
 
@@ -351,9 +370,9 @@ def emit_narrative_request(samples: dict[str, dict]) -> None:
     for the local LLM operator (Claude Code). No API call is made."""
     payload = {
         "report_date": dt.date.today().isoformat(),
-        "models": {key: {"label": label, **sample} for key, label, sample in _ordered(samples)},
+        "models": {m.key: {"label": m.label, **sample} for m, sample in _ordered(samples)},
     }
-    request = {"instructions": NARRATIVE_INSTRUCTIONS, "payload": payload}
+    request = {"instructions": narrative_instructions(), "payload": payload}
     os.makedirs(os.path.dirname(LLM_REQUEST_PATH), exist_ok=True)
     with open(LLM_REQUEST_PATH, "w", encoding="utf-8") as f:
         json.dump(request, f, indent=2)
@@ -363,7 +382,7 @@ def emit_narrative_request(samples: dict[str, dict]) -> None:
     print(f"Request also written to: {LLM_REQUEST_PATH}")
     print("=" * 70)
     print("\n--- INSTRUCTIONS " + "-" * 52)
-    print(NARRATIVE_INSTRUCTIONS)
+    print(narrative_instructions())
     print("\n--- METRICS PAYLOAD (JSON) " + "-" * 42)
     print(json.dumps(payload, indent=2))
     print("=" * 70)
@@ -416,7 +435,8 @@ def email_report(report_path: str, report_md: str) -> bool:
         sys.path.append(MAIL_DIR)
     from send_email import send_report_email
 
-    subject = f"TRADEIN Daily Report — {dt.date.today().isoformat()} (Livne + Biton)"
+    roster = " + ".join(m.label.replace(" model", "") for m in MODELS)
+    subject = f"TRADEIN Daily Report — {dt.date.today().isoformat()} ({roster})"
     body = (_executive_summary(report_md)
             + "\n\n(Full report attached; archived copy in mail/reports.)")
     return send_report_email(subject, body, attachments=[report_path])
@@ -440,31 +460,31 @@ def main() -> int:
     logger.info("=== daily_tradein_analyzer start ===")
     failed = False
 
-    # Stage 1 — analyze BOTH models. One model failing must not suppress the
-    # other's report: each is captured independently and an error is recorded
-    # in place of that model's metrics.
+    # Stage 1 — analyze EVERY registered model. One model failing must not
+    # suppress another's report: each is captured independently and an error is
+    # recorded in place of that model's metrics.
     samples: dict[str, dict] = {}
-    for key, label, store_path, csv_path in MODELS:
+    for model in MODELS:
         try:
-            live = compute_live_metrics(key, store_path)
+            live = compute_live_metrics(model)
             logger.info("%s live metrics: %d signals, %d closed.",
-                        label, live["total_signals"], live["closed_trades"])
+                        model.label, live["total_signals"], live["closed_trades"])
         except Exception:
-            logger.exception("%s live metrics stage failed.", label)
-            live = {"error": f"{label} live metrics could not be computed (see analyzer.log)"}
+            logger.exception("%s live metrics stage failed.", model.label)
+            live = {"error": f"{model.label} live metrics could not be computed (see analyzer.log)"}
             failed = True
         try:
-            backtest = compute_backtest_metrics(csv_path)
+            backtest = compute_backtest_metrics(model.backtest_csv)
         except Exception:
-            logger.exception("%s backtest metrics stage failed.", label)
+            logger.exception("%s backtest metrics stage failed.", model.label)
             backtest = None
             failed = True
-        samples[key] = {"live": live, "backtest": backtest}
+        samples[model.key] = {"live": live, "backtest": backtest}
 
     # Stage 2 — assemble the report (or hand off for narrative generation).
-    # The narrative gate looks at the COMBINED closed-trade count across both
-    # models: the report covers both, so the question is whether there is
-    # enough evidence overall to be worth a strategic narrative.
+    # The narrative gate looks at the COMBINED closed-trade count across all
+    # models: the report covers all of them, so the question is whether there
+    # is enough evidence overall to be worth a strategic narrative.
     closed = sum(s["live"].get("closed_trades", 0) for s in samples.values())
     if args.narrative:
         try:
@@ -476,11 +496,11 @@ def main() -> int:
         report_md = narrative + _data_appendix(samples)
     elif closed < args.min_closed:
         per_model = ", ".join(
-            f"{label} {samples[key]['live'].get('closed_trades', 0)}"
-            for key, label, _s, _c in MODELS if key in samples
+            f"{m.label} {sample['live'].get('closed_trades', 0)}"
+            for m, sample in _ordered(samples)
         )
         gate_note = (
-            f"Only **{closed}** live paper trades are closed across both models "
+            f"Only **{closed}** live paper trades are closed across all models "
             f"({per_model}) — below the {args.min_closed}-trade minimum for meaningful "
             f"strategy analysis, so the strategy narrative was skipped (this is the "
             f"expected path early on). The computed aggregates for each model are below."
