@@ -75,6 +75,13 @@ If the user does not have firm rules yet, say so plainly and scaffold with the
 placeholder trend-pullback rule — it runs end to end and is meant to be
 replaced. Do not invent rules and present them as a strategy.
 
+> For anything beyond a couple of conditions, send the client
+> [`STRATEGY_SPEC_TEMPLATE.md`](STRATEGY_SPEC_TEMPLATE.md) rather than
+> interviewing them field by field. It carries a fully worked reference model
+> (Livne, with its real parameters) plus the rules for writing conditions that
+> can actually be implemented — usually the difference between one round of
+> questions and four.
+
 ### 1c. Telegram
 
 | Question | Notes |

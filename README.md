@@ -4,15 +4,25 @@ A **paper-trading** signal system. No module here places real brokerage or
 exchange orders. "Live" means: scan → compute a setup → send a Telegram alert
 → log a simulated position. Nothing in this repository moves money.
 
-Two independent models run **concurrently in production** against the same
-watchlists. They are different strategies and are expected to disagree.
+Each model is an independent **tenant**: its own strategy, trade store, journal
+and Telegram route. They run against the same watchlists and are expected to
+disagree.
 
 | | Livne | Biton |
 |---|---|---|
-| Pipeline | Multi-timeframe (MTFA): weekly/monthly HTF structure + 12H/8H/4H/1H ITF trigger | Single-timeframe daily (MA confluence + Fib golden zone) |
+| Pipeline | Multi-timeframe (MTFA) **intraday**: weekly/daily/12h zone discovery → 4h/3h/1h refinement → **15m** trigger (5m + 1h confirm) | Single-timeframe daily (MA confluence + Fib golden zone) |
 | Lifecycle | PENDING → ACTIVE → PARTIAL_TP1 → WIN_TP2 / LOSS_SL_BE / EMERGENCY_EXIT | PENDING → ACTIVE → WIN_TP1 / WIN_TP2 / LOSS_SL |
-| Min R:R | 1:3 | 1:2 |
+| Min R:R | **1:1** hard floor (TP1 1.0–2.0R, TP2 2.0R default, capped 4.0R) | 1:2 |
+| Cadence | every 2 min | every 15 min |
+| Stage / state | `production`, enabled | `production`, **currently paused** (`enabled=False`) |
 | Code | `models/livne/` | `models/biton/` |
+
+> Livne's row previously described the pre-intraday design (weekly/monthly
+> structure, a 12H/8H/4H/1H trigger, a 1:3 floor). Those swing-era floors are
+> unreachable on a 15m trigger and were recalibrated during the intraday
+> conversion. The values above are read from the live config; the full
+> specification is in
+> [`docs/STRATEGY_SPEC_TEMPLATE.md`](docs/STRATEGY_SPEC_TEMPLATE.md).
 
 ## Layout
 
@@ -253,6 +263,9 @@ Telegram route**:
 | Cannot take others down | A crash or hang is contained by the supervisor's per-model subprocess + timeout |
 
 **→ Full walkthrough: [`docs/CLIENT_ONBOARDING_GUIDE.md`](docs/CLIENT_ONBOARDING_GUIDE.md)**
+**→ Strategy spec sheet to send the client: [`docs/STRATEGY_SPEC_TEMPLATE.md`](docs/STRATEGY_SPEC_TEMPLATE.md)** — the
+Livne model documented end to end as a worked example, plus a fill-in-the-blank
+template that generates `strategy/` and `config.py` without a round of questions.
 — written as a protocol an AI session can execute step by step, including the
 Telegram bot setup instructions to hand the user and the graduation checklist
 for promoting `incubating` → `production`.
