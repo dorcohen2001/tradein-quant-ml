@@ -20,6 +20,7 @@ cached series only grows and gaps only ever get filled in.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -129,14 +130,36 @@ class CandleCache:
         path = self.path(venue, symbol, interval)
         path.parent.mkdir(parents=True, exist_ok=True)
         frame = normalize_frame(df)
+
         # Write to a temp sibling then replace, so an interrupted run can never
         # leave a truncated file where a valid cache used to be.
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        if self.fmt == "parquet":
-            frame.to_parquet(tmp)
-        else:
-            frame.to_csv(tmp)
-        tmp.replace(path)
+        #
+        # The temp name is PID-scoped because this cache is now written from
+        # SEVERAL PROCESSES AT ONCE. Every tenant runner is its own process and
+        # they share this directory, so two tenants scanning the same symbol on
+        # the same interval used to race on one fixed `<file>.tmp`: on Windows
+        # that surfaces as a PermissionError on `replace`, or as one process
+        # truncating the partially-written file of the other. `os.replace` onto
+        # the final path stays atomic, so the loser of a race simply overwrites
+        # with equivalent data instead of corrupting it.
+        #
+        # This matches what `core.utils.yf_cache` already does for the same
+        # reason -- see its `cache_set`.
+        tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+        try:
+            if self.fmt == "parquet":
+                frame.to_parquet(tmp)
+            else:
+                frame.to_csv(tmp)
+            tmp.replace(path)
+        except BaseException:
+            # Never leave the scratch file behind: it is PID-scoped, so nothing
+            # else will ever reclaim it and it would accumulate silently.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return path
 
     def merge(self, venue: str, symbol: str, interval: str, fresh: pd.DataFrame) -> pd.DataFrame:

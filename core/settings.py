@@ -189,6 +189,18 @@ NEWS_LOOKBACK_HOURS = _int_env("NEWS_LOOKBACK_HOURS", 48)
 # 0 disables a sweep entirely.
 RUNTIME_CACHE_RETENTION_DAYS = _int_env("RUNTIME_CACHE_RETENTION_DAYS", 7)
 CHART_RETENTION_DAYS = _int_env("CHART_RETENTION_DAYS", 14)
+
+# The `data/` candle cache (core.backtesting.CandleCache) gets its OWN, longer
+# retention. It serves two very different readers: live tenant scans, which
+# touch a short recent window every cycle, and backtests, which build up long
+# histories that are slow and rate-limited to re-download. Pruning it on the
+# 7-day yfinance schedule would keep deleting backtest caches that cost minutes
+# to rebuild, so 30 days bounds the growth without fighting that use case.
+#
+# Actively-used symbols never age out regardless: `CandleCache.merge` rewrites
+# the file on every save, which refreshes its mtime.
+CANDLE_CACHE_RETENTION_DAYS = _int_env("CANDLE_CACHE_RETENTION_DAYS", 30)
+CANDLE_CACHE_DIR = os.path.join(REPO_ROOT, "data")
 # How often the supervisor runs the sweep. Daily is plenty for directories
 # that accumulate over weeks.
 MAINTENANCE_INTERVAL_MINUTES = _int_env("MAINTENANCE_INTERVAL_MINUTES", 1440)

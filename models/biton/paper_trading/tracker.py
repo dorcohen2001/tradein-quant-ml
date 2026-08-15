@@ -66,6 +66,25 @@ def _save(trades: list[dict]) -> None:
     save_trades(PAPER_TRADING_STORE, trades)
 
 
+def _journal_safe(trade: dict) -> bool:
+    """Journal a trade without ever letting it break the cycle.
+
+    `core.paper_trading.journal.upsert_row` is already non-raising, but the
+    per-model `upsert_trade_row` above it also builds the row values from the
+    trade dict -- so a schema surprise there could still raise. This is the
+    outer guard: the trade store and the Telegram alert are what matter, and
+    neither may be lost because a spreadsheet could not be written.
+    """
+    try:
+        journal.upsert_trade_row(trade)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[journal] could not journal {trade.get('ticker')} "
+              f"({trade.get('id')}): {type(exc).__name__}: {exc}. "
+              f"Trade store and alerts unaffected.", file=sys.stderr)
+        return False
+
+
 def log_trade(setup, telegram_message_id: int | None = None) -> dict:
     """Persist a new PENDING paper trade from a `TradeSetup` and return its record."""
     trades = _load()
@@ -84,7 +103,7 @@ def log_trade(setup, telegram_message_id: int | None = None) -> dict:
     trade_dict = asdict(record)
     trades.append(trade_dict)
     _save(trades)
-    journal.upsert_trade_row(trade_dict)
+    _journal_safe(trade_dict)
     return trade_dict
 
 
@@ -216,7 +235,7 @@ def catch_up_open_positions(now: dt.datetime | None = None) -> CatchUpReport:
         for event in report.events:
             record = by_id.get(event.trade_id)
             if record is not None:
-                journal.upsert_trade_row(record)
+                _journal_safe(record)
     return report
 
 
@@ -264,7 +283,7 @@ def update_open_positions() -> list[dict]:
 
     _save(trades)
     for trade in changed:
-        journal.upsert_trade_row(trade)
+        _journal_safe(trade)
     return changed
 
 

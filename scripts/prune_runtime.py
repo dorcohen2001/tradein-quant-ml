@@ -23,19 +23,34 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from core.maintenance import sweep_runtime  # noqa: E402
-from core.settings import CHART_RETENTION_DAYS, RUNTIME_CACHE_RETENTION_DAYS  # noqa: E402
+from core.settings import (  # noqa: E402
+    CANDLE_CACHE_DIR,
+    CANDLE_CACHE_RETENTION_DAYS,
+    CHART_RETENTION_DAYS,
+    RUNTIME_CACHE_RETENTION_DAYS,
+)
 
 
 def _dir_size(path: str) -> tuple[int, float]:
+    """(file count, MB) for a directory tree.
+
+    Recursive: the candle cache nests one directory per venue/symbol, so a
+    flat listing reported it as "0 files / 0.0 MB" while the sweep was really
+    walking a multi-megabyte tree. A status line that under-reports what is
+    about to be deleted is worse than no status line.
+    """
     if not os.path.isdir(path):
         return (0, 0.0)
     total = 0
     count = 0
-    for name in os.listdir(path):
-        full = os.path.join(path, name)
-        if os.path.isfile(full):
-            count += 1
-            total += os.path.getsize(full)
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            full = os.path.join(root, name)
+            try:
+                total += os.path.getsize(full)
+                count += 1
+            except OSError:
+                continue
     return (count, total / (1024 * 1024))
 
 
@@ -45,6 +60,8 @@ def main() -> int:
                     help="max age for runtime/cache/yfinance (default: %(default)s; 0 disables)")
     ap.add_argument("--chart-days", type=float, default=CHART_RETENTION_DAYS,
                     help="max age for runtime/charts (default: %(default)s; 0 disables)")
+    ap.add_argument("--candle-days", type=float, default=CANDLE_CACHE_RETENTION_DAYS,
+                    help="max age for the data/ candle cache (default: %(default)s; 0 disables)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be removed, delete nothing")
     args = ap.parse_args()
 
@@ -52,6 +69,7 @@ def main() -> int:
     targets = {
         "yfinance cache": os.path.join(runtime_dir, "cache", "yfinance"),
         "charts": os.path.join(runtime_dir, "charts"),
+        "candle cache": CANDLE_CACHE_DIR,
     }
 
     print("before:")
@@ -59,7 +77,8 @@ def main() -> int:
         count, mb = _dir_size(path)
         print(f"  {label:15} {count:5} files  {mb:8.1f} MB")
 
-    results = sweep_runtime(runtime_dir, args.cache_days, args.chart_days, dry_run=args.dry_run)
+    results = sweep_runtime(runtime_dir, args.cache_days, args.chart_days, dry_run=args.dry_run,
+                            candle_dir=CANDLE_CACHE_DIR, candle_days=args.candle_days)
 
     if not args.dry_run:
         print("after:")

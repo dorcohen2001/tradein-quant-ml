@@ -82,6 +82,8 @@ from core.maintenance import sweep_runtime  # noqa: E402
 from core.registry import ModelConfig, active_models, disabled_models, get_model  # noqa: E402
 from core.scheduling import PersistentIntervalGate  # noqa: E402
 from core.settings import (  # noqa: E402
+    CANDLE_CACHE_DIR,
+    CANDLE_CACHE_RETENTION_DAYS,
     CHART_RETENTION_DAYS,
     MAINTENANCE_INTERVAL_MINUTES,
     RUNTIME_CACHE_RETENTION_DAYS,
@@ -192,7 +194,9 @@ def _maintenance_loop() -> None:
         try:
             if gate.due():
                 _log("[maintenance] running retention sweep")
-                sweep_runtime(RUNTIME_DIR, RUNTIME_CACHE_RETENTION_DAYS, CHART_RETENTION_DAYS)
+                sweep_runtime(RUNTIME_DIR, RUNTIME_CACHE_RETENTION_DAYS, CHART_RETENTION_DAYS,
+                              candle_dir=CANDLE_CACHE_DIR,
+                              candle_days=CANDLE_CACHE_RETENTION_DAYS)
         except Exception as exc:  # noqa: BLE001
             _log(f"[maintenance] sweep failed (models unaffected): {exc}")
         _stop.wait(300)  # re-check every 5 min; the gate decides if it actually runs

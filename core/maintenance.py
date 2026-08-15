@@ -88,8 +88,15 @@ def prune_by_age(directory: str, max_age_days: float, suffix: str | None = None,
 
 
 def sweep_runtime(runtime_dir: str, cache_days: float, chart_days: float,
-                  dry_run: bool = False) -> dict[str, tuple[int, int]]:
-    """Run every retention sweep. Returns `{label: (removed, bytes)}`."""
+                  dry_run: bool = False, candle_dir: str | None = None,
+                  candle_days: float | None = None) -> dict[str, tuple[int, int]]:
+    """Run every retention sweep. Returns `{label: (removed, bytes)}`.
+
+    `candle_dir` is the `data/` tree written by `core.backtesting.CandleCache`.
+    It is passed in rather than derived because it sits OUTSIDE `runtime/` (it
+    is separately gitignored as re-downloadable derived data) and because the
+    backtest CLIs accept a `--data-dir` override.
+    """
     results = {
         "yfinance_cache": prune_by_age(
             os.path.join(runtime_dir, "cache", "yfinance"), cache_days, suffix=".pkl", dry_run=dry_run,
@@ -98,6 +105,24 @@ def sweep_runtime(runtime_dir: str, cache_days: float, chart_days: float,
             os.path.join(runtime_dir, "charts"), chart_days, suffix=".png", dry_run=dry_run,
         ),
     }
+
+    # Candle cache. Every tenant runner writes here on every cycle, across every
+    # timeframe it trades, and nothing pruned it before -- so it grew without
+    # bound in direct proportion to how many tenants are running.
+    #
+    # Nested one directory per venue/symbol, so `prune_by_age` (deliberately
+    # non-recursive) is applied per leaf rather than being made to recurse: a
+    # recursive delete pointed at the wrong root is far more destructive than
+    # this is verbose.
+    if candle_dir and os.path.isdir(candle_dir):
+        age = cache_days if candle_days is None else candle_days
+        removed = reclaimed = 0
+        for root, _dirs, _files in os.walk(candle_dir):
+            for suffix in (".parquet", ".csv"):
+                count, size = prune_by_age(root, age, suffix=suffix, dry_run=dry_run)
+                removed += count
+                reclaimed += size
+        results["candle_cache"] = (removed, reclaimed)
     for label, (count, size) in results.items():
         if count:
             verb = "would remove" if dry_run else "removed"

@@ -209,10 +209,38 @@ def test_first_party_routes_keep_their_forgiving_fallback():
     assert settings.get_telegram_route("livne").chat_id == "-100PRIMARY"
 
 
-def test_registered_clients_all_declare_a_dedicated_route():
+def test_every_tenant_has_its_own_route_name():
+    """Platform policy is a SHARED PRIMARY HUB: a tenant without its own
+    credentials routes to the main channel on purpose, and the `[Model Name]`
+    prefix on every alert is what keeps that readable.
+
+    So `dedicated_route` is OPT-IN, not mandatory. What must always hold is
+    that each tenant has a distinct route NAME -- that is what makes splitting
+    one out later a config change rather than a code change."""
+    names = [m.telegram_route for m in all_models()]
+    assert len(names) == len(set(names)), "two tenants share a route name"
     for m in client_models():
-        assert m.dedicated_route is True, f"{m.key} would leak into the default chat"
         assert m.telegram_route == m.key
+
+
+def test_dedicated_route_is_opt_in_not_the_default():
+    """Pins the routing policy itself. If this flips, tenants that were
+    expected on the hub would silently go quiet."""
+    fresh = ModelConfig(
+        key="client_hub", label="Hub tenant", cycle_interval_minutes=5,
+        closed_statuses=("WIN_TP1",), update_statuses=(), closed_with_pnl=("WIN_TP1",),
+    )
+    assert fresh.dedicated_route is False
+
+
+def test_dedicated_tenants_never_fall_back_to_the_hub():
+    """The opt-in guarantee: once a tenant IS dedicated, a missing credential
+    must silence it rather than divert it to the shared channel."""
+    settings, _ = reload_telegram(dict(DEFAULTS))
+    strict = settings.get_telegram_route("client_private", strict=True)
+    assert strict.chat_id == "" and strict.is_configured is False
+    # ...while a hub tenant resolves to the primary channel, as intended.
+    assert settings.get_telegram_route("client_hub").chat_id == "-100PRIMARY"
 
 
 # ==========================================================================

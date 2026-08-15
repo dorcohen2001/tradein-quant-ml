@@ -141,7 +141,10 @@ python scripts\create_client_model.py --key alpha --name "Alpha Capital" --inter
 ```
 
 Flags: `--key` `--name` `--interval` (minutes) `--timeframe` (`5m`/`15m`/`1h`/`4h`/`1d`)
-`--asset-class` (`crypto`/`stocks`/`both`) `--description` `--force` `--remove`.
+`--asset-class` (`crypto`/`stocks`/`both`) `--description` `--dedicated-route` `--force` `--remove`.
+
+> Routing defaults to the **shared primary hub**. Pass `--dedicated-route`
+> only when a tenant needs its own private channel.
 
 ```bash
 # Roll back a scaffold: deregisters it and deletes models/client_<key>/.
@@ -208,18 +211,18 @@ python scripts\backup_manager.py --mode runtime --retention 30
 ### Runtime artifact retention
 
 ```bash
-# Show what would be pruned from the yfinance cache and charts. Deletes nothing.
+# Show what would be pruned from the yfinance cache, charts and candle cache. Deletes nothing.
 python scripts\prune_runtime.py --dry-run
 ```
 
 ```bash
-# Prune for real (defaults: cache >7 days, charts >14 days).
+# Prune for real (defaults: yfinance cache >7d, charts >14d, data/ candles >30d).
 python scripts\prune_runtime.py
 ```
 
 ```bash
 # Custom ages; 0 disables that sweep.
-python scripts\prune_runtime.py --cache-days 3 --chart-days 7
+python scripts\prune_runtime.py --cache-days 3 --chart-days 7 --candle-days 14
 ```
 
 ### Restore
@@ -430,8 +433,9 @@ STRATEGY RULES
   expiry:       [12] hours before an unfilled signal goes stale
 
 TELEGRAM
-  [dedicated bot | reuse existing bot], destination is a [channel | group]
-  I will set TELEGRAM_ROUTE_CLIENT_[KEY]_TOKEN and _CHAT_ID in .env myself.
+  routing: [shared hub (default) | dedicated channel]
+  If dedicated, pass --dedicated-route and I will set
+  TELEGRAM_ROUTE_CLIENT_[KEY]_TOKEN and _CHAT_ID in .env myself.
 
 WHEN DONE:
 1. Run the scaffolder, then implement the rules above in models/client_[alpha]/strategy/.

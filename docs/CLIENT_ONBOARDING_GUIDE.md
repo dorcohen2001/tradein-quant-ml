@@ -79,13 +79,21 @@ replaced. Do not invent rules and present them as a strategy.
 
 | Question | Notes |
 |---|---|
-| Dedicated bot, or reuse an existing one? | A dedicated bot per client is cleaner and revocable. Reusing one bot across several groups is fine and common. |
+| Shared hub, or a dedicated channel? | **Default is the shared hub.** Choose dedicated only if this client's signals must be private from other tenants. |
+| If dedicated: dedicated bot, or reuse an existing one? | A dedicated bot per client is cleaner and revocable. Reusing one bot across several groups is fine and common. |
 | Channel or group? | Either works. A **channel** is broadcast-only; a **group** allows replies. |
 | Who administers it? | The bot must be an admin to post. |
 
-**Every client route is dedicated.** If its two environment variables are not
-set, that model sends **nothing** — it does not fall back to the main channel.
-State this explicitly to the user; silence is the designed failure mode.
+**Default is the SHARED PRIMARY HUB.** Unless the client asks for its own
+channel, its alerts go to the main `TELEGRAM_CHAT_ID` group alongside every
+other tenant, prefixed with `[Model Name]`. That is the intended platform
+behaviour, not a fallback — state it plainly so the client knows who can see
+their signals.
+
+Only pass `--dedicated-route` when the client's signals must NOT be visible to
+whoever reads the main channel. A dedicated tenant becomes strict: if its two
+environment variables are missing it sends **nothing** rather than falling back
+to the hub. Silence is the designed failure mode for that case.
 
 ---
 
@@ -174,6 +182,7 @@ python scripts/create_client_model.py --key alpha --name "Alpha Capital" --inter
 | `--timeframe` | Analysis bar size |
 | `--asset-class` | `crypto` / `stocks` / `both` |
 | `--description` | One line for the report roster |
+| `--dedicated-route` | Give this tenant its own channel instead of the shared hub |
 | `--force` | Overwrite an existing directory |
 | `--remove <key>` | Deregister and delete the scaffold (runtime state kept) |
 
@@ -181,7 +190,8 @@ This writes to **exactly two places**: the new `models/client_<key>/`
 directory, and one entry between the `CLIENT MODELS` markers at the end of
 `_MODELS` in `core/registry.py`. Nothing else is touched.
 
-The model is registered as `stage="incubating"` with `dedicated_route=True`.
+The model is registered as `stage="incubating"`. Routing follows the shared
+hub unless `--dedicated-route` was passed.
 
 ### What gets generated
 
@@ -290,7 +300,7 @@ history, set `stage="deprecated"`.
 | Guarantee | Mechanism |
 |---|---|
 | No path collisions | Every runtime path derives from the model key in `core/registry.py`. Enforced by `tests/test_client_isolation.py`. |
-| No signal leakage | `dedicated_route=True` disables the shared-chat fallback. An unconfigured client sends nothing. |
+| Predictable routing | Default is the shared hub (every alert name-prefixed). `--dedicated-route` opts into a private channel AND disables the fallback, so a misconfigured dedicated tenant sends nothing rather than leaking to the hub. |
 | No crash propagation | The supervisor runs each model as its own subprocess with its own timeout. |
 | No report contamination | `stage="incubating"` keeps a trial out of the executive report. |
 | No edits to live models | The generator writes only the new directory + one registry entry. |

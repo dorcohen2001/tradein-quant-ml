@@ -218,3 +218,138 @@ def test_cache_bucket_never_outlives_the_bar(interval, expected):
     """Biton previously cached a 1h frame for 30 minutes -- half the bar
     period -- so every second cycle re-used the previous cycle's bars."""
     assert bucket_seconds_for(interval) == expected
+
+
+# --------------------------------------------------------------------------
+# Journal resilience -- a locked spreadsheet must never cost an alert
+# --------------------------------------------------------------------------
+def test_journal_write_round_trips(tmp_path):
+    from core.paper_trading.journal import upsert_row
+    path = str(tmp_path / "j.xlsx")
+    cols = ["ID", "Ticker", "Status"]
+    assert upsert_row(path, cols, ["a1", "BTCUSDT", "ACTIVE"], "a1") is True
+    assert upsert_row(path, cols, ["a1", "BTCUSDT", "WIN_TP2"], "a1") is True  # upsert, not append
+
+    from openpyxl import load_workbook
+    rows = list(load_workbook(path).active.iter_rows(min_row=2, values_only=True))
+    assert len(rows) == 1 and rows[0][2] == "WIN_TP2"
+
+
+# Scoped and deliberate: openpyxl builds its OWN ZipFile to write with, and when
+# that write fails against a locked file the object is finalized later during GC,
+# where CPython reports the close error as unraisable. It is not our exception --
+# `upsert_row` catches and reports the real one, which is what this test asserts.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_locked_journal_returns_false_and_never_raises(tmp_path):
+    """THE regression guard. Before this, openpyxl's PermissionError propagated
+    out of update_open_positions AFTER the trade store was written but BEFORE
+    the caller sent its Telegram alerts -- so the transition persisted, the
+    alert was never sent, and the trade was no longer in `changed` next cycle.
+    The alert was lost permanently because a spreadsheet was open in Excel."""
+    import msvcrt
+
+    from core.paper_trading.journal import upsert_row
+    path = str(tmp_path / "j.xlsx")
+    cols = ["ID", "Ticker", "Status"]
+    upsert_row(path, cols, ["a1", "BTCUSDT", "ACTIVE"], "a1")
+
+    handle = open(path, "r+b")
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        pytest.skip("could not acquire an exclusive lock on this platform")
+    try:
+        assert upsert_row(path, cols, ["a2", "ETHUSDT", "LOSS_SL"], "a2") is False
+    finally:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        handle.close()
+
+
+def test_journal_failure_on_a_bad_path_is_non_fatal(tmp_path):
+    from core.paper_trading.journal import upsert_row
+    assert upsert_row(str(tmp_path / "\0bad" / "j.xlsx"), ["ID"], ["x"], "x") is False
+
+
+# --------------------------------------------------------------------------
+# CandleCache concurrency
+# --------------------------------------------------------------------------
+def test_candle_cache_temp_file_is_pid_scoped(tmp_path, monkeypatch):
+    """Every tenant runner is its own process sharing this directory. A fixed
+    `<file>.tmp` meant two tenants fetching the same symbol raced on one path:
+    a PermissionError on replace, or one truncating the other's partial write."""
+    import pandas as pd
+
+    from core.backtesting.cache import CandleCache
+
+    seen = []
+    real_to_csv = pd.DataFrame.to_csv
+
+    def spy(self, path_or_buf=None, *a, **k):
+        if isinstance(path_or_buf, (str, os.PathLike)):
+            seen.append(str(path_or_buf))
+        return real_to_csv(self, path_or_buf, *a, **k)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", spy)
+
+    cache = CandleCache(str(tmp_path), fmt="csv")
+    frame = pd.DataFrame(
+        {"Open": [1.0], "High": [2.0], "Low": [0.5], "Close": [1.5], "Volume": [10]},
+        index=pd.DatetimeIndex([dt.datetime(2026, 8, 15, 12, 0)]),
+    )
+    out = cache.save("binance", "BTCUSDT", "15m", frame)
+
+    assert seen, "expected a temp write"
+    assert str(os.getpid()) in seen[0], f"temp name is not PID-scoped: {seen[0]}"
+    assert out.exists()
+    assert not list(tmp_path.rglob("*.tmp")), "a scratch file was left behind"
+
+
+def test_candle_cache_save_is_readable_back(tmp_path):
+    import pandas as pd
+
+    from core.backtesting.cache import CandleCache
+    cache = CandleCache(str(tmp_path), fmt="csv")
+    frame = pd.DataFrame(
+        {"Open": [1.0], "High": [2.0], "Low": [0.5], "Close": [1.5], "Volume": [10]},
+        index=pd.DatetimeIndex([dt.datetime(2026, 8, 15, 12, 0)]),
+    )
+    cache.save("binance", "BTCUSDT", "15m", frame)
+    assert len(cache.load("binance", "BTCUSDT", "15m")) == 1
+
+
+# --------------------------------------------------------------------------
+# Candle cache retention
+# --------------------------------------------------------------------------
+def test_sweep_prunes_the_candle_cache_by_its_own_age(tmp_path):
+    """`data/` grew unbounded before -- it is written by every tenant on every
+    cycle and no sweep covered it. It gets a LONGER retention than the yfinance
+    cache because backtest histories are slow and rate-limited to rebuild."""
+    runtime = tmp_path / "runtime"
+    (runtime / "cache" / "yfinance").mkdir(parents=True)
+    (runtime / "charts").mkdir()
+    candles = tmp_path / "data" / "binance" / "BTCUSDT"
+    candles.mkdir(parents=True)
+
+    _aged(candles / "15m.parquet", 45)   # older than the 30-day candle window
+    _aged(candles / "1h.parquet", 10)    # inside it
+    _aged(runtime / "cache" / "yfinance" / "x.pkl", 10)  # older than the 7-day window
+
+    results = sweep_runtime(str(runtime), cache_days=7, chart_days=14,
+                            candle_dir=str(tmp_path / "data"), candle_days=30)
+
+    assert results["candle_cache"][0] == 1
+    assert not (candles / "15m.parquet").exists()
+    assert (candles / "1h.parquet").exists()
+    assert results["yfinance_cache"][0] == 1
+
+
+def test_sweep_without_a_candle_dir_is_unchanged(tmp_path):
+    """Back-compat: existing callers that pass no candle dir must behave
+    exactly as before, with no candle_cache key in the result."""
+    runtime = tmp_path / "runtime"
+    (runtime / "charts").mkdir(parents=True)
+    results = sweep_runtime(str(runtime), cache_days=7, chart_days=14)
+    assert "candle_cache" not in results
