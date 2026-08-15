@@ -122,17 +122,26 @@ def _post(url: str, *, data: dict, files: dict | None = None, timeout: int) -> d
     and never raises -- callers are alerting paths that must degrade, not
     crash, and several of them fall back to a plain-text send on failure.
 
-    `files` is re-opened by the caller for each attempt via a factory, because
-    a file object consumed by a failed upload cannot be replayed.
+    Encoding matches what each endpoint was always sent: `sendMessage` as a
+    JSON body, `sendPhoto` as multipart form data (it has to be -- there is a
+    file part). This is not cosmetic. Form-encoding a JSON payload stringifies
+    the booleans, so `disable_web_page_preview: True` would go out as the
+    string "True", and `reply_to_message_id` as "7" rather than 7.
+
+    `files` is a FACTORY, not an open handle: a file object consumed by a
+    failed upload cannot be replayed on the next attempt.
     """
     last_detail = "no attempt made"
 
     for attempt in range(TELEGRAM_MAX_ATTEMPTS):
         response = None
         try:
-            response = requests.post(
-                url, data=data, files=files() if callable(files) else files, timeout=timeout,
-            )
+            if files is None:
+                response = requests.post(url, json=data, timeout=timeout)
+            else:
+                response = requests.post(
+                    url, data=data, files=files() if callable(files) else files, timeout=timeout,
+                )
             if response.status_code not in _RETRYABLE_STATUS:
                 response.raise_for_status()
                 body = response.json()

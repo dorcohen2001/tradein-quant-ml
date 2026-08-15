@@ -1,0 +1,220 @@
+"""Persistent interval gates, retention sweeps, chart specs, and store I/O."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import time
+
+import pytest
+
+from core.charting.spec import ChartSpec
+from core.data.cache_policy import bucket_seconds_for
+from core.maintenance import prune_by_age, sweep_runtime
+from core.paper_trading.store import load_trades, pnl_pct, save_trades
+from core.scheduling import IntervalGate, PersistentIntervalGate
+
+
+# --------------------------------------------------------------------------
+# Interval gates
+# --------------------------------------------------------------------------
+def test_in_memory_gate_fires_immediately_then_throttles():
+    gate = IntervalGate(15)
+    start = dt.datetime(2026, 8, 15, 12, 0)
+    assert gate.due(start) is True
+    assert gate.due(start + dt.timedelta(minutes=14)) is False
+    assert gate.due(start + dt.timedelta(minutes=15)) is True
+
+
+def test_persistent_gate_survives_process_restarts(tmp_path):
+    """The reason this class exists: under `--once` scheduling the runner is a
+    fresh process every tick, so an in-memory marker would reset each time and
+    the gate would degrade to 'fire every cycle'. A NEW gate object each call
+    stands in for a new process."""
+    path = str(tmp_path / "gates.json")
+    start = dt.datetime(2026, 8, 15, 12, 0)
+
+    def tick(minutes):
+        return PersistentIntervalGate(15, state_path=path, name="funnel").due(
+            start + dt.timedelta(minutes=minutes))
+
+    fired = [m for m in range(0, 18, 2) if tick(m)]
+    assert fired == [0, 16]  # exactly twice across a 2-minute cadence
+
+
+def test_persistent_gates_are_namespaced_within_one_file(tmp_path):
+    path = str(tmp_path / "gates.json")
+    now = dt.datetime(2026, 8, 15, 12, 0)
+    assert PersistentIntervalGate(15, path, "a").due(now) is True
+    assert PersistentIntervalGate(15, path, "b").due(now) is True   # independent
+    assert PersistentIntervalGate(15, path, "a").due(now) is False
+    assert set(json.loads(open(path).read())) == {"a", "b"}
+
+
+def test_corrupt_gate_state_opens_rather_than_jamming_shut(tmp_path):
+    """A throttle stuck open is a nuisance; stuck shut silently disables the
+    work it guards, which is far harder to notice."""
+    path = tmp_path / "gates.json"
+    path.write_text("{ not json", encoding="utf-8")
+    assert PersistentIntervalGate(15, str(path), "f").due() is True
+
+
+def test_unwritable_gate_state_still_fires(tmp_path, monkeypatch):
+    """Simulated by making the write raise, rather than by naming a bogus path:
+    on Windows a path like "/nonexistent-drive/x" is simply resolved against
+    the current drive and cheerfully CREATED, so that version of this test both
+    passed for the wrong reason and littered the filesystem."""
+    gate = PersistentIntervalGate(15, state_path=str(tmp_path / "g.json"), name="f")
+    monkeypatch.setattr(
+        gate, "_write_state",
+        lambda state: (_ for _ in ()).throw(OSError("read-only filesystem")),
+    )
+    assert gate.due() is True
+
+
+def test_gate_state_write_is_atomic(tmp_path):
+    path = str(tmp_path / "gates.json")
+    PersistentIntervalGate(15, path, "f").due()
+    assert [p.name for p in tmp_path.iterdir()] == ["gates.json"]
+
+
+# --------------------------------------------------------------------------
+# Retention
+# --------------------------------------------------------------------------
+def _aged(path, days):
+    path.write_bytes(b"x" * 100)
+    old = time.time() - days * 86400
+    os.utime(path, (old, old))
+
+
+def test_prune_removes_only_files_past_the_age(tmp_path):
+    _aged(tmp_path / "old.pkl", 30)
+    _aged(tmp_path / "new.pkl", 1)
+    removed, reclaimed = prune_by_age(str(tmp_path), max_age_days=7, suffix=".pkl")
+    assert removed == 1 and reclaimed == 100
+    assert {p.name for p in tmp_path.iterdir()} == {"new.pkl"}
+
+
+def test_prune_respects_the_suffix_filter(tmp_path):
+    _aged(tmp_path / "old.pkl", 30)
+    _aged(tmp_path / "keep.json", 30)
+    prune_by_age(str(tmp_path), max_age_days=7, suffix=".pkl")
+    assert {p.name for p in tmp_path.iterdir()} == {"keep.json"}
+
+
+def test_zero_retention_disables_the_sweep(tmp_path):
+    """A misread config must never mean 'delete everything'."""
+    _aged(tmp_path / "ancient.pkl", 9999)
+    assert prune_by_age(str(tmp_path), max_age_days=0, suffix=".pkl") == (0, 0)
+    assert (tmp_path / "ancient.pkl").exists()
+
+
+def test_dry_run_reports_without_deleting(tmp_path):
+    _aged(tmp_path / "old.pkl", 30)
+    removed, _ = prune_by_age(str(tmp_path), max_age_days=7, suffix=".pkl", dry_run=True)
+    assert removed == 1
+    assert (tmp_path / "old.pkl").exists()
+
+
+def test_prune_tolerates_a_missing_directory():
+    assert prune_by_age("/no/such/dir", max_age_days=7) == (0, 0)
+
+
+def test_sweep_targets_only_cache_and_charts(tmp_path):
+    (tmp_path / "cache" / "yfinance").mkdir(parents=True)
+    (tmp_path / "charts").mkdir()
+    (tmp_path / "stores").mkdir()
+    _aged(tmp_path / "cache" / "yfinance" / "a.pkl", 30)
+    _aged(tmp_path / "charts" / "b.png", 30)
+    _aged(tmp_path / "stores" / "trades_livne.json", 9999)  # must NEVER be touched
+
+    results = sweep_runtime(str(tmp_path), cache_days=7, chart_days=14)
+    assert results["yfinance_cache"][0] == 1
+    assert results["charts"][0] == 1
+    assert (tmp_path / "stores" / "trades_livne.json").exists()
+
+
+# --------------------------------------------------------------------------
+# Store
+# --------------------------------------------------------------------------
+def test_store_round_trip(tmp_path):
+    path = str(tmp_path / "trades.json")
+    trades = [{"id": "a", "current_status": "ACTIVE"}]
+    save_trades(path, trades)
+    assert load_trades(path) == trades
+
+
+def test_missing_store_is_an_empty_sample(tmp_path):
+    assert load_trades(str(tmp_path / "none.json")) == []
+
+
+def test_corrupt_store_raises_instead_of_returning_empty(tmp_path):
+    """Returning [] would let the next save overwrite the file and erase all
+    history. This is the single most important line in the store module."""
+    path = tmp_path / "trades.json"
+    path.write_text("{ truncated", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        load_trades(str(path))
+
+
+def test_migration_hook_is_applied_per_record(tmp_path):
+    path = str(tmp_path / "trades.json")
+    save_trades(path, [{"id": "a"}, {"id": "b"}])
+    out = load_trades(path, migrate=lambda t: {**t, "migrated": True})
+    assert all(t["migrated"] for t in out)
+
+
+def test_save_leaves_no_temp_files(tmp_path):
+    path = str(tmp_path / "trades.json")
+    save_trades(path, [{"id": "a"}])
+    save_trades(path, [{"id": "b"}])
+    assert [p.name for p in tmp_path.iterdir()] == ["trades.json"]
+
+
+# --------------------------------------------------------------------------
+# Chart spec
+# --------------------------------------------------------------------------
+def test_daily_spec_reproduces_the_original_hardcoded_chart():
+    spec = ChartSpec.daily()
+    assert (spec.interval, spec.tf_label, spec.stock_period, spec.crypto_limit) == \
+           ("1d", "1D", "2y", 600)
+    assert spec.emas == (50, 200) and spec.show_rsi and spec.show_macd
+    assert spec.warnings() == []
+
+
+def test_intraday_spec_stays_inside_the_yfinance_cap():
+    """Asking yfinance for 2y of 15m returns an EMPTY frame, which would
+    degrade silently to text-only alerts."""
+    spec = ChartSpec.intraday_15m()
+    assert spec.interval == "15m"
+    assert spec.warnings() == []
+
+
+def test_spec_warns_when_history_exceeds_the_intraday_cap():
+    spec = ChartSpec(interval="15m", tf_label="15M", stock_period="2y")
+    issues = spec.warnings()
+    assert issues and "cap" in issues[0]
+
+
+def test_spec_warns_on_insufficient_ema_warmup():
+    spec = ChartSpec(interval="1d", crypto_limit=50, emas=(200,))
+    assert any("warm-up" in w for w in spec.warnings())
+
+
+def test_spec_is_frozen():
+    with pytest.raises(Exception):
+        ChartSpec.daily().interval = "5m"
+
+
+# --------------------------------------------------------------------------
+# Cache policy
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("interval,expected", [
+    ("5m", 60), ("15m", 60), ("30m", 60),
+    ("1h", 300), ("4h", 300),
+    ("1d", 1800), ("1w", 1800),
+])
+def test_cache_bucket_never_outlives_the_bar(interval, expected):
+    """Biton previously cached a 1h frame for 30 minutes -- half the bar
+    period -- so every second cycle re-used the previous cycle's bars."""
+    assert bucket_seconds_for(interval) == expected

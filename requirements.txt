@@ -1,35 +1,59 @@
 # Consolidated dependencies for the whole repository: both model pipelines
 # (models/livne, models/biton), the shared core/ package, the Steve analyzer
-# (agents/steve), and the mail sender (mail/). Previously duplicated across
-# four separate requirements.txt files that had already drifted apart (numpy
-# >=1.24 vs >=1.26); the stricter pin wins wherever they disagreed.
+# (agents/steve), the supervisor, and the mail sender (mail/).
 #
 #     pip install -r requirements.txt
+#
+# PINNING POLICY
+# --------------
+# Everything that can change a NUMBER is pinned to a compatible-release range
+# (`~=`), which allows patch updates but not a minor bump. This repo computes
+# trading signals and has no upstream test coverage of its own beyond tests/,
+# so a silent change in resampling, indicator arithmetic or column shape from
+# a routine `pip install -U` is the exact failure mode worth spending
+# strictness on -- it would not raise, it would just quietly produce different
+# trades.
+#
+# The versions below are the set this repository is known to run on, captured
+# from the working environment. To move deliberately: bump the pin, run
+# `pytest tests/`, then run a backtest over a known window and compare the
+# trade log before committing.
 
 # --- Market data / analysis ---------------------------------------------
-yfinance>=0.2.40
-pandas>=2.0
-pandas_market_calendars>=4.0     # NYSE session calendar (core/utils/market_hours.py)
-numpy>=1.26
-requests>=2.31
+# pandas is the highest-risk pin of the lot: resampling, rolling windows and
+# OHLCV column handling underpin every indicator, the point-in-time resampler
+# and the intrabar simulator.
+pandas~=3.0.3
+numpy~=2.4.5
+# yfinance changes its scraping/auth internals frequently and without notice;
+# a minor bump has broken `history()` shapes before.
+yfinance~=1.5.1
+pandas_market_calendars~=5.4.0   # NYSE session calendar (core/utils/market_hours.py)
+requests~=2.32.5
 
 # --- News / sentiment ----------------------------------------------------
-feedparser>=6.0
-vaderSentiment>=3.3.2
+feedparser~=6.0.12
+vaderSentiment~=3.3.2
 
 # --- Config / secrets ----------------------------------------------------
-python-dotenv>=1.0
+python-dotenv~=1.2.2
 
 # --- Excel journals + funnel diagnostics ---------------------------------
-openpyxl>=3.1
+openpyxl~=3.1.5
 
 # --- Backtest candle cache (core/backtesting) ----------------------------
 # Optional but strongly recommended: with a Parquet engine installed the
 # intraday candle cache stores Parquet instead of CSV, which is several times
 # smaller and much faster to load for the 100k+ row frames a long intraday
 # backtest needs. Without it everything still works, just on CSV.
-pyarrow>=14.0
+pyarrow~=25.0.0
 
 # --- Chart rendering (core/charting) -------------------------------------
-plotly>=5.18,<6
+# kaleido is pinned EXACTLY, not by range: 0.2.1 is the last release with the
+# bundled-binary behaviour this renderer relies on, and 0.4+ reworked the
+# export path entirely.
+plotly~=5.24.1
 kaleido==0.2.1
+
+# --- Tests ---------------------------------------------------------------
+pytest~=9.1.1

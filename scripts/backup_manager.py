@@ -191,7 +191,16 @@ def create_backup(mode: str, include_secrets: bool = True, retention: int = 10) 
     if not files:
         raise RuntimeError(f"mode={mode} matched no files -- refusing to write an empty archive")
 
+    # Timestamps are second-resolution, so two runs inside the same second
+    # would resolve to the same filename and the second would silently
+    # overwrite the first -- losing a snapshot the caller believes they took.
     archive_path = os.path.join(out_dir, f"{MODE_PREFIXES[mode]}{_timestamp()}.zip")
+    if os.path.exists(archive_path):
+        stem = archive_path[:-4]
+        counter = 2
+        while os.path.exists(f"{stem}_{counter}.zip"):
+            counter += 1
+        archive_path = f"{stem}_{counter}.zip"
     rel_files = [_rel(p) for p in files]
     secrets_included = [r for r in rel_files if _is_secret(r)]
 
@@ -301,9 +310,14 @@ def verify_snapshot(path: str) -> bool:
                 _log(f"[verify] FAIL: manifest says {expected} files, archive holds {actual}")
                 return False
 
+            # `or "?"` rather than a .get default: the key EXISTS with a None
+            # value whenever git was unavailable at archive time (no git on
+            # PATH, or the tree is not a repo), and None[:8] is a TypeError --
+            # which would crash verification of a perfectly good archive.
+            git = manifest.get("git") or {}
             _log(f"[verify] mode={manifest.get('mode')} created={manifest.get('created_at')} "
-                 f"commit={(manifest.get('git') or {}).get('commit', '?')[:8]} "
-                 f"dirty={(manifest.get('git') or {}).get('dirty')}")
+                 f"commit={(git.get('commit') or '?')[:8]} "
+                 f"dirty={git.get('dirty')}")
 
             for rel_path in manifest.get("json_state_files", []):
                 if rel_path not in names:
