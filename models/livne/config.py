@@ -471,21 +471,17 @@ TELEGRAM_ROUTE = _MODEL.telegram_route
 CHART_OUTPUT_DIR = os.environ.get("CHART_OUTPUT_DIR", os.path.join(RUNTIME_DIR, "charts"))
 
 # ---------------------------------------------------------------------------
-# Dual-model identity (see live_runner.py) -- this codebase is the "Livne"
-# model (current/refactored pipeline), run alongside the "Biton" model (the
-# frozen legacy pipeline in ../biton) as two fully isolated processes.
+# Model identity. Which OTHER models exist, and how they are scheduled, is not
+# this file's business any more -- see core/registry.py and run_supervisor.py.
 # ---------------------------------------------------------------------------
 MODEL_NAME = _MODEL.label
 
-# Livne's runner drives Biton each cycle as a subprocess. BITON_PHASE_TIMEOUT
-# bounds that call: without it a hung child blocks Livne's own position
-# management indefinitely (a hang is not an exception, so no try/except can
-# catch it). Sized generously -- a full scan+funnel pass over both watchlists
-# is minutes, not seconds -- while still fitting inside one 15-minute cycle
-# alongside Livne's own work.
-BITON_MODEL_DIR = os.path.normpath(os.path.join(MODEL_DIR, "..", "biton"))
-BITON_LIVE_RUNNER = os.path.join(BITON_MODEL_DIR, "live_runner.py")
-BITON_PHASE_TIMEOUT_SECONDS = 480  # 8 minutes per phase
+# This model no longer knows that any OTHER model exists. `BITON_MODEL_DIR`,
+# `BITON_LIVE_RUNNER` and `BITON_PHASE_TIMEOUT_SECONDS` lived here because
+# Livne's runner launched Biton as a subprocess every cycle -- which made Livne
+# Biton's scheduler and single point of failure. Scheduling moved to
+# run_supervisor.py, and the per-model timeout is now `phase_timeout_seconds`
+# on each `core.registry` entry.
 
 # ---------------------------------------------------------------------------
 # Paper trading -- Livne's own isolated store/journal. Biton's equivalents sit
@@ -498,17 +494,14 @@ PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 # ---------------------------------------------------------------------------
 # Live runner -- INTRADAY cadence
 #
-# Livne now cycles every 2 minutes: a trade meant to live 20 minutes cannot be
+# Livne cycles every 2 minutes: a trade meant to live 20 minutes cannot be
 # managed on a 15-minute poll, which gave it roughly one stop/target check for
-# its entire lifetime.
+# its entire lifetime. The cadence itself is declared on this model's
+# `core.registry` entry, which is also what the supervisor schedules from --
+# so a change here can no longer alter any other model's run rate as a side
+# effect (it previously could: Biton's interval was a constant in this file).
 #
-# Two things are deliberately NOT sped up with it:
-#
-#   BITON_CYCLE_INTERVAL_MINUTES -- Biton is a separate, frozen production
-#   model and must keep its existing 15-minute rhythm. Livne's runner invokes
-#   it on this independent schedule instead of once per Livne cycle, which
-#   would otherwise have multiplied Biton's run rate (and its API load) ~7x
-#   purely as a side effect of a Livne-only change.
+# One thing is deliberately NOT sped up with it:
 #
 #   FUNNEL_EXPORT_INTERVAL_MINUTES -- the funnel tracer re-runs the entire
 #   gate chain for every watchlist ticker. At a 2-minute cadence that is ~30
@@ -516,8 +509,12 @@ PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 #   hours and roughly double scan cost for a purely diagnostic artifact.
 # ---------------------------------------------------------------------------
 CYCLE_INTERVAL_MINUTES = _MODEL.cycle_interval_minutes
-BITON_CYCLE_INTERVAL_MINUTES = 15
 FUNNEL_EXPORT_INTERVAL_MINUTES = 15
+
+# Where file-persisted interval gates keep their last-fire markers (see
+# core.scheduling). Needed because the supervisor launches this runner as a
+# fresh `--once` process per tick, so an in-memory gate would reset every time.
+GATE_STATE_STORE = os.path.join(RUNTIME_DIR, "state", f"gates_{MODEL_KEY}.json")
 
 # Intraday signals go stale fast. A setup that has not been entered within a
 # few hours no longer reflects the structure that produced it.

@@ -9,7 +9,7 @@ bot before. Only a literal backtick needs neutralising there, which
 still goes through `escape_markdown`.
 
 State is FILE-persisted, not an in-process variable, because Biton's runner is
-launched with `--once` by Livne every cycle: the process exits each time, so an
+launched with `--once` by the supervisor every cycle: the process exits each time, so an
 in-memory `last_daily_report_date` would reset constantly and re-send the
 report on every invocation.
 """

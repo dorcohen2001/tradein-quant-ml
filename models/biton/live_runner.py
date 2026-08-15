@@ -239,13 +239,13 @@ def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
     """Emit the daily (and, on Friday, weekly) summary if they are due.
 
     Deliberately called from `run_cycle`, not from the main loop: this runner
-    is normally launched by Livne with `--once`, so the loop never executes and
+    is normally launched by the supervisor with `--once`, so the loop never executes and
     a loop-level check would mean Biton never reported at all. For the same
     reason the send-once marker is file-persisted -- the process exits every
     cycle, so an in-memory variable would reset and re-send each time.
 
     Biton keeps its OWN state file, so its reports are fully independent of
-    Livne's; neither model can suppress the other's summary.
+    every other model's; no model can suppress another's summary.
 
     Wrapped so a reporting failure can never interrupt scanning or position
     management."""
@@ -287,17 +287,17 @@ def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
 def run_cycle(args) -> None:
     """Execute a single scan + position-refresh cycle. `--skip-scan` runs
     positions only; `--skip-positions` runs the scan only -- used by the
-    Livne (current) codebase to interleave Biton's position-management and
-    market-screen phases with its own, matching live_runner.py's own cycle
-    ordering (see TRADEIN/live_runner.py)."""
+    supervisor (or an operator) to run just one half of a cycle. Livne's
+    runner used to drive these two phases itself; scheduling now lives in
+    run_supervisor.py and no model invokes another."""
     if not args.skip_positions:
         print("[paper] Refreshing open paper trade positions...", file=sys.stderr)
         process_open_positions()
 
     # After position management, so a close that just happened this cycle is
     # already reflected in the summary. Outside the skip_positions guard: the
-    # summary must still go out on the scan-phase invocation, because Livne
-    # splits Biton's cycle into a positions phase and a scan phase.
+    # summary must still go out on a scan-only invocation, since a caller may
+    # split the cycle into a positions phase and a scan phase.
     send_scheduled_summaries()
 
     if args.skip_scan:
@@ -326,7 +326,7 @@ def main():
                          help="Skip the new-signal scan and only refresh existing open paper trades")
     parser.add_argument("--skip-positions", action="store_true",
                          help="Skip the open-position refresh and only run the new-signal scan "
-                              "(used by the Livne runner to interleave both models' cycle phases)")
+                              "(run only the scan half of a cycle)")
     parser.add_argument("--once", action="store_true",
                          help="Run a single cycle and exit instead of looping forever")
     args = parser.parse_args()

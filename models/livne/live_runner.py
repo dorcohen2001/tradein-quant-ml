@@ -11,24 +11,20 @@ Ties together the screener, TA/macro/news engines, and trade generator to:
      `funnel_logs/` -- a read-only diagnostic, independent of steps 1-4, that
      can never affect scanning/alerting/paper-trading even if it fails.
 
-Dual-model execution: this codebase is the "Livne" model (current/refactored
-pipeline, MODEL_NAME in config.py). Each cycle also drives the "Biton" model
--- the frozen legacy pipeline in the sibling ../biton codebase -- as two
-fully isolated `python models/biton/live_runner.py` subprocesses (one for
-position management, one for the market scan), so the two pipelines never
-share a Python process, import namespace, or global state. Both models write
-their runtime artifacts into the shared ../../runtime/ tree, namespaced per
-model and never colliding:
+This runner drives THIS MODEL ONLY. It used to also launch the Biton model as
+two subprocesses every cycle, which made Livne Biton's de-facto scheduler:
+Livne dying stopped Biton entirely, Livne's `--asset-class`/`--top-n` silently
+governed Biton's scan scope, and Biton's cadence was a gate inside Livne's
+loop. That orchestration now lives in `run_supervisor.py` at the repository
+root, which runs every registered model independently, in parallel, each on
+its own interval and with its own timeout.
+
+Models remain fully isolated: separate OS processes, separate import
+namespaces, and per-model runtime artifacts that never collide:
 
     runtime/stores/trades_livne.json      runtime/stores/trades_biton.json
     runtime/journals/trade_journal_livne.xlsx   ..._biton.xlsx
     runtime/funnel_logs/live_funnel_livne_*.xlsx   ..._biton_*.xlsx
-
-The only coupling between the two models is this subprocess call plus those
-sibling output paths -- neither imports the other. A failure in the Biton
-subprocess (missing folder, crashed cycle, a hang) is caught, bounded by
-BITON_PHASE_TIMEOUT_SECONDS, and logged; it can never block or affect
-Livne's own cycle.
 
 Usage:
     python live_runner.py --asset-class both --top-n 2
@@ -43,8 +39,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import os
-import subprocess
 import sys
 import time
 import traceback
@@ -56,14 +50,11 @@ if hasattr(sys.stdout, "reconfigure"):
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
 from config import (
-    BITON_CYCLE_INTERVAL_MINUTES,
-    BITON_LIVE_RUNNER,
-    BITON_MODEL_DIR,
-    BITON_PHASE_TIMEOUT_SECONDS,
     CHART_OUTPUT_DIR,
     CYCLE_INTERVAL_MINUTES,
     DAILY_REPORT_HOUR,
     FUNNEL_EXPORT_INTERVAL_MINUTES,
+    GATE_STATE_STORE,
     MODEL_NAME,
     REPORT_CLOSED_STATUSES,
     REPORT_STATE_STORE,
@@ -82,6 +73,7 @@ from core.reporting.summary import (
     weekly_report_due,
 )
 from core.news.news_analyzer import analyze_sentiment
+from core.scheduling import PersistentIntervalGate
 from core.utils.chart_attachment import generate_chart_for_setup
 from core.utils.market_hours import is_market_open
 from core.utils.telegram_notifier import escape_markdown, escape_markdown_code, send_telegram_message, send_telegram_photo
@@ -91,43 +83,6 @@ from paper_trading.tracker import get_all_trades, has_open_trade, log_trade, upd
 from screener.funnel_diagnostics import export_funnel_report, run_diagnostics
 from screener.market_screener import scan_crypto, scan_stocks
 from utils.data_fetch import get_binance_klines, get_stock_history
-
-
-def _run_biton_phase(phase: str, asset_class: str, top_n: int, candidate_pool: int) -> None:
-    """Invoke the Biton (legacy) model's own live_runner.py as a completely
-    separate OS process -- `phase` is "positions" or "scan", matching that
-    script's own `--skip-scan`/`--skip-positions` flags, so the two models'
-    position-management and market-screen phases interleave in the same
-    order every cycle. Never raises: a Biton failure is logged and skipped,
-    it can never block or affect Livne's own cycle below.
-
-    The `timeout` is not optional defensive padding -- it is the only thing
-    that bounds this call. `subprocess.run` without one blocks forever, and a
-    hung child (a Binance/Yahoo socket that never returns, most likely) is
-    NOT an exception, so the surrounding `except` cannot rescue it. Livne
-    would stop managing its own open positions and stop emitting exit alerts
-    for as long as the child stayed stuck -- with real positions open. On a
-    timeout the child is killed and the cycle continues; Biton simply misses
-    that phase and picks it up next cycle."""
-    if not os.path.isfile(BITON_LIVE_RUNNER):
-        print(f"[biton] {BITON_LIVE_RUNNER} not found -- skipping Biton {phase} phase.", file=sys.stderr)
-        return
-
-    cmd = [sys.executable, BITON_LIVE_RUNNER, "--asset-class", asset_class, "--once",
-           "--top-n", str(top_n), "--candidate-pool", str(candidate_pool)]
-    cmd.append("--skip-scan" if phase == "positions" else "--skip-positions")
-
-    print(f"[biton] Running Biton (legacy) {phase} phase...", file=sys.stderr)
-    try:
-        result = subprocess.run(cmd, cwd=BITON_MODEL_DIR, timeout=BITON_PHASE_TIMEOUT_SECONDS)
-        if result.returncode != 0:
-            print(f"[biton] {phase} phase exited with code {result.returncode} (Livne unaffected).", file=sys.stderr)
-    except subprocess.TimeoutExpired:
-        # The child is already killed by subprocess.run before this is raised.
-        print(f"[biton] {phase} phase exceeded {BITON_PHASE_TIMEOUT_SECONDS}s and was terminated "
-              f"(Livne unaffected; Biton retries next cycle).", file=sys.stderr)
-    except Exception as exc:
-        print(f"[biton] {phase} phase failed to launch (Livne unaffected): {exc}", file=sys.stderr)
 
 
 def _timestamp() -> str:
@@ -312,40 +267,20 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
     return reports
 
 
-class _IntervalGate:
-    """Fires at most once per `minutes`, independent of the caller's cadence.
-
-    Livne now cycles every 2 minutes (intraday), but two things must NOT
-    inherit that rate:
-
-      Biton -- a separate, frozen production model. It is invoked on its own
-      15-minute schedule so a Livne-only timeframe change does not silently
-      multiply Biton's run rate and API load by ~7x. Its behaviour is
-      unchanged from before the intraday switch.
-
-      The funnel export -- a diagnostic that re-runs the whole gate chain for
-      every watchlist ticker. Per-cycle at 2 minutes it would emit ~30
-      reports/hour, churn through the 50-file retention in under two hours,
-      and roughly double scan cost for something no trade depends on.
-
-    First call always fires, so a freshly started runner does both immediately
-    rather than waiting out a full interval.
-    """
-
-    def __init__(self, minutes: float) -> None:
-        self.interval = dt.timedelta(minutes=minutes)
-        self.last: dt.datetime | None = None
-
-    def due(self) -> bool:
-        now = dt.datetime.now()
-        if self.last is None or (now - self.last) >= self.interval:
-            self.last = now
-            return True
-        return False
-
-
-_biton_gate = _IntervalGate(BITON_CYCLE_INTERVAL_MINUTES)
-_funnel_gate = _IntervalGate(FUNNEL_EXPORT_INTERVAL_MINUTES)
+# The funnel export must NOT inherit Livne's 2-minute cadence: it re-runs the
+# whole gate chain for every watchlist ticker, so per-cycle it would emit ~30
+# reports/hour, churn through the 50-file retention in under two hours, and
+# roughly double scan cost for something no trade depends on.
+#
+# The gate is FILE-PERSISTED rather than in-memory. Under the supervisor this
+# runner is launched as a fresh `--once` process per tick, so an in-memory
+# marker would reset every invocation and the gate would degrade to "fire every
+# cycle" -- reintroducing exactly the cost it exists to prevent. The old
+# in-memory `_IntervalGate` (and the Biton scheduling gate beside it) moved to
+# `core.scheduling`; Biton is now scheduled by run_supervisor.py, not from here.
+_funnel_gate = PersistentIntervalGate(
+    FUNNEL_EXPORT_INTERVAL_MINUTES, state_path=GATE_STATE_STORE, name="funnel_export",
+)
 
 
 def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
@@ -400,16 +335,11 @@ def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
 
 
 def run_cycle(args) -> None:
-    """Execute a single scan + position-refresh cycle.
+    """Execute a single scan + position-refresh cycle for THIS model.
 
-    Livne's own position management and scan run every cycle (every
-    CYCLE_INTERVAL_MINUTES, now 2 min). Biton is interleaved in the same
-    order as before -- positions then scan, Biton before Livne -- but only on
-    the cycles where its own 15-minute gate is due."""
-    biton_due = _biton_gate.due()
-
-    if biton_due:
-        _run_biton_phase("positions", args.asset_class, args.top_n, args.candidate_pool)
+    Position management first, then the scan -- unchanged. What is gone is the
+    interleaved Biton invocation that used to bracket both halves; other models
+    are scheduled independently by run_supervisor.py."""
     print(f"[{MODEL_NAME}] Refreshing open paper trade positions...", file=sys.stderr)
     process_open_positions()
 
@@ -420,8 +350,6 @@ def run_cycle(args) -> None:
     if args.skip_scan:
         return
 
-    if biton_due:
-        _run_biton_phase("scan", args.asset_class, args.top_n, args.candidate_pool)
     reports = run(args.asset_class, args.top_n, args.candidate_pool,
                   export_funnel=_funnel_gate.due())
 

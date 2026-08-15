@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # Repository anchors -- mirrors models/livne/config.py. Derived from __file__,
 # never from cwd, because this model runs both standalone and as a subprocess
-# launched by Livne's runner.
+# launched by the supervisor.
 #
 #     <repo>/models/biton/config.py  ->  REPO_ROOT = <repo>
 # ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ CYCLE_INTERVAL_MINUTES = _MODEL.cycle_interval_minutes  # minutes between backgr
 # would suppress the other's report.
 #
 # The check lives in run_cycle rather than the main loop because this runner is
-# normally launched by Livne with `--once`: the loop never executes, so a
+# normally launched by the supervisor with `--once`: the loop never executes, so a
 # loop-level check would mean Biton never reported at all. For the same reason
 # the marker must be file-persisted -- the process exits every cycle.
 # ---------------------------------------------------------------------------
