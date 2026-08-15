@@ -41,6 +41,9 @@ _KLINE_COLUMNS = [
 ]
 
 
+from core.data.rate_governor import acquire as _rate_acquire
+
+
 def _to_ms(ts) -> int:
     return int(pd.Timestamp(ts).value // 1_000_000)
 
@@ -101,6 +104,10 @@ class BinanceKlineProvider:
         cursor = start_ms
 
         while cursor < end_ms:
+            # Governed HERE, per PAGE, because each page is a separate HTTP
+            # request against the shared per-IP budget -- not once per fetch().
+            # Weight 2 is Binance's published cost for a 1000-candle klines call.
+            _rate_acquire("binance", weight=2.0)
             batch = self._request({
                 "symbol": symbol, "interval": native,
                 "startTime": cursor, "endTime": end_ms, "limit": 1000,
@@ -168,6 +175,10 @@ class YahooProvider:
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
+                # Per ATTEMPT: a retry is another request against the same
+                # shared budget, and retries are exactly when a throttled
+                # caller is most at risk of making things worse.
+                _rate_acquire("yahoo")
                 df = yf.Ticker(ticker).history(
                     start=start.strftime("%Y-%m-%d"),
                     end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),

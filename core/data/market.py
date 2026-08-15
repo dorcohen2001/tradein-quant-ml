@@ -132,6 +132,90 @@ def get_candles(symbol: str, asset_class: str, interval: str = "1d",
     return frame.tail(bars)
 
 
+# ---------------------------------------------------------------------------
+# Timezone-preserving stock adapter
+# ---------------------------------------------------------------------------
+# The exchange timezone US equity data is quoted in. This is NOT cosmetic.
+#
+# The shared feed normalises everything to naive UTC, which is right for
+# storage and for crypto (Binance is UTC-native and trades continuously). It is
+# WRONG to hand to a consumer that resamples: `models/livne/utils/data_fetch.
+# resample_ohlc` builds the 12h/4h/3h frames Livne's HTF zone map depends on,
+# and pandas anchors resample buckets to the index's own midnight. A naive-UTC
+# index anchors those buckets to 00:00 UTC (20:00 the previous ET day), which
+# silently shifts every bucket boundary and therefore every zone.
+#
+# Converting back to America/New_York reproduces the legacy fetcher's index
+# exactly: a daily bar stored as 2026-08-14 04:00 UTC becomes
+# 2026-08-14 00:00-04:00, which is what yfinance returned directly.
+EXCHANGE_TZ = "America/New_York"
+
+# Trading days per calendar period, for translating the legacy fetcher's
+# `period=` strings into a bar count. Deliberately generous -- the frame is
+# tail-sliced afterwards, and asking for too few bars silently truncates
+# indicator warm-up.
+_PERIOD_TRADING_DAYS = {
+    "1d": 1, "5d": 5, "1mo": 23, "3mo": 66, "6mo": 130,
+    "1y": 260, "2y": 520, "5y": 1300, "10y": 2600, "max": 5200,
+}
+
+
+def period_to_bars(period: str, interval: str) -> int:
+    """How many bars of `interval` a legacy `period=` string covers.
+
+    Used only to translate a call written against the old fetcher; a caller
+    that already thinks in bars should pass `bars` directly.
+    """
+    days = _PERIOD_TRADING_DAYS.get(period.strip().lower())
+    if days is None:
+        days = 260
+    minutes_per_day = 390 if interval_minutes(interval) < 1440 else 1440
+    per_day = max(1, minutes_per_day // max(interval_minutes(interval), 1))
+    return max(int(days * per_day), 1)
+
+
+def to_exchange_tz(frame: pd.DataFrame, tz: str = EXCHANGE_TZ) -> pd.DataFrame:
+    """Re-attach exchange-local timezone to a naive-UTC frame.
+
+    The feed stores naive UTC; consumers that resample need the tz-aware
+    exchange-local index the legacy fetcher produced. Localising to UTC and
+    converting is exact -- it relabels the same instants, it does not move any
+    bar.
+
+    A frame that is already tz-aware is converted, not double-localised, so this
+    is safe to apply twice.
+    """
+    if frame is None or len(frame) == 0:
+        return frame
+    out = frame.copy()
+    if getattr(out.index, "tz", None) is None:
+        out.index = out.index.tz_localize("UTC").tz_convert(tz)
+    else:
+        out.index = out.index.tz_convert(tz)
+    return out
+
+
+def get_stock_candles(ticker: str, interval: str = "1d", bars: int = 300,
+                      period: str | None = None, tz: str | None = EXCHANGE_TZ,
+                      now: dt.datetime | None = None,
+                      feed: IntradayDataFeed | None = None) -> pd.DataFrame:
+    """Stock candles from the shared layer, with the exchange timezone intact.
+
+    This is the drop-in replacement for a model's own `get_stock_history`.
+    Pass `period=` to mirror a legacy call ("1y", "6mo"); pass `bars=` to be
+    explicit. `tz=None` returns the raw naive-UTC frame for callers that do not
+    resample and prefer the storage form.
+
+    Column set is OHLCV only. The legacy fetcher also carried `Dividends` and
+    `Stock Splits`; a repo-wide search found no consumer of either, and every
+    indicator, screener gate and chart reads only OHLCV.
+    """
+    if period is not None:
+        bars = period_to_bars(period, interval)
+    frame = get_candles(ticker, "stocks", interval, bars=bars, now=now, feed=feed)
+    return to_exchange_tz(frame, tz) if tz else frame
+
+
 def download_count(feed: IntradayDataFeed | None = None) -> int:
     """How many network downloads the shared feed has performed. Used by the
     deduplication tests to assert that a second tenant's identical request
