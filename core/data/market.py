@@ -197,7 +197,7 @@ def to_exchange_tz(frame: pd.DataFrame, tz: str = EXCHANGE_TZ) -> pd.DataFrame:
 
 def get_stock_candles(ticker: str, interval: str = "1d", bars: int = 300,
                       period: str | None = None, tz: str | None = EXCHANGE_TZ,
-                      now: dt.datetime | None = None,
+                      now: dt.datetime | None = None, lookback_days: float | None = None,
                       feed: IntradayDataFeed | None = None) -> pd.DataFrame:
     """Stock candles from the shared layer, with the exchange timezone intact.
 
@@ -210,9 +210,24 @@ def get_stock_candles(ticker: str, interval: str = "1d", bars: int = 300,
     `Stock Splits`; a repo-wide search found no consumer of either, and every
     indicator, screener gate and chart reads only OHLCV.
     """
-    if period is not None:
-        bars = period_to_bars(period, interval)
-    frame = get_candles(ticker, "stocks", interval, bars=bars, now=now, feed=feed)
+    if lookback_days is not None:
+        # Explicit CALENDAR window. Required for intraday, because the bars->window
+        # heuristic in `get_candles` assumes bars are spread across the clock and
+        # US equities trade only 6.5h of each 24. At 15m that heuristic delivers
+        # roughly a sixth of the bars asked for -- enough to pass an
+        # overlap-based parity check while silently handing downstream code a
+        # much shorter frame, which changes EMA-200 warm-up and the depth of
+        # history the zone map is built from.
+        feed = feed or get_feed()
+        end = quantized_end(interval, now)
+        start = end - dt.timedelta(days=lookback_days)
+        frame = feed.get_candles(ticker, "stocks", interval, start, end)
+        if frame is not None and len(frame):
+            frame = frame.tail(bars) if bars and len(frame) > bars else frame
+    else:
+        if period is not None:
+            bars = period_to_bars(period, interval)
+        frame = get_candles(ticker, "stocks", interval, bars=bars, now=now, feed=feed)
     return to_exchange_tz(frame, tz) if tz else frame
 
 
