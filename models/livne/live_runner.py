@@ -69,6 +69,7 @@ from config import (
     REPORT_STATE_STORE,
     REPORT_UPDATE_STATUSES,
     SEND_EMPTY_DAILY_REPORT,
+    TELEGRAM_ROUTE,
     TOP_N_ASSETS,
     WEEKLY_REPORT_WEEKDAY,
 )
@@ -191,6 +192,7 @@ def process_open_positions() -> None:
         result = send_telegram_message(
             _format_status_update(trade),
             reply_to_message_id=trade.get("telegram_message_id"),
+            route=TELEGRAM_ROUTE,
         )
         print(
             f"[paper] {trade['ticker']} -> {trade['current_status']} "
@@ -272,13 +274,13 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
                 )
                 if chart_path:
                     print(f"[chart] Rendered {chart_path}", file=sys.stderr)
-                    tg_result = send_telegram_photo(chart_path, caption=message)
+                    tg_result = send_telegram_photo(chart_path, caption=message, route=TELEGRAM_ROUTE)
                     if not tg_result["ok"]:
                         print("[chart] Photo alert failed — falling back to text-only.",
                               file=sys.stderr)
-                        tg_result = send_telegram_message(message)
+                        tg_result = send_telegram_message(message, route=TELEGRAM_ROUTE)
                 else:
-                    tg_result = send_telegram_message(message)
+                    tg_result = send_telegram_message(message, route=TELEGRAM_ROUTE)
                 trade_record = log_trade(setup, telegram_message_id=tg_result["message_id"])
                 print(
                     f"[paper] Logged trade {trade_record['id']} for {setup.ticker} "
@@ -374,7 +376,7 @@ def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
             )
             has_activity = "_none_" not in message or message.count("_none_") < 2
             if has_activity or SEND_EMPTY_DAILY_REPORT:
-                send_telegram_message(message)
+                send_telegram_message(message, route=TELEGRAM_ROUTE)
                 sent.append("daily")
             # Mark the day done either way, so a quiet day is not retried every
             # cycle for the rest of the evening.
@@ -383,7 +385,7 @@ def send_scheduled_summaries(now: dt.datetime | None = None) -> list[str]:
         if weekly_report_due(state, now, DAILY_REPORT_HOUR, WEEKLY_REPORT_WEEKDAY):
             send_telegram_message(build_weekly_summary(
                 MODEL_NAME, trades, now, closed_statuses=REPORT_CLOSED_STATUSES,
-            ))
+            ), route=TELEGRAM_ROUTE)
             state["last_weekly_report_date"] = now.date().isoformat()
             sent.append("weekly")
 

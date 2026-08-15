@@ -17,7 +17,10 @@ correctness depend on module import order.
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -41,6 +44,108 @@ REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 10)
 # --- Telegram -----------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# How many times a send is attempted before it is reported as failed, and the
+# base for the exponential backoff between attempts (1s, 2s, 4s). Previously
+# there was no retry at all: a single connection blip or a 429 silently
+# dropped the alert, printed one line to stderr, and the trade went unreported.
+TELEGRAM_MAX_ATTEMPTS = _int_env("TELEGRAM_MAX_ATTEMPTS", 3)
+TELEGRAM_BACKOFF_BASE_SECONDS = float(os.environ.get("TELEGRAM_BACKOFF_BASE_SECONDS", "") or 1.0)
+
+# --- Telegram routing ---------------------------------------------------
+# Every message used to go to exactly one hard-coded chat: the token and chat
+# id were read once at import and baked into the payload, and the send
+# functions had no parameter for either. Routing more than one model, or the
+# same model to more than one group, was impossible without editing code.
+#
+# A route is now a NAME that resolves to a (token, chat_id) pair, and each
+# model declares its route in `core.registry`. Resolution order, first hit
+# wins, per field:
+#
+#   1. the TELEGRAM_ROUTES JSON blob, e.g.
+#        TELEGRAM_ROUTES={"livne":{"chat_id":"-100123"},"biton":{"chat_id":"-100456","token":"..."}}
+#   2. per-route environment variables: TELEGRAM_CHAT_ID_<NAME>,
+#      TELEGRAM_BOT_TOKEN_<NAME>  (e.g. TELEGRAM_CHAT_ID_LIVNE)
+#   3. the shared defaults above.
+#
+# Step 3 is what makes this backward-compatible: with nothing new configured
+# -- which is the current deployment -- EVERY route resolves to exactly the
+# destination everything already used, so behaviour is unchanged until someone
+# opts in. A route may override only the chat and inherit the bot, which is
+# the common case of one bot posting into several groups.
+TELEGRAM_ROUTES_JSON = os.environ.get("TELEGRAM_ROUTES", "")
+
+
+def _parse_routes(raw: str) -> dict[str, dict]:
+    """Never fatal. A malformed TELEGRAM_ROUTES must not take the alerting path
+    down with it -- it degrades to "no JSON routes configured", and every route
+    then falls through to per-route env vars and the shared default."""
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"[settings] TELEGRAM_ROUTES is not valid JSON ({exc}); ignoring it "
+              f"and falling back to per-route env vars / defaults.", file=sys.stderr)
+        return {}
+    if not isinstance(parsed, dict):
+        print("[settings] TELEGRAM_ROUTES must be a JSON object; ignoring it.", file=sys.stderr)
+        return {}
+    return {str(k): v for k, v in parsed.items() if isinstance(v, dict)}
+
+
+_ROUTES = _parse_routes(TELEGRAM_ROUTES_JSON)
+
+DEFAULT_TELEGRAM_ROUTE = "default"
+
+
+@dataclass(frozen=True)
+class TelegramRoute:
+    """A resolved send destination."""
+
+    name: str
+    token: str
+    chat_id: str
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+
+def get_telegram_route(name: str | None = None) -> TelegramRoute:
+    """Resolve a route name to credentials, per the order documented above.
+
+    Resolved at CALL time, not import time, so a test (or a supervisor that
+    sets per-child environment) can change the destination without reimporting
+    the module.
+    """
+    name = name or DEFAULT_TELEGRAM_ROUTE
+    entry = _ROUTES.get(name, {})
+    suffix = name.strip().upper().replace("-", "_").replace(" ", "_")
+
+    token = (
+        str(entry.get("token") or "")
+        or os.environ.get(f"TELEGRAM_BOT_TOKEN_{suffix}", "")
+        or TELEGRAM_BOT_TOKEN
+    )
+    chat_id = (
+        str(entry.get("chat_id") or "")
+        or os.environ.get(f"TELEGRAM_CHAT_ID_{suffix}", "")
+        or TELEGRAM_CHAT_ID
+    )
+    return TelegramRoute(name=name, token=token, chat_id=chat_id)
+
+
+def configured_route_names() -> tuple[str, ...]:
+    """Route names with an EXPLICIT configuration of their own (JSON entry or
+    per-route env var) -- i.e. those that do not simply inherit the default.
+    Used by diagnostics to show where messages will actually land."""
+    names = set(_ROUTES)
+    for key in os.environ:
+        for prefix in ("TELEGRAM_CHAT_ID_", "TELEGRAM_BOT_TOKEN_"):
+            if key.startswith(prefix):
+                names.add(key[len(prefix):].lower())
+    return tuple(sorted(names))
 
 # --- News / sentiment ---------------------------------------------------
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")

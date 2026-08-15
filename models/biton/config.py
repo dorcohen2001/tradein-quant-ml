@@ -132,9 +132,13 @@ COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 
 # ---------------------------------------------------------------------------
 # Telegram alerts
+#
+# Credentials are not read here -- see models/livne/config.py for why the old
+# TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID pair was dead config. This declares only
+# the named route; unconfigured it resolves to the shared default chat, and
+# TELEGRAM_CHAT_ID_BITON splits Biton's alerts into their own group.
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ROUTE = _MODEL.telegram_route
 
 # ---------------------------------------------------------------------------
 # Chart generation -- rendered PNGs for Telegram alerts (core.charting)

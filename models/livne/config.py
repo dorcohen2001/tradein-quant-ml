@@ -451,9 +451,19 @@ YF_RETRY_DELAYS = (2, 5, 10)  # seconds between retries on a failed yfinance cal
 
 # ---------------------------------------------------------------------------
 # Telegram alerts
+#
+# The credentials themselves are NOT read here. `TELEGRAM_BOT_TOKEN` /
+# `TELEGRAM_CHAT_ID` used to be defined in this file but nothing ever imported
+# them -- `core.utils.telegram_notifier` has always read `core.settings`
+# directly -- so they were dead config that looked live, and a rotation edited
+# here would silently have had no effect.
+#
+# What this model DOES declare is which named route its messages go to.
+# Unconfigured, that route resolves to the same shared default chat as before;
+# set TELEGRAM_CHAT_ID_LIVNE (or a TELEGRAM_ROUTES entry) to split it out into
+# its own group. See core/settings.py.
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ROUTE = _MODEL.telegram_route
 
 # ---------------------------------------------------------------------------
 # Chart generation -- rendered PNGs for Telegram alerts (core.charting)
