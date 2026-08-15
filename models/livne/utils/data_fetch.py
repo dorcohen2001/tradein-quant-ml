@@ -35,41 +35,22 @@ from config import (
     YF_RETRY_DELAYS,
     YF_STALE_FALLBACK_SECONDS,
 )
+from core.data.cache_policy import HISTORY_CACHE_SECONDS, bucket, bucket_seconds_for
 from core.utils.yf_cache import cached_call
 
-_HISTORY_CACHE_SECONDS = 1800  # 30-minute buckets for crypto/CoinGecko daily-candle history (unaffected by yf_cache)
-
-# Sub-hourly Binance intervals back LIVE position management -- the intraday
-# high/low range used for stop/target detection (`get_recent_intraday_range`)
-# and the candles used for emergency-reversal detection
-# (`get_recent_intraday_candles`). They must NOT share the 30-minute history
-# bucket: cycles run every CYCLE_INTERVAL_MINUTES (15), so a 30-minute bucket
-# made every second cycle re-use the previous cycle's intraday data verbatim,
-# and a stop breached in between was evaluated against stale bars. The
-# equivalent stock paths already avoid this via the zero-TTL _live_price_cache;
-# this is the crypto counterpart.
-_INTRADAY_CACHE_SECONDS = 60
-_MIDRANGE_CACHE_SECONDS = 300
-_LIVE_INTRADAY_INTERVALS = frozenset({"1m", "3m", "5m", "15m", "30m"})
-_MIDRANGE_INTERVALS = frozenset({"1h", "2h", "3h", "4h"})
+# Cache-bucket policy is shared (core.data.cache_policy): a cache entry must
+# never outlive the bar it describes. The two models had drifted -- Biton
+# lacked the 1h-4h middle tier, so a 1h frame was cached for a full 30 minutes
+# and every second cycle re-used the previous cycle's bars verbatim.
+_HISTORY_CACHE_SECONDS = HISTORY_CACHE_SECONDS
 
 
 def _bucket(seconds: int = _HISTORY_CACHE_SECONDS) -> int:
-    return int(dt.datetime.now(dt.timezone.utc).timestamp() // seconds)
+    return bucket(seconds)
 
 
 def _bucket_seconds_for(interval: str) -> int:
-    """Cache-bucket width for a Binance interval, tiered to the bar period.
-
-    A cache entry must never outlive the bar it describes, or the strategy
-    evaluates a candle that already closed. With the intraday mapping the 15m
-    trigger and the 5m/1h confirmations are all on the hot path, so they get
-    short buckets; only the daily/weekly context frames keep the long one."""
-    if interval in _LIVE_INTRADAY_INTERVALS:
-        return _INTRADAY_CACHE_SECONDS
-    if interval in _MIDRANGE_INTERVALS:
-        return _MIDRANGE_CACHE_SECONDS
-    return _HISTORY_CACHE_SECONDS
+    return bucket_seconds_for(interval)
 
 
 # ---------------------------------------------------------------------------

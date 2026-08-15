@@ -11,10 +11,7 @@ reversal. Marks positions against live market prices via `utils.data_fetch`.
 from __future__ import annotations
 
 import datetime as dt
-import json
-import os
 import sys
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 
@@ -28,6 +25,7 @@ from config import (
     PENDING_EXPIRY_HOURS,
     TP1_CLOSE_PCT,
 )
+from core.paper_trading.store import load_trades, pnl_pct as _pnl_pct, save_trades
 from core.utils.market_hours import is_market_open
 from paper_trading import journal
 from risk.risk_manager import detect_emergency_reversal
@@ -97,35 +95,14 @@ def _migrate(trade: dict) -> dict:
 
 
 def _load() -> list[dict]:
-    if not os.path.exists(PAPER_TRADING_STORE):
-        return []
-    with open(PAPER_TRADING_STORE, "r", encoding="utf-8") as f:
-        try:
-            trades = json.load(f)
-        except json.JSONDecodeError as exc:
-            # A corrupt store must be a hard error: returning [] here would let
-            # the next _save() overwrite the file and silently erase all history.
-            raise RuntimeError(
-                f"{PAPER_TRADING_STORE} is corrupt ({exc}). Fix or restore it "
-                f"manually before running again."
-            ) from exc
-    return [_migrate(t) for t in trades]
+    """Shared atomic-store read (core.paper_trading.store), with THIS model's
+    schema migration applied per record -- only Livne knows how to backfill
+    its multi-tier TP/breakeven fields."""
+    return load_trades(PAPER_TRADING_STORE, migrate=_migrate)
 
 
 def _save(trades: list[dict]) -> None:
-    """Atomically replace the store (temp file + os.replace) so a crash
-    mid-write can never leave a truncated/corrupt trades.json behind."""
-    store_dir = os.path.dirname(PAPER_TRADING_STORE)
-    os.makedirs(store_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=store_dir, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(trades, f, indent=2)
-        os.replace(tmp_path, PAPER_TRADING_STORE)
-    except BaseException:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
+    save_trades(PAPER_TRADING_STORE, trades)
 
 
 def log_trade(setup, telegram_message_id: int | None = None) -> dict:
@@ -173,12 +150,6 @@ def get_current_price(ticker: str, asset_class: str) -> float | None:
     except Exception as exc:
         print(f"[tracker] price fetch failed for {ticker}: {exc}", file=sys.stderr)
         return None
-
-
-def _pnl_pct(direction: str, entry_price: float, exit_price: float) -> float:
-    if direction == "LONG":
-        return (exit_price / entry_price - 1) * 100
-    return (entry_price / exit_price - 1) * 100
 
 
 def _blended_pnl(trade: dict, entry_price: float, leg2_exit_price: float) -> float:

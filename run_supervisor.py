@@ -73,7 +73,16 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from core.maintenance import sweep_runtime  # noqa: E402
 from core.registry import ModelConfig, all_models, get_model  # noqa: E402
+from core.scheduling import PersistentIntervalGate  # noqa: E402
+from core.settings import (  # noqa: E402
+    CHART_RETENTION_DAYS,
+    MAINTENANCE_INTERVAL_MINUTES,
+    RUNTIME_CACHE_RETENTION_DAYS,
+)
+
+RUNTIME_DIR = os.path.join(REPO_ROOT, "runtime")
 
 _stop = threading.Event()
 # stderr is shared by every thread; without this, two models logging at the
@@ -160,6 +169,30 @@ def _supervise(model: ModelConfig, args) -> None:
         _stop.wait(sleep_for)
 
 
+def _maintenance_loop() -> None:
+    """Age-based retention for derived runtime artifacts.
+
+    Lives in the supervisor rather than in a model because it is not any one
+    model's concern -- the yfinance cache and the charts directory are shared.
+    Gated on a persisted marker so restarting the supervisor does not re-run
+    the sweep every time, and wrapped so a housekeeping failure can never take
+    down the process that keeps the models running.
+    """
+    gate = PersistentIntervalGate(
+        MAINTENANCE_INTERVAL_MINUTES,
+        state_path=os.path.join(RUNTIME_DIR, "state", "gates_supervisor.json"),
+        name="runtime_sweep",
+    )
+    while not _stop.is_set():
+        try:
+            if gate.due():
+                _log("[maintenance] running retention sweep")
+                sweep_runtime(RUNTIME_DIR, RUNTIME_CACHE_RETENTION_DAYS, CHART_RETENTION_DAYS)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"[maintenance] sweep failed (models unaffected): {exc}")
+        _stop.wait(300)  # re-check every 5 min; the gate decides if it actually runs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Run every registered TRADEIN model independently",
@@ -210,6 +243,11 @@ def main() -> int:
         threading.Thread(target=_supervise, args=(m, args), name=f"supervise-{m.key}", daemon=True)
         for m in models
     ]
+    # Housekeeping runs alongside, never inside, a model cycle -- so a sweep
+    # cannot delay position management. Skipped under --once, which is a
+    # one-shot invocation rather than a long-running deployment.
+    if not args.once:
+        threads.append(threading.Thread(target=_maintenance_loop, name="maintenance", daemon=True))
     for t in threads:
         t.start()
 

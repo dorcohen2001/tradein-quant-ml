@@ -31,29 +31,22 @@ from config import (
     YF_RETRY_DELAYS,
     YF_STALE_FALLBACK_SECONDS,
 )
+from core.data.cache_policy import HISTORY_CACHE_SECONDS, bucket, bucket_seconds_for
 from core.utils.yf_cache import cached_call
 
-_HISTORY_CACHE_SECONDS = 1800  # 30-minute buckets for crypto/CoinGecko daily-candle history (unaffected by yf_cache)
-
-# Sub-hourly Binance intervals back LIVE position management -- the intraday
-# high/low range used for stop/target detection (`get_recent_intraday_range`).
-# They must NOT share the 30-minute history bucket: cycles run every
-# CYCLE_INTERVAL_MINUTES (15), so a 30-minute bucket made every second cycle
-# re-use the previous cycle's intraday data verbatim, and a stop breached in
-# between was evaluated against stale bars. The equivalent stock paths already
-# avoid this via the zero-TTL _live_price_cache; this is the crypto counterpart.
-_INTRADAY_CACHE_SECONDS = 60
-_LIVE_INTRADAY_INTERVALS = frozenset({"1m", "3m", "5m", "15m"})
+# Cache-bucket policy is shared (core.data.cache_policy): a cache entry must
+# never outlive the bar it describes. The two models had drifted -- Biton
+# lacked the 1h-4h middle tier, so a 1h frame was cached for a full 30 minutes
+# and every second cycle re-used the previous cycle's bars verbatim.
+_HISTORY_CACHE_SECONDS = HISTORY_CACHE_SECONDS
 
 
 def _bucket(seconds: int = _HISTORY_CACHE_SECONDS) -> int:
-    return int(dt.datetime.now(dt.timezone.utc).timestamp() // seconds)
+    return bucket(seconds)
 
 
 def _bucket_seconds_for(interval: str) -> int:
-    """Cache-bucket width for a Binance interval: short for the live intraday
-    intervals above, the normal history bucket for everything else."""
-    return _INTRADAY_CACHE_SECONDS if interval in _LIVE_INTRADAY_INTERVALS else _HISTORY_CACHE_SECONDS
+    return bucket_seconds_for(interval)
 
 
 # ---------------------------------------------------------------------------

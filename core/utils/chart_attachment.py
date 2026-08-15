@@ -30,7 +30,9 @@ import sys
 _CRYPTO_QUOTES = ("USDT", "USDC", "BUSD", "PERP")
 
 
-def generate_chart_for_setup(setup, *, fetch_crypto, fetch_stock, output_dir) -> str | None:
+def generate_chart_for_setup(
+    setup, *, fetch_crypto, fetch_stock, output_dir, spec=None, model_key: str | None = None,
+) -> str | None:
     """Render a chart PNG for a model's trade setup.
 
     `fetch_crypto(symbol, interval=..., limit=...)` and
@@ -38,15 +40,31 @@ def generate_chart_for_setup(setup, *, fetch_crypto, fetch_stock, output_dir) ->
     own data-fetch functions (both models expose exactly these signatures).
     `output_dir` is created if missing.
 
+    `spec` is a `core.charting.spec.ChartSpec` choosing the timeframe, history
+    window and indicators; omitted, it is the daily chart this function always
+    produced, so an un-migrated caller is unaffected.
+
+    `model_key` prefixes the output filename. Charts share one directory, and
+    the name used to be `{TICKER}_{TF}_{DATE}.png` -- so two models alerting on
+    the same ticker on the same day wrote the SAME path. That was harmless
+    while models ran sequentially, but under the supervisor they run
+    concurrently and one process could overwrite the file another was still
+    uploading.
+
     Returns the absolute path of the saved image, or None if anything failed
     (missing data, unknown ticker, render error, ...).
     """
     try:
         from core.charting.chart_renderer import render_chart
         from core.charting.setup_parser import TradeSetup as ChartSetup
+        from core.charting.spec import ChartSpec
+
+        spec = spec or ChartSpec.daily()
+        for issue in spec.warnings():
+            print(f"[chart] WARNING: {issue}", file=sys.stderr)
 
         if setup.asset_class == "crypto":
-            df = fetch_crypto(setup.ticker, interval="1d", limit=600)
+            df = fetch_crypto(setup.ticker, interval=spec.interval, limit=spec.crypto_limit)
             base = setup.ticker
             for q in _CRYPTO_QUOTES:
                 if base.endswith(q):
@@ -54,22 +72,25 @@ def generate_chart_for_setup(setup, *, fetch_crypto, fetch_stock, output_dir) ->
                     break
             yf_symbol = f"{base}-USD"  # "-USD" suffix disables weekend rangebreaks
         else:
-            df = fetch_stock(setup.ticker, period="2y", interval="1d")
+            df = fetch_stock(setup.ticker, period=spec.stock_period, interval=spec.interval)
             yf_symbol = setup.ticker
 
         if df.empty:
-            raise RuntimeError(f"no market data for {setup.ticker}")
+            raise RuntimeError(
+                f"no market data for {setup.ticker} at {spec.interval} "
+                f"(stock_period={spec.stock_period}, crypto_limit={spec.crypto_limit})"
+            )
 
         chart_setup = ChartSetup(
             asset=setup.ticker,
             yf_symbol=yf_symbol,
-            interval="1d",
-            tf_label="1D",
+            interval=spec.interval,
+            tf_label=spec.tf_label,
             resample=None,
             direction=setup.direction,
-            emas=[50, 200],
-            show_rsi=True,
-            show_macd=True,
+            emas=list(spec.emas),
+            show_rsi=spec.show_rsi,
+            show_macd=spec.show_macd,
             fib_zone=setup.fib_zone,
             supports=list(setup.supports),
             resistances=list(setup.resistances),
@@ -79,7 +100,8 @@ def generate_chart_for_setup(setup, *, fetch_crypto, fetch_stock, output_dir) ->
         )
 
         os.makedirs(output_dir, exist_ok=True)
-        out_name = f"{setup.ticker}_1D_{dt.date.today():%Y-%m-%d}.png"
+        prefix = f"{model_key}_" if model_key else ""
+        out_name = f"{prefix}{setup.ticker}_{spec.tf_label}_{dt.date.today():%Y-%m-%d}.png"
         out_path = os.path.join(output_dir, out_name)
         render_chart(chart_setup, df, out_path)
         return out_path

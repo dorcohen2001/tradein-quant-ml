@@ -8,11 +8,10 @@ being appended to indefinitely.
 """
 from __future__ import annotations
 
-import os
-
-from openpyxl import Workbook, load_workbook
+import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
 from config import PAPER_TRADING_JOURNAL_XLSX
+from core.paper_trading.journal import upsert_row
 
 COLUMNS = [
     "ID", "Signal Date", "Ticker", "Asset Class", "Direction",
@@ -45,35 +44,11 @@ def _row_values(trade: dict) -> list:
     ]
 
 
-def _open_or_create_workbook():
-    if os.path.exists(PAPER_TRADING_JOURNAL_XLSX):
-        wb = load_workbook(PAPER_TRADING_JOURNAL_XLSX)
-        return wb, wb.active
-
-    os.makedirs(os.path.dirname(PAPER_TRADING_JOURNAL_XLSX), exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Trades"
-    ws.append(COLUMNS)
-    return wb, ws
-
-
 def upsert_trade_row(trade: dict) -> None:
-    """Insert or update the spreadsheet row for `trade`, matched by ID."""
-    wb, ws = _open_or_create_workbook()
+    """Insert or update the spreadsheet row for `trade`, matched by ID.
 
-    trade_id = trade["id"]
-    target_row = None
-    for (id_cell,) in ws.iter_rows(min_row=2, max_col=1):
-        if id_cell.value == trade_id:
-            target_row = id_cell.row
-            break
-
-    values = _row_values(trade)
-    if target_row is None:
-        ws.append(values)
-    else:
-        for col_idx, value in enumerate(values, start=1):
-            ws.cell(row=target_row, column=col_idx, value=value)
-
-    wb.save(PAPER_TRADING_JOURNAL_XLSX)
+    The COLUMNS/`_row_values` pair above is this model's own schema; the
+    open-or-create + match-by-ID + save mechanism is shared (it was duplicated
+    verbatim in both models). See core/paper_trading/journal.py.
+    """
+    upsert_row(PAPER_TRADING_JOURNAL_XLSX, COLUMNS, _row_values(trade), trade["id"])

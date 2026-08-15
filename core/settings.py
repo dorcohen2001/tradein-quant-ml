@@ -151,6 +151,20 @@ def configured_route_names() -> tuple[str, ...]:
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 NEWS_LOOKBACK_HOURS = _int_env("NEWS_LOOKBACK_HOURS", 48)
 
+# --- Runtime artifact retention (core.maintenance) ----------------------
+# Both of these directories previously grew without any bound. Ages, not
+# counts: they are content-keyed caches, so "how old" is the meaningful axis.
+#
+# 7 days for the yfinance cache is deliberately more than double the 72h
+# YF_STALE_FALLBACK_SECONDS window past which even the emergency stale-serve
+# path refuses an entry -- so nothing still reachable is ever pruned.
+# 0 disables a sweep entirely.
+RUNTIME_CACHE_RETENTION_DAYS = _int_env("RUNTIME_CACHE_RETENTION_DAYS", 7)
+CHART_RETENTION_DAYS = _int_env("CHART_RETENTION_DAYS", 14)
+# How often the supervisor runs the sweep. Daily is plenty for directories
+# that accumulate over weeks.
+MAINTENANCE_INTERVAL_MINUTES = _int_env("MAINTENANCE_INTERVAL_MINUTES", 1440)
+
 # --- Daily analyzer ("Steve", agents/steve) -----------------------------
 # These belong to the ANALYZER, not to any model. They previously lived in
 # models/livne/config.py, which made one model's config the carrier for a tool

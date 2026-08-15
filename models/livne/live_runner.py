@@ -51,10 +51,12 @@ import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
 from config import (
     CHART_OUTPUT_DIR,
+    CHART_SPEC,
     CYCLE_INTERVAL_MINUTES,
     DAILY_REPORT_HOUR,
     FUNNEL_EXPORT_INTERVAL_MINUTES,
     GATE_STATE_STORE,
+    MODEL_KEY,
     MODEL_NAME,
     REPORT_CLOSED_STATUSES,
     REPORT_STATE_STORE,
@@ -226,6 +228,8 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
                     fetch_crypto=get_binance_klines,
                     fetch_stock=get_stock_history,
                     output_dir=CHART_OUTPUT_DIR,
+                    spec=CHART_SPEC,
+                    model_key=MODEL_KEY,
                 )
                 if chart_path:
                     print(f"[chart] Rendered {chart_path}", file=sys.stderr)

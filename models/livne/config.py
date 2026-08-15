@@ -39,6 +39,7 @@ load_dotenv(os.path.join(REPO_ROOT, ".env"))
 # ---------------------------------------------------------------------------
 import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
 
+from core.charting.spec import ChartSpec  # noqa: E402
 from core.registry import get_model  # noqa: E402
 
 MODEL_KEY = "livne"
@@ -469,6 +470,12 @@ TELEGRAM_ROUTE = _MODEL.telegram_route
 # Chart generation -- rendered PNGs for Telegram alerts (core.charting)
 # ---------------------------------------------------------------------------
 CHART_OUTPUT_DIR = os.environ.get("CHART_OUTPUT_DIR", os.path.join(RUNTIME_DIR, "charts"))
+
+# Livne triggers on 15m and targets a holding period of minutes to hours, so
+# it now charts 15m rather than the daily chart every alert used to carry. On
+# a daily chart this model's entry zone, stop and TP1 routinely fall inside a
+# single candle -- a picture that cannot show the setup it illustrates.
+CHART_SPEC = ChartSpec.intraday_15m()
 
 # ---------------------------------------------------------------------------
 # Model identity. Which OTHER models exist, and how they are scheduled, is not

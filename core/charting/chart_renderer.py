@@ -259,9 +259,16 @@ def render_chart(setup: TradeSetup, df: pd.DataFrame, out_path: str) -> str:
     pad = (y_hi - y_lo) * 0.05
     fig.update_yaxes(range=[y_lo - pad * 2.2, y_hi + pad],
                      row=1, col=1, secondary_y=False)
-    # stocks: hide weekend gaps (crypto trades 24/7 so no breaks needed)
+    # stocks: hide weekend gaps (crypto trades 24/7 so no breaks needed).
+    # On an INTRADAY stock chart the overnight gap must go too -- without it,
+    # 17.5 non-trading hours are drawn between every 16:00 bar and the next
+    # 09:30 bar, so the actual session compresses into a sliver and the chart
+    # is mostly empty space. Crypto needs neither break.
     if not setup.yf_symbol.endswith("-USD"):
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+        breaks = [dict(bounds=["sat", "mon"])]
+        if setup.interval in ("1m", "2m", "5m", "15m", "30m", "60m", "1h"):
+            breaks.append(dict(bounds=[16, 9.5], pattern="hour"))  # 16:00 -> 09:30 ET
+        fig.update_xaxes(rangebreaks=breaks)
 
     height = {1: 860, 2: 980, 3: 1080}[rows]
     fig.write_image(out_path, width=1680, height=height, scale=2)

@@ -28,6 +28,7 @@ load_dotenv(os.path.join(REPO_ROOT, ".env"))
 # ---------------------------------------------------------------------------
 import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
 
+from core.charting.spec import ChartSpec  # noqa: E402
 from core.registry import get_model  # noqa: E402
 
 MODEL_KEY = "biton"
@@ -144,6 +145,11 @@ TELEGRAM_ROUTE = _MODEL.telegram_route
 # Chart generation -- rendered PNGs for Telegram alerts (core.charting)
 # ---------------------------------------------------------------------------
 CHART_OUTPUT_DIR = os.environ.get("CHART_OUTPUT_DIR", os.path.join(RUNTIME_DIR, "charts"))
+
+# Biton is a daily structural model, so it keeps the daily chart -- stated
+# explicitly rather than inherited by omission, since the default is no longer
+# the only option.
+CHART_SPEC = ChartSpec.daily()
 
 # ---------------------------------------------------------------------------
 # Dual-model identity (see live_runner.py) -- this is the frozen "Biton"
