@@ -1,89 +1,84 @@
-"""Main CLI launcher for the backtesting suite.
+"""Main CLI launcher for the Livne INTRADAY backtesting suite.
 
-!! SCOPE WARNING -- READ BEFORE TRUSTING THESE RESULTS !!
-The live Livne model moved to an INTRADAY mapping (daily/weekly context,
-top-down zone map, 15m trigger with 5m/1h confirmation). This backtest still
-walks DAILY bars and approximates the trigger with a daily-bar proxy, because
-that is the only history this dataset holds -- neither yfinance nor the
-Binance pagination here supplies years of 15m candles.
+    python -m backtest_suite.run_backtest --start-date 2026-06-15 --end-date 2026-07-15
+    python -m backtest_suite.run_backtest --start-date 2026-01-01 --end-date 2026-07-01 --asset-class crypto
+    python -m backtest_suite.run_backtest --start-date 2026-06-15 --end-date 2026-07-15 \
+        --interval 15m --exec-interval 5m --require-entry-touch --verbose
 
-It therefore no longer reproduces the live entry logic: it cannot see the
-15m reversal formation, the directional volume confirmation, or the
-precision-refined zones. It remains useful for exercising the structural
-primitives (htf_pass, stop/target construction, the R:R gate) against real
-price history, but its win rate is NOT an estimate of live intraday
-performance. Validating the intraday rules needs an intraday dataset.
+WHAT THIS NOW REPLAYS
+---------------------
+The previous version walked DAILY bars and approximated the live 15m trigger
+with a daily-bar proxy, so its win rate was explicitly not an estimate of live
+intraday performance. That gap is closed. This walks the trigger timeframe bar
+by bar and drives the REAL production functions -- `ta.mtfa.map_zones_top_down`
+for the top-down zone map, `ta.candles.detect_reversal_formation` for the
+trigger formation, `ta.candles.directional_volume_confirmation` for the
+mandatory volume proof, `ta.mtfa._ma_alignment_vote` for the 200 EMA vote, and
+`risk.risk_manager` for stops/targets and the R:R gate -- against point-in-time
+intraday frames. Nothing in this file re-implements a trading rule; it only
+replicates the macro *regime computation* (`_stock_regime`/`_crypto_regime`),
+because `macro.macro_analyzer`'s public functions always fetch "now" and are
+not parameterised by a historical instant.
 
+Gate order differs from `analyze_mtfa` and this is deliberate. Live, the zone
+map runs first; here the cheap trigger-frame gates (reversal formation,
+directional volume, Fib confluence) run first and the expensive zone map only
+on bars that already passed them. Every gate is an AND, so the accept/reject
+decision is identical -- it just avoids building a full weekly/daily/12h/4h/3h
+zone map on the ~99% of bars that could never have produced a trade anyway.
 
-Walks day-by-day through a historical window and, on each date T, feeds only
-data up to and including T into the *same* production structural building
-blocks used by the live pipeline: `ta.mtfa.htf_pass` (structure/OB/RSI
-divergence/zone-match), `ta.candles`/`ta.ta_engine.volume_spike` for the
-trigger check, and `risk.risk_manager` for stop/target construction and the
-R:R gate. The decision thresholds themselves still come from config.py, so
-there is a single source of truth for the rules.
+SCOPE BOUNDARIES (unchanged from the daily version, and still real)
+-------------------------------------------------------------------
+  1. The liquidity-heatmap bias is live-only: historical order-book snapshots
+     do not exist to backtest against. `screener._score_candidate` -- the same
+     function the live pipeline scores with -- runs unmodified against a
+     neutral placeholder `LiquidityContext`.
+  2. USDT.D / TOTAL-market-cap trend gating is live-only; no free historical
+     dominance or market-cap time series exists.
+  3. `earnings_hours_away` is passed as None on purpose. A real point-in-time
+     earnings calendar is not available for free, and using "today's" next
+     earnings date would leak the future into a historical decision.
+  4. Stock intraday history is capped by yfinance (~60 days at 15m/5m). Longer
+     stock windows get clamped, with a warning, and coarser bars substituted.
+     Crypto has no such limit.
 
-Two scope boundaries versus the live/paper-trading engine, both because this
-dataset only has historical *daily* OHLCV (see `ta_mtfa_backtest` docstring
-below for why):
-
-  1. HTF structure uses weekly/monthly bars resampled from the daily history
-     (same as live), but the ITF 12H/8H/4H/1H trigger cascade is approximated
-     by a single "trigger" pass directly on the daily bar itself -- Stage 7's
-     `detect_braking_event` still scans a multi-bar window for the same four
-     braking/reversal signatures the live path checks on 4H/1H, just applied
-     to daily bars, plus daily volume spike + daily 200MA alignment + daily
-     Fib golden zone -- instead of true intraday timeframes.
-  2. The liquidity-heatmap filter and the intraday emergency-reversal exit
-     are live/paper-trading-only features and are not simulated here --
-     historical order-book snapshots and intraday volume-anomaly candles
-     aren't available. `evaluate_setup`-equivalent scoring uses a neutral
-     placeholder `LiquidityContext` so `screener._score_candidate` (the same
-     function the live pipeline uses) still runs unmodified.
-
-Point-in-time macro regime (`_stock_regime` / `_crypto_regime`) mirrors
-macro_analyzer.py's SPY/QQQ and BTC/ETH trend rules, because macro_analyzer's
-public functions always fetch "now" data and aren't parameterized by a
-historical date. USDT.D/TOTAL-market-cap trend gating is also live-only (no
-free historical dominance/mcap time series exists to backtest against).
-
-Trades have no fixed holding-period cutoff -- `backtest_suite.simulator`
-walks each signal forward until it hits its stop, a target, or a dynamic
-trend-reversal exit, however long that takes. A trade still unresolved when
-the historical data runs out is reported OPEN (unrealized), not force-closed;
-`print_report` below excludes OPEN trades from win-rate/profit-factor math
-and reports them separately. See `simulator.py`'s module docstring for why a
-finite backtest can't mean "wait forever."
-
-Usage:
-    python -m backtest_suite.run_backtest --start-date 2026-05-01 --end-date 2026-07-01
-    python -m backtest_suite.run_backtest --start-date 2026-05-01 --end-date 2026-07-01 --asset-class crypto
+Trades have no fixed holding-period cutoff -- see `simulator.py`. One still
+unresolved when the data runs out is reported OPEN and excluded from every
+summary figure.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import sys
-from collections import defaultdict
-from pathlib import Path
+import time
 
 import pandas as pd
 
+import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
+
 from backtest_suite.historical_data import (
-    fetch_crypto_klines,
-    fetch_stock_history,
-    slice_upto,
-    trading_dates,
+    AssetData,
+    build_asset_data,
+    build_benchmark,
+    decision_time,
+    enough_history,
+    forward_bars,
+    signal_bars,
 )
-from backtest_suite.simulator import TradeOutcome, simulate_trade
+from backtest_suite.simulator import simulate_trade
 from config import (
     BACKTEST_TRADES_CSV,
     CRYPTO_BENCHMARK,
-    LTF_VOLUME_LOOKBACK,
-    LTF_VOLUME_SURGE_MULT,
+    DOLLAR_VOLUME_SMA_LOOKBACK,
+    LTF_ALIGNMENT_TFS,
+    LTF_CONFIRM_TFS,
+    LTF_MA_MIN_ALIGNED,
+    LTF_TRIGGER_TF,
     MIN_CRYPTO_DOLLAR_VOLUME_SMA20,
+    MIN_DAILY_HISTORY_BARS,
     MIN_STOCK_DOLLAR_VOLUME_SMA20,
+    PENDING_EXPIRY_HOURS,
     PRIMARY_MA_PERIOD,
     RS_LOOKBACK_DAYS,
     STOCK_BENCHMARKS,
@@ -93,12 +88,50 @@ from config import (
     WATCHLIST_CRYPTO,
     WATCHLIST_STOCKS,
 )
+from core.backtesting import (
+    FinerBarTieBreaker,
+    IntradayDataFeed,
+    TradeRecord,
+    compute_metrics,
+    export_trades_csv,
+    format_summary,
+    format_trade_log,
+    interval_of,
+    trades_to_dataframe,
+)
 from liquidity.orderbook import LiquidityContext
 from risk.risk_manager import compute_stop, compute_targets, position_size_estimate, validate_min_rr
 from screener.market_screener import Candidate, _dollar_volume_sma, _n_day_return, _score_candidate
 from strategy.strategy_engine import StrategyDecision, entry_zone
-from ta.mtfa import MTFASetup, detect_braking_event, fib_reaction, htf_pass, swing_excluding_recent
-from ta.ta_engine import add_moving_averages, atr, determine_trend, fibonacci_levels, volume_spike
+from ta.candles import detect_reversal_formation, directional_volume_confirmation
+from ta.divergence import DivergenceResult, rsi_divergence
+from ta.mtfa import (
+    MTFASetup,
+    _confirm_agreement,
+    _ma_alignment_vote,
+    _zone_frame_ok,
+    fib_reaction,
+    htf_volume_ratio,
+    map_zones_top_down,
+    swing_excluding_recent,
+)
+from ta.ta_engine import add_moving_averages, atr, determine_trend, fibonacci_levels
+
+# Trailing trigger bars handed to the CHEAP gates. Every one of them looks at
+# most ~63 bars back (the Fib swing lookback of 60 plus its 3-bar exclusion),
+# so 400 is comfortable slack while keeping the per-bar slice small on a
+# 100k-row intraday frame. The EXPENSIVE stage always gets the full slice,
+# because a 200-period EMA seeded 400 bars ago is measurably off.
+CHEAP_GATE_TAIL_BARS = 400
+
+_NEUTRAL_LIQUIDITY = LiquidityContext(
+    source="unavailable_backtest", above_notional=0.0, below_notional=0.0,
+    favored_direction=None, top_clusters=[],
+)
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr)
 
 
 def _within(price: float, a: float, b: float) -> bool:
@@ -110,9 +143,9 @@ def _within(price: float, a: float, b: float) -> bool:
 # Point-in-time macro regime (mirrors macro_analyzer.py's decision rules)
 # ---------------------------------------------------------------------------
 def _stock_regime(spy_slice: pd.DataFrame, qqq_slice: pd.DataFrame, vix_slice: pd.DataFrame) -> str:
-    spy_trend = determine_trend(add_moving_averages(spy_slice))
-    qqq_trend = determine_trend(add_moving_averages(qqq_slice))
-    vix_level = float(vix_slice["Close"].iloc[-1]) if not vix_slice.empty else 0.0
+    spy_trend = determine_trend(add_moving_averages(spy_slice)) if len(spy_slice) else "UNKNOWN"
+    qqq_trend = determine_trend(add_moving_averages(qqq_slice)) if len(qqq_slice) else "UNKNOWN"
+    vix_level = float(vix_slice["Close"].iloc[-1]) if len(vix_slice) else 0.0
 
     if vix_level >= VIX_HIGH_VOL:
         return "High Volatility"
@@ -124,8 +157,8 @@ def _stock_regime(spy_slice: pd.DataFrame, qqq_slice: pd.DataFrame, vix_slice: p
 
 
 def _crypto_regime(btc_slice: pd.DataFrame, eth_slice: pd.DataFrame) -> str:
-    btc_trend = determine_trend(add_moving_averages(btc_slice))
-    eth_trend = determine_trend(add_moving_averages(eth_slice))
+    btc_trend = determine_trend(add_moving_averages(btc_slice)) if len(btc_slice) else "UNKNOWN"
+    eth_trend = determine_trend(add_moving_averages(eth_slice)) if len(eth_slice) else "UNKNOWN"
 
     risk_on = True
     if len(btc_slice) > RS_LOOKBACK_DAYS:
@@ -143,8 +176,7 @@ def _crypto_regime(btc_slice: pd.DataFrame, eth_slice: pd.DataFrame) -> str:
 
 def _allowed_from_regime(regime: str) -> set[str]:
     """Mirrors `macro.macro_analyzer`'s Bullish->LONG / Bearish->SHORT /
-    else-both mapping (the USDT.D/SPY-QQQ correlation rule), without the
-    live-only USDT.D/TOTAL trend refinement."""
+    else-both mapping, without the live-only USDT.D/TOTAL refinement."""
     if regime == "Bullish":
         return {"LONG"}
     if regime == "Bearish":
@@ -153,84 +185,147 @@ def _allowed_from_regime(regime: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Point-in-time MTFA-equivalent signal: HTF pass (weekly/monthly resampled
-# from daily) + a daily-bar trigger proxy standing in for the live ITF cascade.
+# Stage 1 -- cheap, trigger-frame-only gates
 # ---------------------------------------------------------------------------
-def ta_mtfa_backtest(ticker: str, asset_class: str, sliced_daily: pd.DataFrame, allowed: set[str]) -> MTFASetup | None:
-    if len(sliced_daily) < 60:
+def _trigger_gates(trigger_tail: pd.DataFrame, direction: str) -> dict | None:
+    """The three hard gates that only need the trigger timeframe:
+    an explicit reversal FORMATION, MANDATORY directional volume confirmation
+    on that formation candle, and Fib containment or a 0.5/0.618 reaction.
+
+    Identical checks, and identical thresholds, to `ta.mtfa.analyze_mtfa`
+    steps 2/3/5 -- just evaluated before the expensive zone map instead of
+    after it. Returns the values the setup needs, or None on any rejection."""
+    if len(trigger_tail) < 30:
         return None
 
-    weekly = sliced_daily.resample("W").agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    ).dropna(subset=["Open", "High", "Low", "Close"])
-    monthly = sliced_daily.resample("ME").agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    ).dropna(subset=["Open", "High", "Low", "Close"])
-
-    htf = htf_pass(weekly, monthly)
-    if htf is None or htf["direction"] not in allowed:
+    found, pattern, conviction, bar_offset = detect_reversal_formation(trigger_tail, direction)
+    if not found:
         return None
 
-    direction = htf["direction"]
-
-    daily_ma = add_moving_averages(sliced_daily, periods=(PRIMARY_MA_PERIOD,))
-    ema200_val = daily_ma[f"EMA{PRIMARY_MA_PERIOD}"].iloc[-1]
-    if pd.isna(ema200_val):
-        return None
-    ema200 = float(ema200_val)
-    price = float(sliced_daily["Close"].iloc[-1])
-    ma_aligned = 1 if (
-        (direction == "LONG" and price >= ema200) or (direction == "SHORT" and price <= ema200)
-    ) else 0
-    if not ma_aligned:
+    formation_df = trigger_tail.iloc[: len(trigger_tail) - bar_offset]
+    volume_ok, volume_detail = directional_volume_confirmation(formation_df, direction)
+    if not volume_ok:
         return None
 
-    # Stage 7 zoom-in (daily-bar proxy -- no historical 4H/1H data exists to
-    # backtest against, see module scope-boundary note): scan the last few
-    # daily bars for a braking/reversal event via the same shared detector
-    # Stage 7 uses live on 4H/1H.
-    braking_found, braking_pattern = detect_braking_event(sliced_daily, direction)
-    if not braking_found:
-        return None
-
-    vol_ok, vol_ratio = volume_spike(sliced_daily, mult=LTF_VOLUME_SURGE_MULT, lookback=LTF_VOLUME_LOOKBACK)
-    if not vol_ok:
-        return None
-
-    hi2, lo2 = swing_excluding_recent(sliced_daily)
-    daily_fib = fibonacci_levels(hi2, lo2)
-    contained = _within(price, daily_fib["0.5"], daily_fib["0.786"])
-    reacted = fib_reaction(sliced_daily, daily_fib, direction)
+    price = float(trigger_tail["Close"].iloc[-1])
+    itf_hi, itf_lo = swing_excluding_recent(trigger_tail)
+    itf_fib = fibonacci_levels(itf_hi, itf_lo)
+    contained = _within(price, itf_fib["0.5"], itf_fib["0.786"])
+    reacted = fib_reaction(trigger_tail, itf_fib, direction)
     if not (contained or reacted):
         return None
 
-    atr_val = atr(sliced_daily).iloc[-1]
-    daily_atr = float(atr_val) if not pd.isna(atr_val) else None
+    return {
+        "pattern": pattern, "conviction": conviction, "volume_detail": volume_detail,
+        "fib": itf_fib, "swing_high": itf_hi, "swing_low": itf_lo,
+        "contained": contained, "price": price,
+    }
 
-    fib_note = "inside daily Fib golden zone" if contained else "reacted off daily 0.5/0.618 Fib level"
-    thesis = (
-        f"[BACKTEST] HTF ({htf['htf_trend']}, monthly {htf['monthly_trend']}) {htf['zone_type']} zone "
-        f"{htf['zone'][0]:.4g}-{htf['zone'][1]:.4g}; daily-bar trigger proxy: {braking_pattern} braking/reversal "
-        f"event on {vol_ratio}x volume, {fib_note}"
+
+# ---------------------------------------------------------------------------
+# Stage 2 -- full MTFA against point-in-time frames
+# ---------------------------------------------------------------------------
+def evaluate_intraday_setup(
+    ticker: str, asset_class: str, frames: dict[str, pd.DataFrame],
+    trigger_df: pd.DataFrame, trigger_tf: str, candidates: dict[str, dict],
+) -> MTFASetup | None:
+    """The historical equivalent of `ta.mtfa.analyze_mtfa`, reading pre-sliced
+    frames instead of calling the live fetchers.
+
+    `candidates` maps each direction that already cleared `_trigger_gates` to
+    that gate's output. Both zone maps are still computed regardless, because
+    live REJECTS a bar where price sits at both a support and a resistance
+    read with no daily trend to break the tie -- resolving only the
+    cheap-passing direction would quietly accept setups live would refuse.
+    """
+    if not candidates:
+        return None
+
+    price = next(iter(candidates.values()))["price"]
+
+    daily = frames.get("daily")
+    weekly = frames.get("weekly")
+    htf_trend = determine_trend(add_moving_averages(daily)) if _zone_frame_ok(daily) else "UNKNOWN"
+    higher_trend = determine_trend(add_moving_averages(weekly)) if _zone_frame_ok(weekly) else "UNKNOWN"
+    zone_volume_ratio = htf_volume_ratio(daily) if _zone_frame_ok(daily) else 0.0
+    divergence = rsi_divergence(daily) if _zone_frame_ok(daily) else DivergenceResult()
+
+    long_map = map_zones_top_down("LONG", price, frames)
+    short_map = map_zones_top_down("SHORT", price, frames)
+    if long_map and short_map:
+        if htf_trend == "UPTREND":
+            direction, zone_map = "LONG", long_map
+        elif htf_trend == "DOWNTREND":
+            direction, zone_map = "SHORT", short_map
+        else:
+            return None  # genuinely ambiguous location -- not worth trading intraday
+    elif long_map:
+        direction, zone_map = "LONG", long_map
+    elif short_map:
+        direction, zone_map = "SHORT", short_map
+    else:
+        return None
+
+    gate = candidates.get(direction)
+    if gate is None:
+        return None  # the zone map resolved to a direction the trigger did not confirm
+
+    ma_aligned_count = _ma_alignment_vote(direction, frames)
+    if ma_aligned_count < LTF_MA_MIN_ALIGNED:
+        return None
+
+    trigger_ma = add_moving_averages(trigger_df, periods=(PRIMARY_MA_PERIOD,))
+    ema200_val = trigger_ma[f"EMA{PRIMARY_MA_PERIOD}"].iloc[-1]
+    itf_ema200 = float(ema200_val) if not pd.isna(ema200_val) else None
+    atr_val = atr(trigger_df).iloc[-1]
+    itf_atr = float(atr_val) if not pd.isna(atr_val) else None
+
+    confirm_agreement = _confirm_agreement(direction, frames)
+    discovery_tfs = sorted({d["tf"] for d in zone_map["discovered"]})
+    refined_tfs = sorted({r["tf"] for r in zone_map["refined"]})
+    zone = zone_map["zone"]
+    volume_detail = gate["volume_detail"]
+
+    thesis_bits = [
+        f"[BACKTEST {trigger_tf}] Daily context {htf_trend} (weekly {higher_trend}); "
+        f"{zone_map['zone_type']} zone {zone[0]:.4g}-{zone[1]:.4g} discovered on "
+        f"{'/'.join(discovery_tfs)}" + (f", refined on {'/'.join(refined_tfs)}" if refined_tfs else "")
+    ]
+    if zone_map["ema200_anchor"] is not None:
+        thesis_bits.append(
+            f"price reacting at the {zone_map['ema200_anchor_tf']} {PRIMARY_MA_PERIOD} EMA "
+            f"({zone_map['ema200_anchor']:.4g})"
+        )
+    vol_word = "buyer volume surge" if direction == "LONG" else "seller volume expansion"
+    thesis_bits.append(f"{vol_word} {volume_detail['ratio']}x avg on the {trigger_tf} {gate['pattern']}")
+    fib_note = "inside Fib golden zone" if gate["contained"] else "reacted off 0.5/0.618 Fib level"
+    thesis_bits.append(
+        f"{ma_aligned_count}/{len(LTF_ALIGNMENT_TFS)} execution timeframes {PRIMARY_MA_PERIOD}MA-aligned, "
+        f"{confirm_agreement}/{len(LTF_CONFIRM_TFS)} confirmation frames agree, {fib_note}"
     )
 
     return MTFASetup(
         ticker=ticker, asset_class=asset_class, price=price, direction_bias=direction,
-        htf_trend=htf["htf_trend"], htf_zone_type=htf["zone_type"], htf_zone=htf["zone"],
-        divergence=htf["divergence"], order_blocks=htf["obs"],
-        nearest_support=htf["near"].get("nearest_support"), nearest_resistance=htf["near"].get("nearest_resistance"),
-        swing_high=htf["hi"], swing_low=htf["lo"], fib_levels=htf["fib"], monthly_trend=htf["monthly_trend"],
-        itf_trigger_tf="1d_proxy", itf_pattern=braking_pattern, itf_volume_ratio=vol_ratio,
-        itf_ma200_aligned_count=ma_aligned, itf_fib_levels=daily_fib, itf_ema200=ema200,
-        itf_atr=daily_atr, thesis=thesis, htf_volume_ratio=htf["htf_volume_ratio"],
+        htf_trend=htf_trend, htf_zone_type=zone_map["zone_type"], htf_zone=zone, divergence=divergence,
+        order_blocks=zone_map["order_blocks"], nearest_support=zone_map["nearest_support"],
+        nearest_resistance=zone_map["nearest_resistance"],
+        swing_high=zone_map["swing_high"], swing_low=zone_map["swing_low"],
+        fib_levels=zone_map["fib"], monthly_trend=higher_trend,
+        itf_trigger_tf=trigger_tf, itf_pattern=gate["pattern"],
+        itf_volume_ratio=volume_detail["ratio"], itf_ma200_aligned_count=ma_aligned_count,
+        itf_fib_levels=gate["fib"], itf_ema200=itf_ema200, itf_atr=itf_atr,
+        itf_swing_high=gate["swing_high"], itf_swing_low=gate["swing_low"],
+        thesis="; ".join(thesis_bits), htf_volume_ratio=zone_volume_ratio,
+        zone_tf=zone_map["zone_tf"], zone_discovery_tfs=discovery_tfs, zone_refined_tfs=refined_tfs,
+        reversal_conviction=gate["conviction"], ema200_anchor=zone_map["ema200_anchor"],
+        ema200_anchor_tf=zone_map["ema200_anchor_tf"], volume_detail=volume_detail,
+        confirm_agreement=confirm_agreement,
     )
 
 
-_NEUTRAL_LIQUIDITY = LiquidityContext(source="unavailable_backtest", above_notional=0.0, below_notional=0.0,
-                                       favored_direction=None, top_clusters=[])
-
-
 def build_backtest_decision(setup: MTFASetup) -> StrategyDecision | None:
+    """`strategy_engine.evaluate_setup`'s risk half, with the live-only
+    liquidity fetch replaced by a neutral placeholder."""
     direction = setup.direction_bias
     entry_low, entry_high = entry_zone(direction, setup.price)
     entry_price = (entry_low + entry_high) / 2
@@ -260,278 +355,287 @@ def build_backtest_decision(setup: MTFASetup) -> StrategyDecision | None:
 # ---------------------------------------------------------------------------
 # Backtest core loop
 # ---------------------------------------------------------------------------
+class _Replay:
+    """One asset class pass. Holds the per-class benchmarks and the caches that
+    keep daily-resolution work (regime, liquidity, relative strength) from
+    being recomputed on every intraday bar of every ticker."""
+
+    def __init__(self, feed: IntradayDataFeed, asset_class: str, start: dt.date, end: dt.date) -> None:
+        self.feed = feed
+        self.asset_class = asset_class
+        self._regime: dict[dt.date, str] = {}
+        self._bench_ret: dict[dt.date, float] = {}
+
+        if asset_class == "stocks":
+            _log("[backtest] loading SPY/QQQ/^VIX benchmark history...")
+            self.spy = build_benchmark(feed, STOCK_BENCHMARKS["default"], "stocks", start, end)
+            self.qqq = build_benchmark(feed, "QQQ", "stocks", start, end)
+            self.vix = build_benchmark(feed, "^VIX", "stocks", start, end)
+            self.bench = self.spy
+        else:
+            _log("[backtest] loading BTC/ETH benchmark history...")
+            self.btc = build_benchmark(feed, CRYPTO_BENCHMARK, "crypto", start, end)
+            self.eth = build_benchmark(feed, "ETHUSDT", "crypto", start, end)
+            self.bench = self.btc
+
+    def regime_at(self, at: pd.Timestamp) -> str:
+        """Macro regime is a DAILY read, so it is computed once per calendar
+        day and reused across that day's intraday bars -- recomputing 200-period
+        EMAs on three benchmarks for every 15m bar would dominate the runtime
+        and produce the same answer."""
+        day = at.date()
+        cached = self._regime.get(day)
+        if cached is not None:
+            return cached
+        if self.asset_class == "stocks":
+            regime = _stock_regime(self.spy.as_of(at), self.qqq.as_of(at), self.vix.as_of(at))
+        else:
+            regime = _crypto_regime(self.btc.as_of(at), self.eth.as_of(at))
+        self._regime[day] = regime
+        return regime
+
+    def benchmark_return(self, at: pd.Timestamp) -> float:
+        day = at.date()
+        cached = self._bench_ret.get(day)
+        if cached is not None:
+            return cached
+        value = _n_day_return(self.bench.as_of(at), RS_LOOKBACK_DAYS)
+        self._bench_ret[day] = value
+        return value
+
+
+def _liquidity_floor(asset_class: str) -> float:
+    return MIN_CRYPTO_DOLLAR_VOLUME_SMA20 if asset_class == "crypto" else MIN_STOCK_DOLLAR_VOLUME_SMA20
+
+
+def _replay_asset(
+    data: AssetData,
+    replay: _Replay,
+    start: dt.date,
+    end: dt.date,
+    notional: float,
+    enable_dynamic_exit: bool,
+    tie_breaker: FinerBarTieBreaker | None,
+    require_entry_touch: bool,
+) -> tuple[list[TradeRecord], int]:
+    """Walk one asset's trigger bars and simulate every signal it produces.
+
+    Returns (trades, unfilled) -- `unfilled` counts setups that were valid but
+    whose entry zone price never returned to, which only happens under
+    `--require-entry-touch`.
+    """
+    trades: list[TradeRecord] = []
+    unfilled = 0
+    trigger_pit = data.frames.get(data.trigger_interval)
+    if trigger_pit is None:
+        return trades, unfilled
+
+    floor = _liquidity_floor(data.asset_class)
+    entry_expiry = pd.Timedelta(hours=PENDING_EXPIRY_HOURS) if require_entry_touch else None
+    open_until: pd.Timestamp | None = None
+    daily_cache: dict[dt.date, tuple[float, float] | None] = {}
+
+    for bar_open in signal_bars(data.trigger, start, end):
+        at = decision_time(bar_open, data.trigger_interval)
+
+        # A position is still live on this ticker -- don't stack signals.
+        if open_until is not None and at <= open_until:
+            continue
+        if not enough_history(data, at):
+            continue
+
+        # --- daily-resolution context (liquidity floor + relative strength) ---
+        # Both are daily-bar measures in the live screener, so they are computed
+        # once per calendar day and reused across that day's intraday bars. The
+        # trade-off is that the current session's still-growing volume is read
+        # at the first bar of the day rather than continuously -- a liquidity
+        # FLOOR does not need per-bar resolution, and recomputing a 7-day SMA
+        # on every 15m bar would dominate the runtime.
+        day = at.date()
+        if day not in daily_cache:
+            daily_slice = data.daily.as_of(at)
+            if len(daily_slice) < MIN_DAILY_HISTORY_BARS:
+                daily_cache[day] = None
+            else:
+                daily_cache[day] = (
+                    _dollar_volume_sma(daily_slice, lookback=DOLLAR_VOLUME_SMA_LOOKBACK),
+                    _n_day_return(daily_slice, RS_LOOKBACK_DAYS),
+                )
+        context = daily_cache[day]
+        if context is None:
+            continue
+        dollar_volume, asset_ret = context
+        if dollar_volume < floor:
+            continue
+
+        allowed = _allowed_from_regime(replay.regime_at(at))
+
+        # --- Stage 1: cheap trigger-frame gates ---
+        cut = trigger_pit.cutoff_position(at)
+        tail = data.trigger.iloc[max(0, cut - CHEAP_GATE_TAIL_BARS):cut]
+        candidates = {}
+        for direction in ("LONG", "SHORT"):
+            if direction not in allowed:
+                continue
+            gate = _trigger_gates(tail, direction)
+            if gate is not None:
+                candidates[direction] = gate
+        if not candidates:
+            continue
+
+        # --- Stage 2: full point-in-time MTFA ---
+        frames = data.frames.frames_at(at)
+        setup = evaluate_intraday_setup(
+            data.ticker, data.asset_class, frames,
+            data.trigger.iloc[:cut], data.trigger_interval, candidates,
+        )
+        if setup is None:
+            continue
+
+        decision = build_backtest_decision(setup)
+        if decision is None:
+            continue
+
+        rs_pct = (asset_ret - replay.benchmark_return(at)) * 100
+        score, breakdown = _score_candidate(decision, dollar_volume, rs_pct, None)
+        candidate = Candidate(
+            ticker=data.ticker, asset_class=data.asset_class, score=score, decision=decision,
+            dollar_volume=dollar_volume, rs_pct=rs_pct, earnings_hours_away=None, breakdown=breakdown,
+        )
+
+        trade = simulate_trade(
+            forward_bars(data.execution, at), data.ticker, data.asset_class,
+            decision.direction, at, decision.entry_low, decision.entry_high,
+            decision.stop, decision.target1, decision.target2, candidate.score,
+            interval=data.exec_interval, notional=notional,
+            reversal_df=data.trigger, reversal_interval=data.trigger_interval,
+            enable_dynamic_exit=enable_dynamic_exit, tie_breaker=tie_breaker,
+            require_entry_touch=require_entry_touch, entry_expiry=entry_expiry,
+        )
+        if trade is None:
+            unfilled += 1
+            continue
+
+        trades.append(trade)
+        open_until = trade.exit_time
+
+    return trades, unfilled
+
+
 def run_backtest(
     start: dt.date,
     end: dt.date,
     asset_class: str = "both",
+    interval: str = LTF_TRIGGER_TF,
+    exec_interval: str | None = None,
     max_tickers: int | None = None,
     enable_dynamic_exit: bool = True,
-) -> list[TradeOutcome]:
-    outcomes: list[TradeOutcome] = []
+    require_entry_touch: bool = False,
+    notional: float = 1000.0,
+    cache_dir: str | None = None,
+    cache_format: str = "auto",
+    offline: bool = False,
+    tie_break_interval: str | None = None,
+    tickers: list[str] | None = None,
+) -> list[TradeRecord]:
+    feed = IntradayDataFeed(cache_dir=cache_dir, cache_format=cache_format, offline=offline)
+    exec_interval = exec_interval or interval
+
+    tie_breaker = None
+    if tie_break_interval:
+        tie_breaker = FinerBarTieBreaker(
+            loader=lambda sym, cls, s, e: feed.get_candles(sym, cls, tie_break_interval, s, e),
+            interval_delta=interval_of(exec_interval).delta,
+        )
+
+    outcomes: list[TradeRecord] = []
     classes = ["stocks", "crypto"] if asset_class == "both" else [asset_class]
 
     for cls in classes:
-        if cls == "stocks":
-            watchlist = WATCHLIST_STOCKS[:max_tickers] if max_tickers else WATCHLIST_STOCKS
-            print(f"[backtest] Fetching {len(watchlist)} stock histories + SPY/QQQ/VIX benchmarks...", file=sys.stderr)
-            spy_df = fetch_stock_history(STOCK_BENCHMARKS["default"], start, end)
-            qqq_df = fetch_stock_history("QQQ", start, end)
-            vix_df = fetch_stock_history("^VIX", start, end)
-            asset_dfs = {t: fetch_stock_history(t, start, end) for t in watchlist}
-            calendar_df = spy_df
+        if tickers:
+            watchlist = list(tickers)
         else:
-            watchlist = WATCHLIST_CRYPTO[:max_tickers] if max_tickers else WATCHLIST_CRYPTO
-            print(f"[backtest] Fetching {len(watchlist)} crypto histories + BTC/ETH benchmarks...", file=sys.stderr)
-            btc_df = fetch_crypto_klines(CRYPTO_BENCHMARK, start, end)
-            eth_df = fetch_crypto_klines("ETHUSDT", start, end)
-            asset_dfs = {s: fetch_crypto_klines(s, start, end) for s in watchlist}
-            calendar_df = btc_df
+            watchlist = WATCHLIST_STOCKS if cls == "stocks" else WATCHLIST_CRYPTO
+        if max_tickers:
+            watchlist = watchlist[:max_tickers]
 
-        dates = trading_dates(calendar_df, start, end)
-        print(f"[backtest] Replaying {len(dates)} trading days for {cls}...", file=sys.stderr)
+        _log(f"[backtest] === {cls}: {len(watchlist)} tickers, {interval} signals, "
+             f"{exec_interval} execution, {start} -> {end} ===")
+        replay = _Replay(feed, cls, start, end)
 
-        open_until: dict[str, pd.Timestamp] = {}  # ticker -> last date its open trade still runs
+        started = time.time()
+        class_trades = 0
+        class_unfilled = 0
+        for n, ticker in enumerate(watchlist, 1):
+            data = build_asset_data(feed, ticker, cls, start, end, interval, exec_interval)
+            if data is None or not data.usable:
+                _log(f"[backtest] ({n}/{len(watchlist)}) {ticker}: no usable intraday history, skipped")
+                continue
+            trades, unfilled = _replay_asset(
+                data, replay, start, end, notional, enable_dynamic_exit, tie_breaker, require_entry_touch,
+            )
+            outcomes.extend(trades)
+            class_trades += len(trades)
+            class_unfilled += unfilled
+            _log(f"[backtest] ({n}/{len(watchlist)}) {ticker}: {len(data.trigger)} {interval} bars, "
+                 f"{len(trades)} trade(s)" + (f", {unfilled} unfilled" if unfilled else ""))
 
-        for T in dates:
-            if cls == "stocks":
-                regime = _stock_regime(slice_upto(spy_df, T), slice_upto(qqq_df, T), slice_upto(vix_df, T))
-            else:
-                regime = _crypto_regime(slice_upto(btc_df, T), slice_upto(eth_df, T))
-            allowed = _allowed_from_regime(regime)
+        elapsed = time.time() - started
+        _log(f"[backtest] {cls}: {class_trades} trade(s)"
+             + (f", {class_unfilled} setup(s) never filled" if class_unfilled else "")
+             + f" in {elapsed:.0f}s")
 
-            bench_slice = slice_upto(spy_df if cls == "stocks" else btc_df, T)
-            bench_ret = _n_day_return(bench_slice, RS_LOOKBACK_DAYS)
-
-            for ticker, full_df in asset_dfs.items():
-                if full_df.empty:
-                    continue
-                if ticker in open_until and T <= open_until[ticker]:
-                    continue  # a trade on this ticker is still live; don't stack signals
-
-                sliced = slice_upto(full_df, T)
-                if len(sliced) < 60:
-                    continue  # not enough warmup history yet for this historical date
-
-                dollar_volume = _dollar_volume_sma(sliced)
-                liquidity_floor = MIN_CRYPTO_DOLLAR_VOLUME_SMA20 if cls == "crypto" else MIN_STOCK_DOLLAR_VOLUME_SMA20
-                if dollar_volume < liquidity_floor:
-                    continue
-
-                setup = ta_mtfa_backtest(ticker, cls, sliced, allowed)
-                if setup is None:
-                    continue
-
-                decision = build_backtest_decision(setup)
-                if decision is None:
-                    continue
-
-                asset_ret = _n_day_return(sliced, RS_LOOKBACK_DAYS)
-                rs_pct = (asset_ret - bench_ret) * 100
-
-                # earnings_hours_away is intentionally None: a real point-in-time
-                # earnings calendar isn't available for free, and using "today's"
-                # next-earnings date here would leak future information.
-                score, breakdown = _score_candidate(decision, dollar_volume, rs_pct, None)
-                candidate = Candidate(
-                    ticker=ticker, asset_class=cls, score=score, decision=decision,
-                    dollar_volume=dollar_volume, rs_pct=rs_pct,
-                    earnings_hours_away=None, breakdown=breakdown,
-                )
-
-                trade = simulate_trade(
-                    full_df, ticker, cls, decision.direction, T,
-                    decision.entry_low, decision.entry_high, decision.stop,
-                    decision.target1, decision.target2, candidate.score,
-                    enable_dynamic_exit=enable_dynamic_exit,
-                )
-                outcomes.append(trade)
-                # exit_date is always set now (OPEN trades use the last available
-                # bar), so the ticker stays blocked from a new signal for as long
-                # as its position is still open -- including indefinitely, if it
-                # never resolved before the backtest's data ran out.
-                open_until[ticker] = trade.exit_date
-
-        print(f"[backtest] {cls}: {sum(1 for o in outcomes if o.asset_class == cls)} signals generated", file=sys.stderr)
-
+    _log(f"[backtest] {feed.download_count} provider download(s) this run "
+         f"(everything else served from {feed.cache.root})")
+    if tie_breaker is not None:
+        _log(f"[backtest] intrabar tie-breaker: {tie_breaker.resolved} resolved from {tie_break_interval} "
+             f"candles, {tie_breaker.unresolved} fell back to stop-first")
     return outcomes
 
 
 # ---------------------------------------------------------------------------
-# Metrics & report
+# CLI
 # ---------------------------------------------------------------------------
-def print_report(outcomes: list[TradeOutcome], start: dt.date, end: dt.date) -> None:
-    print("\n" + "=" * 64)
-    print(f"BACKTEST REPORT  |  {start} -> {end}  |  no fixed holding-period cutoff")
-    print("=" * 64)
-
-    total = len(outcomes)
-    if total == 0:
-        print("No signals were generated in this window.")
-        return
-
-    # Only RESOLVED trades (WIN/LOSS -- an actual stop/target/reversal exit)
-    # feed win-rate/profit-factor. OPEN trades are unrealized marks against
-    # the last available close, not a completed result -- mixing them into
-    # "win rate" would be misleading in either direction.
-    resolved = [o for o in outcomes if o.is_resolved]
-    open_trades = [o for o in outcomes if not o.is_resolved]
-
-    if not resolved:
-        print(f"Total Signals Generated : {total}  (0 resolved -- all still OPEN, see below)")
-    else:
-        # Win/loss is based on realized P&L (`is_profitable`), not the exit-
-        # mechanism label -- a trade that exits on a trend-reversal signal (or
-        # hits breakeven after TP1) with positive P&L is still a win.
-        # `tag`/`combined_outcome()` remain available for *how* trades exited,
-        # kept separate from *whether* they were profitable.
-        wins = [o for o in resolved if o.is_profitable]
-        losses = [o for o in resolved if not o.is_profitable]
-        win_rate = len(wins) / len(resolved) * 100
-
-        gross_profit = sum(o.pnl_pct for o in resolved if o.pnl_pct > 0)
-        gross_loss = abs(sum(o.pnl_pct for o in resolved if o.pnl_pct < 0))
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
-        strategy_return = sum(o.pnl_pct for o in resolved)
-
-        print(f"Total Signals Generated : {total}  ({len(resolved)} resolved, {len(open_trades)} still OPEN)")
-        print(f"Win Rate (resolved)     : {win_rate:.1f}%  ({len(wins)} profitable / {len(losses)} unprofitable)")
-        pf_str = "inf (no losses)" if profit_factor == float("inf") else f"{profit_factor:.2f}"
-        print(f"Profit Factor           : {pf_str}")
-        print(f"Strategy Return (sum)   : {strategy_return:+.2f}%  (resolved trades only, equal-weighted, non-compounded)")
-
-        print("\n--- Exit Reason Breakdown (resolved trades) ---")
-        by_tag: dict[str, list[TradeOutcome]] = defaultdict(list)
-        for o in resolved:
-            by_tag[o.tag].append(o)
-        for tag, trades in sorted(by_tag.items(), key=lambda kv: -len(kv[1])):
-            n = len(trades)
-            profitable = sum(1 for t in trades if t.is_profitable)
-            avg_pnl = sum(t.pnl_pct for t in trades) / n
-            avg_days = sum(t.days_held for t in trades) / n
-            print(f"  {tag:<16}{n:>4} trades   {profitable}/{n} profitable   avg PnL {avg_pnl:>+6.2f}%   avg hold {avg_days:.0f}d")
-
-        print("\n--- Per-Asset Performance (resolved trades) ---")
-        by_ticker: dict[str, list[TradeOutcome]] = defaultdict(list)
-        for o in resolved:
-            by_ticker[o.ticker].append(o)
-
-        rows = []
-        for ticker, trades in by_ticker.items():
-            n = len(trades)
-            w = sum(1 for t in trades if t.is_profitable)
-            wr = w / n * 100
-            avg_pnl = sum(t.pnl_pct for t in trades) / n
-            rows.append((ticker, trades[0].asset_class, n, w, wr, avg_pnl))
-
-        rows.sort(key=lambda r: (-r[4], -r[2]))
-        print(f"{'Ticker':<10}{'Class':<8}{'Trades':<8}{'Wins':<6}{'WinRate':<10}{'AvgPnL%':<10}")
-        for ticker, cls, n, w, wr, avg_pnl in rows:
-            print(f"{ticker:<10}{cls:<8}{n:<8}{w:<6}{wr:>6.1f}%   {avg_pnl:>+7.2f}%")
-
-    if open_trades:
-        avg_open_pnl = sum(o.pnl_pct for o in open_trades) / len(open_trades)
-        print(f"\n--- Still OPEN at end of available data ({len(open_trades)} positions, unrealized avg PnL {avg_open_pnl:+.2f}%) ---")
-        for o in sorted(open_trades, key=lambda o: o.signal_date):
-            print(
-                f"  {o.ticker:<10}({o.asset_class:<6}) {o.direction:<5} signaled {o.signal_date.strftime('%Y-%m-%d')}, "
-                f"still open as of {o.exit_date.strftime('%Y-%m-%d')}  unrealized PnL {o.pnl_pct:+.2f}%"
-            )
-
-    print("=" * 64 + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Itemized trade log: terminal (--verbose) + CSV export (always)
-# ---------------------------------------------------------------------------
-_CSV_COLUMNS = [
-    "signal_date", "ticker", "asset_class", "direction",
-    "entry_price", "entry_low", "entry_high",
-    "initial_stop_loss", "stop_loss_at_exit", "target1", "target2",
-    "exit_date", "exit_price", "outcome", "pnl_pct", "days_held", "score",
-]
-
-
-def _log_row(o: TradeOutcome) -> dict:
-    return {
-        "signal_date": o.signal_date.strftime("%Y-%m-%d"),
-        "ticker": o.ticker,
-        "asset_class": o.asset_class,
-        "direction": o.direction,
-        "entry_price": round(o.entry_price, 6),
-        "entry_low": round(o.entry_low, 6),
-        "entry_high": round(o.entry_high, 6),
-        # `initial_stop_loss` is the original structural stop at signal time;
-        # `stop_loss_at_exit` is whatever was active when the trade closed
-        # (the breakeven price, once TP1 has triggered) -- these differ for
-        # any trade that reached PARTIAL_TP1, by design (Breakeven Adjustment).
-        "initial_stop_loss": round(o.initial_stop, 6),
-        "stop_loss_at_exit": round(o.stop, 6),
-        "target1": round(o.target1, 6),
-        "target2": round(o.target2, 6),
-        "exit_date": o.exit_date.strftime("%Y-%m-%d") if o.exit_date is not None else "",
-        "exit_price": round(o.exit_price, 6),
-        "outcome": o.combined_outcome(),
-        "pnl_pct": o.pnl_pct,
-        "days_held": o.days_held,
-        "score": o.score,
-    }
-
-
-def print_trade_log(outcomes: list[TradeOutcome]) -> None:
-    """Itemized per-trade log for --verbose runs: one entry per signal with
-    trigger date, direction, entry/stop/targets, exit, and outcome/PnL."""
-    if not outcomes:
-        return
-
-    ordered = sorted(outcomes, key=lambda o: o.signal_date)
-
-    print("--- Trade Log " + "-" * 49)
-    for o in ordered:
-        exit_date_str = o.exit_date.strftime("%Y-%m-%d") if o.exit_date is not None else "n/a"
-        print(
-            f"[{o.signal_date.strftime('%Y-%m-%d')}] {o.ticker:<10}({o.asset_class:<6}) "
-            f"{o.direction:<5} | Entry {o.entry_price:,.4f}  Stop {o.initial_stop:,.4f}  "
-            f"TP1 {o.target1:,.4f}  TP2 {o.target2:,.4f}"
-        )
-        print(
-            f"    Exit {exit_date_str} @ {o.exit_price:,.4f}  ->  {o.combined_outcome():<9}  "
-            f"PnL {o.pnl_pct:+.2f}%  ({o.days_held}d held, score {o.score})"
-        )
-    print("-" * 64 + "\n")
-
-
-def export_trades_csv(outcomes: list[TradeOutcome], path: Path | None = None) -> Path:
-    """Write every simulated trade to runtime/backtest/trades_log_livne.csv
-    (sorted chronologically) so results can be cross-referenced against
-    historical charts (e.g. TradingView) or analyzed in a spreadsheet. The
-    path comes from config so this output lands in the shared runtime/ tree
-    rather than inside the source package, and so Steve reads exactly the
-    file this writes."""
-    if path is None:
-        path = Path(BACKTEST_TRADES_CSV)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    ordered = sorted(outcomes, key=lambda o: o.signal_date)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS)
-        writer.writeheader()
-        for o in ordered:
-            writer.writerow(_log_row(o))
-
-    return path
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Historical backtest of the market analysis pipeline's signal logic")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Intraday historical backtest of the Livne pipeline's signal logic",
+    )
     parser.add_argument("--start-date", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end-date", required=True, help="YYYY-MM-DD")
     parser.add_argument("--asset-class", choices=["stocks", "crypto", "both"], default="both")
-    parser.add_argument("--max-tickers", type=int, default=None, help="Limit watchlist size per class (for faster test runs)")
-    parser.add_argument("--verbose", action="store_true", help="Print an itemized trade-by-trade log to the terminal")
+    parser.add_argument("--interval", default=LTF_TRIGGER_TF,
+                        help=f"signal/trigger timeframe (default {LTF_TRIGGER_TF}, matching the live model)")
+    parser.add_argument("--exec-interval", default=None,
+                        help="timeframe open positions are managed on; finer than --interval gives more "
+                             "precise exit timestamps and fewer ambiguous same-bar stop/target collisions "
+                             "(default: same as --interval)")
+    parser.add_argument("--tickers", default=None,
+                        help="comma-separated symbols to test instead of the config watchlist")
+    parser.add_argument("--max-tickers", type=int, default=None,
+                        help="limit watchlist size per class (for faster test runs)")
+    parser.add_argument("--require-entry-touch", action="store_true",
+                        help="only fill a trade if price actually trades into the entry zone within "
+                             f"{PENDING_EXPIRY_HOURS}h, as the live paper tracker requires (default: assume "
+                             "a fill at the entry-zone midpoint on the trigger bar's close)")
     parser.add_argument("--disable-dynamic-exit", action="store_true",
-                         help="Disable the trend-reversal+volume early exit, using only the stop/target levels "
-                              "(useful for A/B-comparing the two exit policies). Trades still have no fixed "
-                              "holding-period cutoff either way.")
+                        help="disable the trend-reversal+volume early exit, using only stop/target levels")
+    parser.add_argument("--tie-break-interval", default=None,
+                        help="finer interval (e.g. 1m) used to decide which of a stop and a target that "
+                             "both sit inside one execution bar triggered first (default: assume the stop)")
+    parser.add_argument("--capital", type=float, default=10_000.0,
+                        help="starting capital used for ROI and drawdown (default 10000)")
+    parser.add_argument("--notional", type=float, default=1_000.0,
+                        help="fixed position size per trade in currency; no compounding or leverage "
+                             "is modelled (default 1000)")
+    parser.add_argument("--data-dir", default=None, help="candle cache directory (default <repo>/data)")
+    parser.add_argument("--cache-format", choices=["auto", "parquet", "csv"], default="auto")
+    parser.add_argument("--offline", action="store_true",
+                        help="never hit the network; run purely from cached candles")
+    parser.add_argument("--csv-out", default=None, help=f"trade-log destination (default {BACKTEST_TRADES_CSV})")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print the full trade-by-trade log to the terminal")
+    parser.add_argument("--max-log-rows", type=int, default=60,
+                        help="cap terminal trade-log rows without --verbose (default 60)")
     args = parser.parse_args()
 
     start = dt.date.fromisoformat(args.start_date)
@@ -540,17 +644,36 @@ def main():
         parser.error("--start-date must be before --end-date")
 
     outcomes = run_backtest(
-        start, end, args.asset_class, args.max_tickers,
+        start, end,
+        asset_class=args.asset_class,
+        interval=args.interval,
+        exec_interval=args.exec_interval,
+        max_tickers=args.max_tickers,
         enable_dynamic_exit=not args.disable_dynamic_exit,
+        require_entry_touch=args.require_entry_touch,
+        notional=args.notional,
+        cache_dir=args.data_dir,
+        cache_format=args.cache_format,
+        offline=args.offline,
+        tie_break_interval=args.tie_break_interval,
+        tickers=[t.strip().upper() for t in args.tickers.split(",")] if args.tickers else None,
     )
 
-    if args.verbose:
-        print_trade_log(outcomes)
+    trades = trades_to_dataframe(outcomes)
 
-    print_report(outcomes, start, end)
+    print("\n--- Trade Log (all timestamps UTC) " + "-" * 39)
+    print(format_trade_log(trades, max_rows=None if args.verbose else args.max_log_rows))
 
-    csv_path = export_trades_csv(outcomes)
-    print(f"[backtest] Trade log exported to {csv_path}", file=sys.stderr)
+    metrics = compute_metrics(trades, initial_capital=args.capital)
+    exec_tf = args.exec_interval or args.interval
+    print(format_summary(
+        metrics,
+        title=f"LIVNE INTRADAY BACKTEST  |  {start} -> {end}  |  "
+              f"{args.interval} signals / {exec_tf} execution",
+    ))
+
+    csv_path = export_trades_csv(trades, args.csv_out or BACKTEST_TRADES_CSV)
+    _log(f"[backtest] trade log exported to {csv_path}")
 
 
 if __name__ == "__main__":

@@ -23,6 +23,13 @@ python-dotenv>=1.0
 # --- Excel journals + funnel diagnostics ---------------------------------
 openpyxl>=3.1
 
+# --- Backtest candle cache (core/backtesting) ----------------------------
+# Optional but strongly recommended: with a Parquet engine installed the
+# intraday candle cache stores Parquet instead of CSV, which is several times
+# smaller and much faster to load for the 100k+ row frames a long intraday
+# backtest needs. Without it everything still works, just on CSV.
+pyarrow>=14.0
+
 # --- Chart rendering (core/charting) -------------------------------------
 plotly>=5.18,<6
 kaleido==0.2.1

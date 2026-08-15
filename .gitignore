@@ -24,6 +24,25 @@ runtime/*/*
 runtime/cache/*/*
 !runtime/cache/*/.gitkeep
 
+# --- Backtest candle cache -----------------------------------------------
+# core/backtesting downloads intraday OHLCV here once and reuses it across
+# runs and across both models. It is pure derived data (re-downloadable from
+# Binance/Yahoo at any time) and gets large fast -- a year of 5m candles for
+# one crypto watchlist is millions of rows.
+data/
+
 # --- Generated reports / narratives --------------------------------------
 mail/reports/
 agents/steve/narrative_*.md
+
+# --- Backup archives ------------------------------------------------------
+# scripts/backup_manager.py writes timestamped .zip snapshots here. They are
+# large, they duplicate content git already versions, and a `full` archive
+# deliberately contains the repo-root .env -- committing one would push the
+# Telegram bot token straight into history. The directory skeleton is kept via
+# .gitkeep so a fresh clone has somewhere to write.
+backups/*
+!backups/.gitkeep
+!backups/*/
+backups/*/*
+!backups/*/.gitkeep

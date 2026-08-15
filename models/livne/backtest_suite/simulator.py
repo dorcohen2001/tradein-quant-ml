@@ -1,66 +1,67 @@
-"""Trade execution logic & outcome tracker.
+"""Intraday trade execution logic & outcome tracker.
 
-Given a signal (direction, entry zone, stop, target1, target2) generated on a
-historical date T, walks forward through the real subsequent daily bars and
-grades the trade per the same multi-tier TP1(50%)/breakeven/TP2 lifecycle the
-live paper tracker (`paper_trading.tracker`) uses:
+Given a signal produced at instant T, this walks forward through the real
+subsequent INTRADAY bars and grades the trade through the same multi-tier
+TP1(50%)/breakeven/TP2 lifecycle the live paper tracker
+(`paper_trading.tracker`) uses.
 
-  - ACTIVE: LONG WINs the TP1 leg if High >= Target1 before Low <= Stop (SHORT
-    mirrored). Hitting Stop before Target1 is a full-size LOSS ("SL").
-  - Once TP1 triggers, `TP1_CLOSE_PCT` of the position is booked at Target1
-    and the stop for the remainder moves to breakeven (with the same
-    slippage buffer used live). State becomes PARTIAL_TP1.
-  - PARTIAL_TP1: the remaining size exits either at the breakeven stop
-    ("TP1_SL_BE") or at Target2 ("TP1_TP2"). P&L is the size-weighted blend
-    of both legs.
-  - On any bar where neither the stop nor a target was hit, a *dynamic*
-    trend-reversal exit is checked: an opposing candlestick pattern, a fresh
-    break of the recent swing extreme, or a MACD histogram cross -- combined
-    with abnormal volume vs. its N-day average -- closes the (remaining)
-    position at that bar's close ("TREND_REVERSAL").
+THE INTRADAY CHANGE
+-------------------
+Stops and targets are evaluated against each bar's HIGH and LOW, not its
+Close, and on intraday bars rather than daily ones. That is not a refinement,
+it is a correctness fix: a 15m candle that opens at 100, wicks to 97 and
+closes at 101 HAS taken out a stop at 98. A close-only or daily-only
+simulator books that bar as a win the trade never had. Exit timestamps are
+consequently precise to the execution bar, and the worst unrealised mark the
+position ever reached (its maximum adverse excursion, usually an intraday
+wick) is recorded with its own timestamp.
 
-There is no fixed-duration forced closure. A trade stays open, bar by bar,
-for as long as historical data exists and none of the above conditions have
-fired -- previous versions of this module force-closed any unresolved trade
-after a fixed `max_days` (originally 10), which is gone. What replaces it is
-NOT "the trade waits forever": a finite backtest dataset has a real edge (the
-requested `end` date plus `historical_data.FORWARD_CALENDAR_DAYS` of
-subsequent bars, itself bounded by how much history actually exists). A trade
-that is still unresolved when that edge is reached is reported as **OPEN**
-(tag `END_OF_DATA`) -- an honest "don't know yet," not a fabricated win or
-loss. `TradeOutcome.is_resolved` distinguishes OPEN from an actual exit;
-`is_profitable` (P&L sign) is only meaningful for resolved trades, and
-`run_backtest.print_report` excludes OPEN trades from win-rate/profit-factor
-math for exactly that reason -- an unrealized mark-to-last-close is not a
-realized result.
+LIFECYCLE
+---------
+  ACTIVE       LONG takes the TP1 leg if High >= Target1 before Low <= Stop
+               (SHORT mirrored). Stop first is a full-size LOSS ("SL").
+  -> on TP1    `TP1_CLOSE_PCT` of the position books at Target1 and the stop
+               for the remainder moves to breakeven (with the same slippage
+               buffer used live). State becomes PARTIAL_TP1.
+  PARTIAL_TP1  The remainder exits at the breakeven stop ("TP1_SL_BE") or at
+               Target2 ("TP1_TP2"). P&L is the size-weighted blend of both legs.
+  any bar      When neither stop nor target was touched, a dynamic trend-
+               reversal exit is checked on the TRIGGER timeframe: an opposing
+               braking/reversal event or a MACD histogram cross, combined with
+               abnormal volume, closes the remaining position at that bar's
+               close ("TREND_REVERSAL").
 
-Same-day ambiguity (a single daily bar's range covers both the stop and a
-target) is resolved conservatively in favor of the stop -- daily OHLCV has no
-intrabar sequencing, so assuming the adverse outcome avoids overstating the
-win rate. The dynamic-exit check only runs when neither the stop nor a target
-was hit that same bar, so it never overrides a harder price-level event.
+There is no fixed holding-period cutoff. A trade that is still unresolved when
+the historical data runs out is reported OPEN (tag `END_OF_DATA`) -- an honest
+"don't know yet", not a fabricated win or loss. `TradeRecord.resolved`
+distinguishes the two and every summary metric excludes the unresolved ones.
 
-Known scope boundary: this backtest only has historical daily OHLCV. It
-cannot replicate the live/paper-trading-only liquidity-heatmap bias or the
-intraday emergency-reversal exit (both need data this dataset doesn't have:
-historical order-book snapshots and intraday volume-anomaly candles). The
-dynamic exit above is a *daily-bar* analogue of that live mechanism, using
-the same data this backtest already has.
+INTRABAR ORDERING
+-----------------
+One bar whose range covers both the stop and a target cannot, on its own, say
+which was touched first. Default policy is the conservative one -- assume the
+stop -- because that is the only assumption that cannot flatter the win rate.
+Running with a finer `--exec-interval` shrinks the ambiguous set (a 5m bar is
+ambiguous far less often than a 15m one), and an optional
+`core.backtesting.FinerBarTieBreaker` resolves what remains from finer candles
+where they exist. See `core/backtesting/engine.py`.
 
-Known simplification: the trade is assumed FILLED at the entry-zone midpoint
-on the signal date — the simulator never requires price to actually touch the
-entry zone first. Because entry zones sit within ~0.5% of the signal price
-this is usually harmless, but it slightly flatters results vs. the live paper
-tracker (which requires a real entry-zone touch before a trade goes ACTIVE).
-Keep this in mind when comparing backtest and live win rates.
+ENTRY FILL
+----------
+By default the trade is assumed FILLED at the entry-zone midpoint at the
+trigger bar's close -- the same simplification the daily version made, kept so
+results stay comparable. It slightly flatters results versus the live tracker,
+which requires a real entry-zone touch first. `require_entry_touch=True` now
+models that properly (it needs intraday bars to be meaningful, which is why it
+could not exist before): the order rests until price actually trades into the
+zone, and expires unfilled after `entry_expiry`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pandas as pd
 
-from backtest_suite.historical_data import forward_window
+import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
+
 from config import (
     DYNAMIC_EXIT_CONTEXT_BARS,
     DYNAMIC_EXIT_VOLUME_LOOKBACK,
@@ -68,18 +69,20 @@ from config import (
     MAX_SLIPPAGE_PCT,
     TP1_CLOSE_PCT,
 )
+from core.backtesting import ExcursionTracker, TradeRecord, apply_slippage, hits, interval_of, pnl_pct
+from core.backtesting.engine import resolve_same_bar
 from ta.mtfa import detect_braking_event
 from ta.ta_engine import macd, volume_spike
+
+# The dynamic-exit reversal check is the one per-bar cost that is not O(1), so
+# it runs at most once per TRIGGER bar even when the position is being managed
+# on a finer execution interval -- a reversal "signal" recomputed every 5m
+# against 15m structure would fire on the same formation three times anyway.
+MIN_REVERSAL_CONTEXT_BARS = 2
 
 
 def _opposite(direction: str) -> str:
     return "SHORT" if direction == "LONG" else "LONG"
-
-
-def _pnl_pct(direction: str, entry_price: float, exit_price: float) -> float:
-    if direction == "LONG":
-        return (exit_price / entry_price - 1) * 100
-    return (entry_price / exit_price - 1) * 100
 
 
 def _trend_reversal_signal(window: pd.DataFrame, direction: str) -> bool:
@@ -90,7 +93,7 @@ def _trend_reversal_signal(window: pd.DataFrame, direction: str) -> bool:
     what closes a LONG (and vice versa). A MACD histogram cross is kept as an
     independent additional condition on top of the four braking-event
     signatures (pin-bar rejection, classic pattern, volume climax, MSS)."""
-    if len(window) < 2:
+    if len(window) < MIN_REVERSAL_CONTEXT_BARS:
         return False
 
     braking_hit, _pattern = detect_braking_event(window, _opposite(direction))
@@ -107,181 +110,223 @@ def _trend_reversal_signal(window: pd.DataFrame, direction: str) -> bool:
 
 def _dynamic_exit_signal(window: pd.DataFrame, direction: str) -> tuple[bool, float]:
     """Trend-reversal signal combined with an abnormal-volume bar (spec: 1.5x
-    - 2.0x the N-day average). `window` should already be trimmed to a bounded
-    trailing context (see `DYNAMIC_EXIT_CONTEXT_BARS`) -- this is re-evaluated
-    on every open bar of a trade that may now run for months, so an unbounded
-    from-inception window would make a single trade's simulation cost grow
-    quadratically with how long it stays open."""
+    - 2.0x the N-bar average). `window` is already trimmed to a bounded
+    trailing context (`DYNAMIC_EXIT_CONTEXT_BARS`) -- this is re-evaluated on
+    every trigger bar of a trade that may run for days, so an unbounded
+    from-inception window would make one trade's cost grow quadratically with
+    how long it stays open."""
     if not _trend_reversal_signal(window, direction):
         return False, 0.0
     vol_ok, ratio = volume_spike(window, mult=DYNAMIC_EXIT_VOLUME_MULT, lookback=DYNAMIC_EXIT_VOLUME_LOOKBACK)
     return vol_ok, ratio
 
 
-@dataclass
-class TradeOutcome:
-    ticker: str
-    asset_class: str
-    direction: str
-    signal_date: pd.Timestamp
-    entry_low: float
-    entry_high: float
-    entry_price: float
-    stop: float           # stop ACTIVE at exit time (breakeven-adjusted once TP1 hits -- see `initial_stop`)
-    initial_stop: float   # the original structural stop at signal time, never mutated
-    target1: float
-    target2: float
-    exit_date: pd.Timestamp
-    exit_price: float
-    outcome: str   # WIN / LOSS / OPEN
-    tag: str       # SL / TP1_SL_BE / TP1_TP2 / TREND_REVERSAL / END_OF_DATA
-    tp1_hit: bool
-    pnl_pct: float
-    days_held: int
-    score: float
+def _blend(direction: str, entry_price: float, tp1_price: float, exit_price: float) -> float:
+    """Size-weighted P&L across the two legs of a position that banked TP1."""
+    leg1 = pnl_pct(direction, entry_price, tp1_price)
+    leg2 = pnl_pct(direction, entry_price, exit_price)
+    return TP1_CLOSE_PCT * leg1 + (1 - TP1_CLOSE_PCT) * leg2
 
-    def combined_outcome(self) -> str:
-        """Single-token label for logs/CSV: WIN_TP1_TP2, WIN_TP1_SL_BE,
-        WIN_TREND_REVERSAL, LOSS_SL, or OPEN_END_OF_DATA."""
-        return f"{self.outcome}_{self.tag}"
 
-    @property
-    def is_resolved(self) -> bool:
-        """False for OPEN/END_OF_DATA -- the position was still live when the
-        backtest ran out of historical data, so there's no realized result
-        yet. `pnl_pct` on an unresolved trade is an unrealized mark-to-last-
-        close, not a completed trade's P&L."""
-        return self.outcome in ("WIN", "LOSS")
+def _resolve_entry(
+    bars: pd.DataFrame, direction: str, entry_low: float, entry_high: float,
+    signal_time: pd.Timestamp, expiry: pd.Timedelta | None,
+) -> tuple[pd.Timestamp, float, int] | None:
+    """Find the bar on which an order into [entry_low, entry_high] would actually
+    have filled. Returns (fill_time, fill_price, bar_position), or None if price
+    never traded into the zone before the order expired.
 
-    @property
-    def is_profitable(self) -> bool:
-        """Whether this trade should count as a "win" for performance
-        reporting, regardless of *how* it exited -- a trade that exits on a
-        trend-reversal signal (or hits breakeven after TP1) with positive
-        P&L is still a win. Only meaningful for resolved trades; callers
-        should filter on `is_resolved` first (see `run_backtest.print_report`)."""
-        return self.pnl_pct > 0
+    The fill price is the first price INSIDE the zone the market actually
+    traded at on that bar:
+
+      * the bar opened inside the zone -- which is the normal case on the
+        signal bar itself, since `strategy_engine.entry_zone` builds the zone
+        around the trigger price -- so it fills at the open;
+      * the bar opened above the zone and fell into it, so it fills at the
+        zone's upper edge;
+      * the bar opened below and rose into it, so it fills at the lower edge.
+
+    Deliberately direction-agnostic: which edge fills is decided by where price
+    came FROM, not by whether the position is long or short.
+    """
+    deadline = signal_time + expiry if expiry is not None else None
+    for pos, (ts, row) in enumerate(bars.iterrows()):
+        if deadline is not None and ts > deadline:
+            return None
+        low, high = float(row["Low"]), float(row["High"])
+        if high < entry_low or low > entry_high:
+            continue
+        open_px = float(row["Open"])
+        if open_px > entry_high:
+            fill = entry_high
+        elif open_px < entry_low:
+            fill = entry_low
+        else:
+            fill = open_px
+        return ts, float(fill), pos
+    return None
 
 
 def simulate_trade(
-    full_df: pd.DataFrame,
+    exec_df: pd.DataFrame,
     ticker: str,
     asset_class: str,
     direction: str,
-    signal_date: pd.Timestamp,
+    signal_time: pd.Timestamp,
     entry_low: float,
     entry_high: float,
     stop: float,
     target1: float,
     target2: float,
     score: float,
+    interval: str,
+    notional: float = 1000.0,
+    reversal_df: pd.DataFrame | None = None,
+    reversal_interval: str | None = None,
     enable_dynamic_exit: bool = True,
-) -> TradeOutcome:
-    entry_price = (entry_low + entry_high) / 2
+    tie_breaker=None,
+    require_entry_touch: bool = False,
+    entry_expiry: pd.Timedelta | None = None,
+) -> TradeRecord | None:
+    """Walk `exec_df` forward from `signal_time` and grade the trade.
+
+    `exec_df` is the interval the position is MANAGED on (finer than the
+    signal interval if you want tighter exit timestamps); `reversal_df` is the
+    trigger-timeframe frame the dynamic exit reads its structure from.
+
+    Returns None only when `require_entry_touch` is set and price never
+    returned to the entry zone -- a setup that never became a position.
+    """
+    forward = exec_df.loc[exec_df.index >= pd.Timestamp(signal_time)]
+    exec_delta = interval_of(interval).delta
+
+    # --- entry ------------------------------------------------------------
+    if require_entry_touch:
+        filled = _resolve_entry(forward, direction, entry_low, entry_high, signal_time, entry_expiry)
+        if filled is None:
+            return None
+        entry_time, entry_price, start_pos = filled
+        # The fill bar stays in the walk: a bar that dipped into the entry zone
+        # and kept going can genuinely take the stop out on that same bar, and
+        # dropping it would quietly discard those losses.
+        walk = forward.iloc[start_pos:]
+    else:
+        entry_price = (entry_low + entry_high) / 2
+        entry_time = pd.Timestamp(signal_time)
+        walk = forward
+
     initial_stop = stop
-    breakeven_price = entry_price * (1 + MAX_SLIPPAGE_PCT) if direction == "LONG" else entry_price * (1 - MAX_SLIPPAGE_PCT)
-    future = forward_window(full_df, signal_date)  # unbounded: every available bar after signal_date
+    breakeven_price = apply_slippage(entry_price, direction, MAX_SLIPPAGE_PCT, adverse=False)
+    excursion = ExcursionTracker(direction, entry_price)
+
+    # Trigger-frame context for the dynamic exit, plus a cursor so the check
+    # runs once per trigger bar rather than once per execution bar.
+    rev_df = reversal_df if reversal_df is not None else exec_df
+    rev_delta = interval_of(reversal_interval or interval).delta
+    rev_index = rev_df.index
+    last_rev_pos = -1
 
     state = "ACTIVE"
-    tp1_exit_price: float | None = None
-    outcome = tag = exit_price = exit_date = None
-    pnl_pct = None
+    tp1_price: float | None = None
+    outcome = tag = None
+    exit_price = exit_time = None
+    result_pct = None
 
-    for ts, row in future.iterrows():
-        hi, lo = float(row["High"]), float(row["Low"])
+    for ts, row in walk.iterrows():
+        excursion.update(ts, row)
+        # Bars are stamped with their OPEN time, but an exit is only KNOWN to
+        # have happened once the bar completes. Exits are therefore timestamped
+        # at the bar's close: a level touched somewhere inside the bar is
+        # reported at the first instant it is certain, and a close-based exit
+        # (trend reversal) is reported at the close it was decided on. The
+        # alternative -- stamping the open -- prints trades that exit zero
+        # minutes after they were entered.
+        bar_close = ts + exec_delta
+        active_stop = stop if state == "ACTIVE" else breakeven_price
 
-        if state == "ACTIVE":
-            if direction == "LONG":
-                hit_stop, hit_t1, hit_t2 = lo <= stop, hi >= target1, hi >= target2
+        stop_hit = hits(row, direction, active_stop, "stop")
+        t1_hit = hits(row, direction, target1, "target") if state == "ACTIVE" else False
+        t2_hit = hits(row, direction, target2, "target")
+
+        if stop_hit and (t1_hit or t2_hit):
+            # Both sides of the trade printed inside one bar. Ask the finer
+            # data which came first; without it, assume the stop.
+            first = resolve_same_bar(
+                tie_breaker, ticker, asset_class, ts, direction,
+                active_stop, target2 if t2_hit else target1,
+            )
+            if first == "target":
+                stop_hit = False
+
+        if stop_hit:
+            fill = apply_slippage(active_stop, direction, MAX_SLIPPAGE_PCT, adverse=True)
+            if state == "ACTIVE":
+                result_pct = pnl_pct(direction, entry_price, fill)
+                outcome, tag = "LOSS", "SL"
             else:
-                hit_stop, hit_t1, hit_t2 = hi >= stop, lo <= target1, lo <= target2
+                result_pct = _blend(direction, entry_price, tp1_price, fill)
+                outcome, tag = ("WIN" if result_pct >= 0 else "LOSS"), "TP1_SL_BE"
+            exit_price, exit_time = fill, bar_close
+            break
 
-            if hit_stop:
-                # Same-day ambiguity (the daily range covers both the stop
-                # and a target) is resolved conservatively in favor of the
-                # stop, regardless of what else the range also touched.
-                fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-                outcome, tag, exit_price, exit_date = "LOSS", "SL", fill, ts
-                pnl_pct = _pnl_pct(direction, entry_price, fill)
-                break
-            if hit_t2:
-                # Gapped through both targets in one bar -- credit both legs.
-                pnl1 = _pnl_pct(direction, entry_price, target1)
-                pnl2 = _pnl_pct(direction, entry_price, target2)
-                pnl_pct = TP1_CLOSE_PCT * pnl1 + (1 - TP1_CLOSE_PCT) * pnl2
-                outcome, tag, exit_price, exit_date = "WIN", "TP1_TP2", target2, ts
-                break
-            if hit_t1:
-                tp1_exit_price = target1
-                state = "PARTIAL_TP1"
-                stop = breakeven_price  # Breakeven Adjustment
-                continue
+        if t2_hit:
+            # Reaching TP2 credits both legs, whether TP1 was banked on an
+            # earlier bar or the same bar gapped straight through both.
+            result_pct = _blend(direction, entry_price, tp1_price if tp1_price else target1, target2)
+            outcome, tag, exit_price, exit_time = "WIN", "TP1_TP2", target2, bar_close
+            break
 
-            if enable_dynamic_exit:
-                window = full_df.loc[:ts].tail(DYNAMIC_EXIT_CONTEXT_BARS)
+        if t1_hit:
+            tp1_price = target1
+            state = "PARTIAL_TP1"
+            stop = breakeven_price  # Breakeven Adjustment
+            continue
+
+        if enable_dynamic_exit:
+            # Only re-check once a NEW trigger bar has closed.
+            rev_pos = int(rev_index.searchsorted(bar_close - rev_delta, side="right"))
+            if rev_pos > last_rev_pos and rev_pos >= MIN_REVERSAL_CONTEXT_BARS:
+                last_rev_pos = rev_pos
+                window = rev_df.iloc[max(0, rev_pos - DYNAMIC_EXIT_CONTEXT_BARS):rev_pos]
                 reversal, _ratio = _dynamic_exit_signal(window, direction)
                 if reversal:
                     exit_p = float(row["Close"])
-                    pnl_pct = _pnl_pct(direction, entry_price, exit_p)
-                    outcome = "WIN" if pnl_pct >= 0 else "LOSS"
-                    tag, exit_price, exit_date = "TREND_REVERSAL", exit_p, ts
+                    if state == "ACTIVE":
+                        result_pct = pnl_pct(direction, entry_price, exit_p)
+                    else:
+                        result_pct = _blend(direction, entry_price, tp1_price, exit_p)
+                    outcome = "WIN" if result_pct >= 0 else "LOSS"
+                    tag, exit_price, exit_time = "TREND_REVERSAL", exit_p, bar_close
                     break
 
-        elif state == "PARTIAL_TP1":
-            hit_stop = lo <= breakeven_price if direction == "LONG" else hi >= breakeven_price
-            hit_t2 = hi >= target2 if direction == "LONG" else lo <= target2
-
-            if hit_stop:
-                fill = breakeven_price * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else breakeven_price * (1 + MAX_SLIPPAGE_PCT)
-                pnl1 = _pnl_pct(direction, entry_price, tp1_exit_price)
-                pnl2 = _pnl_pct(direction, entry_price, fill)
-                pnl_pct = TP1_CLOSE_PCT * pnl1 + (1 - TP1_CLOSE_PCT) * pnl2
-                outcome = "WIN" if pnl_pct >= 0 else "LOSS"
-                tag, exit_price, exit_date = "TP1_SL_BE", fill, ts
-                break
-            if hit_t2:
-                pnl1 = _pnl_pct(direction, entry_price, tp1_exit_price)
-                pnl2 = _pnl_pct(direction, entry_price, target2)
-                pnl_pct = TP1_CLOSE_PCT * pnl1 + (1 - TP1_CLOSE_PCT) * pnl2
-                outcome, tag, exit_price, exit_date = "WIN", "TP1_TP2", target2, ts
-                break
-
-            if enable_dynamic_exit:
-                window = full_df.loc[:ts].tail(DYNAMIC_EXIT_CONTEXT_BARS)
-                reversal, _ratio = _dynamic_exit_signal(window, direction)
-                if reversal:
-                    exit_p = float(row["Close"])
-                    pnl1 = _pnl_pct(direction, entry_price, tp1_exit_price)
-                    pnl2 = _pnl_pct(direction, entry_price, exit_p)
-                    pnl_pct = TP1_CLOSE_PCT * pnl1 + (1 - TP1_CLOSE_PCT) * pnl2
-                    outcome = "WIN" if pnl_pct >= 0 else "LOSS"
-                    tag, exit_price, exit_date = "TREND_REVERSAL", exit_p, ts
-                    break
-
-    if outcome is None:
-        # Ran out of historical data (or the signal fell on the very last
-        # available bar) without ever hitting a stop, target, or reversal --
-        # the position is still open, not force-closed. `pnl_pct` here is an
-        # unrealized mark against the last available close.
-        if len(future) == 0:
-            exit_price, exit_date = entry_price, signal_date
+    resolved = outcome is not None
+    if not resolved:
+        # Ran out of historical data without hitting a stop, a target or a
+        # reversal. The position is still open, not force-closed; `pnl_pct`
+        # here is an unrealised mark against the last available close.
+        if len(walk) == 0:
+            exit_price, exit_time = entry_price, entry_time
         else:
-            exit_price, exit_date = float(future["Close"].iloc[-1]), future.index[-1]
+            exit_price, exit_time = float(walk["Close"].iloc[-1]), walk.index[-1] + exec_delta
         if state == "PARTIAL_TP1":
-            pnl1 = _pnl_pct(direction, entry_price, tp1_exit_price)
-            pnl2 = _pnl_pct(direction, entry_price, exit_price)
-            pnl_pct = TP1_CLOSE_PCT * pnl1 + (1 - TP1_CLOSE_PCT) * pnl2
+            result_pct = _blend(direction, entry_price, tp1_price, exit_price)
         else:
-            pnl_pct = _pnl_pct(direction, entry_price, exit_price)
+            result_pct = pnl_pct(direction, entry_price, exit_price)
         outcome, tag = "OPEN", "END_OF_DATA"
 
-    days_held = (future.index.get_loc(exit_date) + 1) if exit_date in future.index else 0
-
-    return TradeOutcome(
-        ticker=ticker, asset_class=asset_class, direction=direction, signal_date=signal_date,
-        entry_low=entry_low, entry_high=entry_high, entry_price=entry_price,
-        stop=stop, initial_stop=initial_stop, target1=target1, target2=target2,
-        exit_date=exit_date, exit_price=exit_price,
-        outcome=outcome, tag=tag, tp1_hit=(tp1_exit_price is not None),
-        pnl_pct=round(pnl_pct, 3), days_held=days_held, score=score,
+    return TradeRecord(
+        ticker=ticker, asset_class=asset_class, direction=direction, interval=interval,
+        entry_time=entry_time, entry_price=entry_price,
+        exit_time=exit_time, exit_price=float(exit_price),
+        exit_tag=tag, outcome=outcome, resolved=resolved,
+        pnl_pct=round(float(result_pct), 3), notional=notional,
+        initial_stop=initial_stop,
+        # `initial_stop` is the structural stop at signal time; `stop_at_exit`
+        # is whatever was active when the trade closed -- the breakeven price
+        # once TP1 has triggered. They differ for any trade that reached
+        # PARTIAL_TP1, by design (Breakeven Adjustment).
+        stop_at_exit=stop,
+        target1=target1, target2=target2, tp1_hit=tp1_price is not None,
+        mae_pct=excursion.mae_pct, mfe_pct=excursion.mfe_pct, mae_time=excursion.mae_time,
+        score=score,
     )

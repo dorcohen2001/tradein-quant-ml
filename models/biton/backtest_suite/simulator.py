@@ -1,131 +1,147 @@
-"""Trade execution logic & outcome tracker.
+"""Intraday trade execution logic & outcome tracker (Biton).
 
-Given a signal (direction, entry zone, stop, target1, target2) generated on a
-historical date T, walks forward through the real subsequent daily bars and
-grades the trade WIN / LOSS / EXPIRED per the spec:
+Biton's lifecycle is the older single-shot one and is preserved exactly:
 
-  - LONG:  WIN if High >= Target1 before Low <= Stop.  LOSS if Stop hit first.
-  - SHORT: WIN if Low  <= Target1 before High >= Stop.  LOSS if Stop hit first.
-  - Neither hit within `max_days` -> close at the final day's close (EXPIRED).
+  - LONG:  WIN once High >= Target1 before Low <= Stop.  LOSS if Stop first.
+  - SHORT: WIN once Low  <= Target1 before High >= Stop.  LOSS if Stop first.
+  - Once Target1 is hit the trade is already a WIN; scanning continues only to
+    see whether Target2 is also reached. The stop is assumed moved to
+    breakeven after TP1, so no further loss risk is tracked -- exactly as
+    before.
+  - Nothing hit within the maximum holding period -> closed at that bar's
+    close (tag `MAX_HOLD`).
 
-Same-day ambiguity (a single daily bar's range covers both the stop and a
-target) is resolved conservatively in favor of the stop -- daily OHLCV has no
-intrabar sequencing, so assuming the adverse outcome avoids overstating the
-win rate.
+WHAT THE INTRADAY UPGRADE CHANGES
+---------------------------------
+Only the resolution, not the rules. Stops and targets are evaluated against
+each INTRADAY bar's High and Low rather than daily ones, so an exit is dated
+to the bar it actually happened on instead of to a whole session, and a wick
+through the stop is no longer invisible. The holding cap is expressed in HOURS
+rather than in daily bars, because "10 bars" means ten very different things
+at 5m and at 1d; `MAX_HOLD_HOURS` below is the direct equivalent of the old
+`max_days=10` default.
 
-Once Target1 is hit the trade is already a WIN; scanning continues only to
-see whether Target2 is also reached within the remaining window (the stop is
-assumed moved to breakeven after TP1, so no further loss risk is tracked).
+Same-bar ambiguity (one bar's range covering both the stop and a target) is
+resolved conservatively in favour of the stop, since a single OHLC bar cannot
+say which came first. A finer `--exec-interval` makes it rarer and an optional
+`core.backtesting.FinerBarTieBreaker` resolves the rest from finer candles.
 
-Known simplification: the trade is assumed FILLED at the entry-zone midpoint
-on the signal date — the simulator never requires price to actually touch the
-entry zone first. Because entry zones sit within ~0.5% of the signal price
-this is usually harmless, but it slightly flatters results vs. the live paper
-tracker (which requires a real entry-zone touch before a trade goes ACTIVE).
-Keep this in mind when comparing backtest and live win rates.
+Known simplification, unchanged: the trade is assumed FILLED at the entry-zone
+midpoint at the signal bar's close -- the simulator does not require price to
+touch the entry zone first. Entry zones sit within ~0.5% of the signal price
+so this is usually harmless, but it slightly flatters results versus the live
+paper tracker, which requires a real entry-zone touch before a trade goes
+ACTIVE. Keep it in mind when comparing backtest and live win rates.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pandas as pd
 
-from backtest_suite.historical_data import forward_window
+import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
+
 from config import MAX_SLIPPAGE_PCT
+from core.backtesting import ExcursionTracker, TradeRecord, apply_slippage, hits, interval_of, pnl_pct
+from core.backtesting.engine import resolve_same_bar
 
-
-@dataclass
-class TradeOutcome:
-    ticker: str
-    asset_class: str
-    direction: str
-    signal_date: pd.Timestamp
-    entry_low: float
-    entry_high: float
-    entry_price: float
-    stop: float
-    target1: float
-    target2: float
-    exit_date: pd.Timestamp
-    exit_price: float
-    outcome: str   # WIN / LOSS / EXPIRED
-    tag: str       # TP1 / TP2 / SL / TIMEOUT
-    pnl_pct: float
-    days_held: int
-    score: float
-
-    def combined_outcome(self) -> str:
-        """Single-token label for logs/CSV: WIN_TP1, WIN_TP2, LOSS_SL, or EXPIRED."""
-        if self.outcome in ("WIN", "LOSS"):
-            return f"{self.outcome}_{self.tag}"
-        return self.outcome
+# The intraday equivalent of the old `max_days=10` cutoff: ten calendar days.
+MAX_HOLD_HOURS = 240
 
 
 def simulate_trade(
-    full_df: pd.DataFrame,
+    exec_df: pd.DataFrame,
     ticker: str,
     asset_class: str,
     direction: str,
-    signal_date: pd.Timestamp,
+    signal_time: pd.Timestamp,
     entry_low: float,
     entry_high: float,
     stop: float,
     target1: float,
     target2: float,
     score: float,
-    max_days: int = 10,
-) -> TradeOutcome:
+    interval: str,
+    notional: float = 1000.0,
+    max_hold_hours: float = MAX_HOLD_HOURS,
+    tie_breaker=None,
+) -> TradeRecord:
     entry_price = (entry_low + entry_high) / 2
-    future = forward_window(full_df, signal_date, max_days)
+    entry_time = pd.Timestamp(signal_time)
+    exec_delta = interval_of(interval).delta
+    deadline = entry_time + pd.Timedelta(hours=max_hold_hours) if max_hold_hours else None
 
-    outcome = tag = exit_price = exit_date = None
+    walk = exec_df.loc[exec_df.index >= entry_time]
+    excursion = ExcursionTracker(direction, entry_price)
+
+    outcome = tag = None
+    exit_price = exit_time = None
     tp1_locked = False
 
-    for ts, row in future.iterrows():
-        hi, lo = float(row["High"]), float(row["Low"])
+    for ts, row in walk.iterrows():
+        excursion.update(ts, row)
+        # Bars are stamped with their OPEN time; an exit is only KNOWN once the
+        # bar completes, so exits are timestamped at the bar's close.
+        bar_close = ts + exec_delta
 
-        if direction == "LONG":
-            hit_stop, hit_t1, hit_t2 = lo <= stop, hi >= target1, hi >= target2
-        else:
-            hit_stop, hit_t1, hit_t2 = hi >= stop, lo <= target1, lo <= target2
+        stop_hit = hits(row, direction, stop, "stop") and not tp1_locked
+        t1_hit = hits(row, direction, target1, "target")
+        t2_hit = hits(row, direction, target2, "target")
 
-        if not tp1_locked:
-            if hit_stop:
-                # A stop-loss becomes a market order once triggered - model a
-                # small amount of adverse slippage instead of a perfect fill,
-                # consistent with the live paper tracker.
-                fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-                outcome, tag, exit_price, exit_date = "LOSS", "SL", fill, ts
-                break
-            if hit_t2:
-                outcome, tag, exit_price, exit_date = "WIN", "TP2", target2, ts
-                break
-            if hit_t1:
-                tp1_locked = True
-                outcome, tag, exit_price, exit_date = "WIN", "TP1", target1, ts
-                continue
-        elif hit_t2:
-            tag, exit_price, exit_date = "TP2", target2, ts
+        if stop_hit and (t1_hit or t2_hit):
+            first = resolve_same_bar(
+                tie_breaker, ticker, asset_class, ts, direction,
+                stop, target2 if t2_hit else target1,
+            )
+            if first == "target":
+                stop_hit = False
+
+        if stop_hit:
+            # A stop-loss becomes a market order once triggered -- model a
+            # small amount of adverse slippage instead of a perfect fill,
+            # consistent with the live paper tracker.
+            fill = apply_slippage(stop, direction, MAX_SLIPPAGE_PCT, adverse=True)
+            outcome, tag, exit_price, exit_time = "LOSS", "SL", fill, bar_close
             break
 
-    if outcome is None:
-        if len(future) == 0:
-            exit_price, exit_date = entry_price, signal_date
+        if t2_hit:
+            outcome, tag, exit_price, exit_time = "WIN", "TP2", target2, bar_close
+            break
+
+        if t1_hit and not tp1_locked:
+            # Already a win. Keep walking only to see whether TP2 also prints;
+            # the stop is assumed at breakeven from here, so the loss branch
+            # above is disabled for the rest of the walk.
+            tp1_locked = True
+            outcome, tag, exit_price, exit_time = "WIN", "TP1", target1, bar_close
+            continue
+
+        if deadline is not None and bar_close >= deadline and not tp1_locked:
+            exit_p = float(row["Close"])
+            result = pnl_pct(direction, entry_price, exit_p)
+            outcome = "WIN" if result >= 0 else "LOSS"
+            tag, exit_price, exit_time = "MAX_HOLD", exit_p, bar_close
+            break
+
+    resolved = outcome is not None
+    if not resolved:
+        # Ran out of historical data before the trade resolved or timed out.
+        # Reported OPEN with an unrealised mark, not force-closed -- every
+        # summary metric excludes it.
+        if len(walk) == 0:
+            exit_price, exit_time = entry_price, entry_time
         else:
-            exit_price, exit_date = float(future["Close"].iloc[-1]), future.index[-1]
-        outcome, tag = "EXPIRED", "TIMEOUT"
+            exit_price, exit_time = float(walk["Close"].iloc[-1]), walk.index[-1] + exec_delta
+        outcome, tag = "OPEN", "END_OF_DATA"
 
-    if direction == "LONG":
-        pnl_pct = (exit_price - entry_price) / entry_price * 100
-    else:
-        pnl_pct = (entry_price - exit_price) / entry_price * 100
+    result_pct = pnl_pct(direction, entry_price, float(exit_price))
 
-    days_held = (future.index.get_loc(exit_date) + 1) if exit_date in future.index else 0
-
-    return TradeOutcome(
-        ticker=ticker, asset_class=asset_class, direction=direction, signal_date=signal_date,
-        entry_low=entry_low, entry_high=entry_high, entry_price=entry_price,
-        stop=stop, target1=target1, target2=target2,
-        exit_date=exit_date, exit_price=exit_price,
-        outcome=outcome, tag=tag, pnl_pct=round(pnl_pct, 3), days_held=days_held, score=score,
+    return TradeRecord(
+        ticker=ticker, asset_class=asset_class, direction=direction, interval=interval,
+        entry_time=entry_time, entry_price=entry_price,
+        exit_time=exit_time, exit_price=float(exit_price),
+        exit_tag=tag, outcome=outcome, resolved=resolved,
+        pnl_pct=round(float(result_pct), 3), notional=notional,
+        initial_stop=stop, stop_at_exit=(entry_price if tp1_locked else stop),
+        target1=target1, target2=target2, tp1_hit=tp1_locked,
+        mae_pct=excursion.mae_pct, mfe_pct=excursion.mfe_pct, mae_time=excursion.mae_time,
+        score=score,
     )
