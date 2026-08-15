@@ -203,6 +203,30 @@ a `config.py` deriving its paths from `get_model("<key>")`, and a
 `live_runner.py` exposing `--once`. Registered-but-missing directories are
 skipped with a warning rather than crashing the supervisor.
 
+## Catch-up after downtime
+
+Position management polls: each cycle tests stops and targets against the range
+traded since the last poll. If the runner is stopped and restarted hours later,
+that comparison would only cover the last few minutes — a stop breached
+overnight would never be seen, and whatever exit eventually fired would be
+stamped with the restart time rather than when the level was actually crossed.
+
+`core/paper_trading/catch_up.py` closes that. Before each live refresh, any open
+position whose last check is older than `min_gap_minutes` has the missed window
+replayed **bar by bar** (5m bars) through the *same* `apply_bar` the live loop
+uses — so a fill, stop or target is graded at the level and the minute it really
+happened. Resolutions are reported as **one consolidated summary**, not a burst
+of delayed exit alerts that would read as if they were happening now.
+
+It costs nothing when healthy: at a 2-minute cycle the gap is ~2 min, far under
+the 30-minute floor, so no historical bar is ever fetched. Tunable per model via
+`CATCH_UP_CONFIG` in its `config.py`.
+
+Not replayed: Livne's emergency reversal exit. It keys off a volume anomaly
+rather than a price level and is live-only by design (the backtest does not
+simulate it either) — replaying it would invent exits the live system would not
+have taken.
+
 ## Pausing a model
 
 Set `enabled=False` on its registry entry. That model then stops being

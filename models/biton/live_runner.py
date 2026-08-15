@@ -55,12 +55,19 @@ from core.reporting.summary import (
     weekly_report_due,
 )
 from core.news.news_analyzer import analyze_sentiment
+from core.paper_trading.catch_up import format_catch_up_summary
 from core.utils.chart_attachment import generate_chart_for_setup
 from core.utils.market_hours import is_market_open
 from core.utils.telegram_notifier import escape_markdown, escape_markdown_code, send_telegram_message, send_telegram_photo
 from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
-from paper_trading.tracker import get_all_trades, has_open_trade, log_trade, update_open_positions
+from paper_trading.tracker import (
+    catch_up_open_positions,
+    get_all_trades,
+    has_open_trade,
+    log_trade,
+    update_open_positions,
+)
 from screener.funnel_diagnostics import export_funnel_report, run_diagnostics
 from screener.market_screener import scan_crypto, scan_stocks
 from utils.data_fetch import get_binance_klines, get_stock_history
@@ -111,6 +118,35 @@ def _format_status_update(trade: dict) -> str:
         if trade.get("pnl_pct") is not None:
             lines.append(f"P&L: *{trade['pnl_pct']:+.2f}%*")
     return "\n".join(lines)
+
+
+def process_catch_up() -> None:
+    """Replay price action missed while this runner was stopped, then report it
+    as ONE consolidated message.
+
+    Deliberately not per-trade alerts. A runner that was down overnight can come
+    back to several resolutions at once, and firing that many delayed
+    "EXIT ALERT" messages would read as if they were all happening right now --
+    actively misleading in a channel people trade from. One clearly-labelled
+    summary carrying the real crossing timestamps says what actually happened.
+
+    Costs nothing at steady state: with a healthy cadence every open trade was
+    checked one cycle ago, so the gap check short-circuits before any historical
+    fetch (see core.paper_trading.catch_up.gap_window).
+    """
+    report = catch_up_open_positions()
+    if not report.events:
+        return
+
+    print(f"[catch-up] {len(report.events)} transition(s) across "
+          f"{report.trades_replayed} position(s), {report.bars_replayed} bars replayed",
+          file=sys.stderr)
+
+    message = format_catch_up_summary(MODEL_NAME, report)
+    if message:
+        result = send_telegram_message(message, route=TELEGRAM_ROUTE)
+        print(f"[catch-up] consolidated summary "
+              f"(telegram {'sent' if result['ok'] else 'FAILED'})", file=sys.stderr)
 
 
 def process_open_positions() -> None:
@@ -296,6 +332,8 @@ def run_cycle(args) -> None:
     runner used to drive these two phases itself; scheduling now lives in
     run_supervisor.py and no model invokes another."""
     if not args.skip_positions:
+        # Before the live refresh: resolve anything missed while stopped.
+        process_catch_up()
         print("[paper] Refreshing open paper trade positions...", file=sys.stderr)
         process_open_positions()
 

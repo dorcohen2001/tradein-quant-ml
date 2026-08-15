@@ -29,6 +29,7 @@ load_dotenv(os.path.join(REPO_ROOT, ".env"))
 import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
 
 from core.charting.spec import ChartSpec  # noqa: E402
+from core.paper_trading.catch_up import CatchUpConfig  # noqa: E402
 from core.registry import get_model  # noqa: E402
 
 MODEL_KEY = "biton"
@@ -201,6 +202,20 @@ YF_RETRY_DELAYS = (2, 5, 10)
 # Live runner
 # ---------------------------------------------------------------------------
 CYCLE_INTERVAL_MINUTES = _MODEL.cycle_interval_minutes  # minutes between background scan/refresh cycles
+
+# Historical catch-up (core.paper_trading.catch_up). Biton cycles every 15
+# minutes, so the 45-minute floor sits at 3x the healthy gap -- comfortably
+# clear of a slow cycle, while still catching any real outage. Below it no
+# historical bar is fetched at all, which is what keeps steady-state cost at
+# zero. Biton is currently deactivated, so its first catch-up will cover the
+# pause (bounded by max_lookback_hours).
+CATCH_UP_CONFIG = CatchUpConfig(
+    min_gap_minutes=45.0,
+    max_lookback_hours=72.0,
+    crypto_interval="5m",
+    stock_interval="5m",
+    interval_minutes=5,
+)
 
 # ---------------------------------------------------------------------------
 # Scheduled Telegram summaries (core.reporting.summary)

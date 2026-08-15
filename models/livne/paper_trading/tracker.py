@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
 from config import (
+    CATCH_UP_CONFIG,
     CYCLE_INTERVAL_MINUTES,
     EMERGENCY_CANDLE_LOOKBACK,
     MAX_SLIPPAGE_PCT,
@@ -25,6 +26,7 @@ from config import (
     PENDING_EXPIRY_HOURS,
     TP1_CLOSE_PCT,
 )
+from core.paper_trading.catch_up import CatchUpConfig, CatchUpReport, run_catch_up
 from core.paper_trading.store import load_trades, pnl_pct as _pnl_pct, save_trades
 from core.utils.market_hours import is_market_open
 from paper_trading import journal
@@ -166,13 +168,114 @@ def _blended_pnl(trade: dict, entry_price: float, leg2_exit_price: float) -> flo
 
 
 def _close_trade(trade: dict, status: str, exit_price: float, entry_price: float,
-                  emergency_reason: str | None = None) -> None:
+                  emergency_reason: str | None = None, at: str | None = None) -> None:
+    """`at` is the ISO timestamp of the event. It defaults to now for the live
+    path; the historical catch-up passes the timestamp of the BAR on which the
+    level was actually crossed, which is the whole point of replaying."""
+    stamp = at or _now()
     trade["current_status"] = status
-    trade["exit_date"] = _now()
+    trade["exit_date"] = stamp
     trade["exit_price"] = exit_price
     trade["pnl_pct"] = _blended_pnl(trade, entry_price, exit_price)
     if emergency_reason:
         trade["emergency_exit_reason"] = emergency_reason
+
+
+def apply_bar(trade: dict, high: float, low: float, ts: dt.datetime) -> bool:
+    """Apply ONE bar's traded range to ONE open trade. Returns True if the
+    status changed. Mutates `trade` in place.
+
+    This is the single implementation of Livne's lifecycle transitions, used by
+    both callers:
+
+        live      one call per cycle, with the range since the last poll and
+                  ts=now -- byte-for-byte the behaviour this loop always had.
+        catch-up  one call per historical bar, oldest first, with that bar's
+                  timestamp (see core.paper_trading.catch_up).
+
+    Keeping it in one place is deliberate. A separate replay implementation
+    would be a second copy of a state machine that manages real positions, and
+    it would drift from this one the first time either was tuned.
+
+    NOT handled here: the emergency reversal exit. It needs a volume/candle
+    pattern rather than a price range, it is live-only by design (the backtest
+    does not simulate it either), and replaying it from historical bars would
+    invent exits the live system would not have taken.
+    """
+    status = trade["current_status"]
+    if status not in ("PENDING", "ACTIVE", "PARTIAL_TP1"):
+        return False
+
+    direction = trade["direction"]
+    entry_low, entry_high = trade["entry_zone"]
+    entry_price = (entry_low + entry_high) / 2
+    stamp = ts.isoformat(timespec="seconds")
+
+    if status == "PENDING":
+        signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
+        # Entry-zone touch is an OVERLAP test between the entry zone and the
+        # bar's traded range, not "is the last price inside the zone right
+        # now". Entry zones are ~0.7% wide, so price routinely traded through
+        # the zone and back out between polls -- with a point-in-time check
+        # those trades stayed PENDING and eventually EXPIRED, silently
+        # under-reporting fills and skewing every downstream win-rate metric.
+        if low <= entry_high and high >= entry_low:
+            trade["current_status"] = "ACTIVE"
+            trade["entry_date"] = stamp
+            trade["last_status_change"] = stamp
+            return True
+        if (ts - signal_dt) >= PENDING_EXPIRY:
+            trade["current_status"] = "EXPIRED"
+            trade["exit_date"] = stamp
+            trade["last_status_change"] = stamp
+            return True
+        return False
+
+    stop = trade["stop_loss"]
+    hit_stop = low <= stop if direction == "LONG" else high >= stop
+    hit_tp1 = high >= trade["target1"] if direction == "LONG" else low <= trade["target1"]
+    hit_tp2 = high >= trade["target2"] if direction == "LONG" else low <= trade["target2"]
+
+    changed = False
+    if status == "ACTIVE":
+        if hit_stop:
+            # Same-bar ambiguity (the range covers both the stop and a target)
+            # is resolved conservatively in favour of the stop, regardless of
+            # what else the range also touched -- OHLC cannot say which came
+            # first, and only the adverse assumption cannot flatter the result.
+            fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
+            _close_trade(trade, "LOSS_SL", fill, entry_price, at=stamp)
+            changed = True
+        elif hit_tp2:
+            # Gapped through both targets in one bar -- credit both legs.
+            trade["tp1_hit"] = True
+            trade["tp1_exit_price"] = trade["target1"]
+            trade["remaining_size_pct"] = 1 - trade["tp1_close_pct"]
+            _close_trade(trade, "WIN_TP2", trade["target2"], entry_price, at=stamp)
+            changed = True
+        elif hit_tp1:
+            trade["tp1_hit"] = True
+            trade["tp1_exit_price"] = trade["target1"]
+            trade["remaining_size_pct"] = 1 - trade["tp1_close_pct"]
+            trade["stop_loss"] = trade["breakeven_price"]  # Breakeven Adjustment
+            trade["current_status"] = "PARTIAL_TP1"
+            changed = True
+
+    elif status == "PARTIAL_TP1":
+        if hit_stop:
+            fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
+            _close_trade(trade, "LOSS_SL_BE", fill, entry_price, at=stamp)
+            changed = True
+        elif hit_tp2:
+            _close_trade(trade, "WIN_TP2", trade["target2"], entry_price, at=stamp)
+            changed = True
+
+    if changed:
+        # Stamped here rather than by the caller: `exit_date` alone is not
+        # enough for the daily summary, since PARTIAL_TP1 is a status change
+        # but not a close and never sets it.
+        trade["last_status_change"] = stamp
+    return changed
 
 
 def update_open_positions() -> list[dict]:
@@ -205,90 +308,91 @@ def update_open_positions() -> list[dict]:
         entry_price = (entry_low + entry_high) / 2
 
         # The price RANGE since the last check -- not just the instantaneous
-        # last-trade price -- is what every level test below uses, so a level
-        # touched between two cycles is still caught. Fetched once per trade
-        # and reused by both the PENDING entry test and the ACTIVE stop/target
-        # tests.
+        # last-trade price -- is what every level test uses, so a level touched
+        # between two cycles is still caught.
         rng = get_recent_intraday_range(trade["ticker"], trade["asset_class"], CYCLE_INTERVAL_MINUTES)
         hi, lo = (rng["high"], rng["low"]) if rng is not None else (price, price)
 
-        if status == "PENDING":
-            signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
-            # Entry-zone touch is an OVERLAP test between the entry zone and
-            # the cycle's traded range, not "is the last price inside the
-            # zone right now". Entry zones are ~0.7% wide while a cycle is 15
-            # minutes, so price routinely traded through the zone and back out
-            # before the poll -- with the old point-in-time check those trades
-            # stayed PENDING and eventually EXPIRED, silently under-reporting
-            # fills and skewing every downstream win-rate metric.
-            if lo <= entry_high and hi >= entry_low:
-                trade["current_status"] = "ACTIVE"
-                trade["entry_date"] = _now()
-                changed.append(trade)
-            elif (dt.datetime.now() - signal_dt) >= PENDING_EXPIRY:
-                trade["current_status"] = "EXPIRED"
-                trade["exit_date"] = _now()
-                changed.append(trade)
-            continue
+        # Emergency reversal is checked BEFORE the range, and only here: it is
+        # a live-only signal driven by a volume/candle anomaly rather than by a
+        # price level, so it has no meaningful historical replay (see
+        # `apply_bar`).
+        if status in ("ACTIVE", "PARTIAL_TP1"):
+            candles = get_recent_intraday_candles(trade["ticker"], trade["asset_class"],
+                                                  EMERGENCY_CANDLE_LOOKBACK + 5)
+            if candles is not None:
+                is_emergency, reason = detect_emergency_reversal(direction, candles)
+                if is_emergency:
+                    now_iso = _now()
+                    _close_trade(trade, "EMERGENCY_EXIT", price, entry_price,
+                                 emergency_reason=reason, at=now_iso)
+                    trade["last_status_change"] = now_iso
+                    trade["last_checked_at"] = now_iso
+                    changed.append(trade)
+                    continue
 
-        # status in (ACTIVE, PARTIAL_TP1): first check for an emergency
-        # reversal exit on the (remaining) open position.
-        candles = get_recent_intraday_candles(trade["ticker"], trade["asset_class"], EMERGENCY_CANDLE_LOOKBACK + 5)
-        if candles is not None:
-            is_emergency, reason = detect_emergency_reversal(direction, candles)
-            if is_emergency:
-                _close_trade(trade, "EMERGENCY_EXIT", price, entry_price, emergency_reason=reason)
-                changed.append(trade)
-                continue
+        # One bar -- the range since the last poll -- through the SAME
+        # transition function the historical catch-up replays bar by bar.
+        if apply_bar(trade, hi, lo, dt.datetime.now()):
+            changed.append(trade)
 
-        stop = trade["stop_loss"]
-        hit_stop = lo <= stop if direction == "LONG" else hi >= stop
-        hit_tp1 = hi >= trade["target1"] if direction == "LONG" else lo <= trade["target1"]
-        hit_tp2 = hi >= trade["target2"] if direction == "LONG" else lo <= trade["target2"]
-
-        if status == "ACTIVE":
-            if hit_stop:
-                # Same-cycle ambiguity (the intraday range covers both the
-                # stop and a target) is resolved conservatively in favor of
-                # the stop, regardless of what else the range also touched.
-                fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-                _close_trade(trade, "LOSS_SL", fill, entry_price)
-                changed.append(trade)
-            elif hit_tp2:
-                # Gapped through both targets in one cycle -- credit both legs.
-                trade["tp1_hit"] = True
-                trade["tp1_exit_price"] = trade["target1"]
-                trade["remaining_size_pct"] = 1 - trade["tp1_close_pct"]
-                _close_trade(trade, "WIN_TP2", trade["target2"], entry_price)
-                changed.append(trade)
-            elif hit_tp1:
-                trade["tp1_hit"] = True
-                trade["tp1_exit_price"] = trade["target1"]
-                trade["remaining_size_pct"] = 1 - trade["tp1_close_pct"]
-                trade["stop_loss"] = trade["breakeven_price"]  # Breakeven Adjustment
-                trade["current_status"] = "PARTIAL_TP1"
-                changed.append(trade)
-
-        elif status == "PARTIAL_TP1":
-            if hit_stop:
-                fill = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-                _close_trade(trade, "LOSS_SL_BE", fill, entry_price)
-                changed.append(trade)
-            elif hit_tp2:
-                _close_trade(trade, "WIN_TP2", trade["target2"], entry_price)
-                changed.append(trade)
-
-    # Stamp every transition in one place. `exit_date` alone is not enough for
-    # the daily summary: PARTIAL_TP1 is a status CHANGE but not a close, so it
-    # never sets exit_date, and a trade that entered days ago but hit TP1 today
-    # would be invisible to a 24-hour reporting window.
-    for trade in changed:
-        trade["last_status_change"] = _now()
+        # Written for every trade actually evaluated (changed or not), so the
+        # next run can tell how much price action it missed. Not written for
+        # trades skipped above (closed market, no price): those genuinely were
+        # not checked, and pretending otherwise would hide a real gap.
+        trade["last_checked_at"] = _now()
 
     _save(trades)
     for trade in changed:
         journal.upsert_trade_row(trade)
     return changed
+
+
+def catch_up_open_positions(now: dt.datetime | None = None) -> CatchUpReport:
+    """Replay any price action missed while this runner was stopped.
+
+    Call BEFORE `update_open_positions`. On a healthy runner every open trade
+    was checked one cycle ago, `gap_window` returns None for all of them, and
+    this costs one timestamp comparison each -- no fetch, no bars, no cost.
+
+    After a real outage it walks the missed window bar by bar through the same
+    `apply_bar` the live loop uses, so stops and targets are graded at the
+    level and the MINUTE they were actually crossed rather than wherever price
+    happened to be at restart.
+
+    Returns a CatchUpReport for the caller to turn into ONE consolidated
+    Telegram message. Never raises: a failed catch-up leaves every position
+    exactly as it was for the normal live pass.
+    """
+    trades = _load()
+    stocks_market_open = is_market_open()
+
+    def tradeable(trade: dict) -> bool:
+        # Mirrors the live loop: stocks are not evaluated outside RTH, so the
+        # replay must not resolve them on bars the live system would never
+        # have acted on either.
+        return not (trade["asset_class"] == "stocks" and not stocks_market_open)
+
+    try:
+        report = run_catch_up(
+            trades, apply_bar,
+            fetch_crypto=get_binance_klines, fetch_stock=get_stock_history,
+            config=CATCH_UP_CONFIG, now=now, is_tradeable=tradeable,
+        )
+    except Exception as exc:  # noqa: BLE001 -- catch-up must never break the cycle
+        print(f"[catch-up] pass failed (live positions unaffected): {exc}", file=sys.stderr)
+        return CatchUpReport()
+
+    if report.events:
+        # Only persist if something actually changed. A no-op catch-up must not
+        # rewrite the store.
+        _save(trades)
+        by_id = {t["id"]: t for t in trades}
+        for event in report.events:
+            record = by_id.get(event.trade_id)
+            if record is not None:
+                journal.upsert_trade_row(record)
+    return report
 
 
 def get_all_trades() -> list[dict]:

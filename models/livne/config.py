@@ -40,6 +40,7 @@ load_dotenv(os.path.join(REPO_ROOT, ".env"))
 import _bootstrap  # noqa: E402,F401  -- puts repo root on sys.path for core.*
 
 from core.charting.spec import ChartSpec  # noqa: E402
+from core.paper_trading.catch_up import CatchUpConfig  # noqa: E402
 from core.registry import get_model  # noqa: E402
 
 MODEL_KEY = "livne"
@@ -526,6 +527,31 @@ FUNNEL_EXPORT_INTERVAL_MINUTES = 15
 # core.scheduling). Needed because the supervisor launches this runner as a
 # fresh `--once` process per tick, so an in-memory gate would reset every time.
 GATE_STATE_STORE = os.path.join(RUNTIME_DIR, "state", f"gates_{MODEL_KEY}.json")
+
+# ---------------------------------------------------------------------------
+# Historical catch-up (core.paper_trading.catch_up)
+#
+# When the runner is stopped and restarted, open positions would otherwise be
+# compared only against the latest tick -- a stop breached overnight would go
+# unseen and the eventual exit would be stamped with the restart time rather
+# than when the level was actually crossed.
+#
+# `min_gap_minutes` is what keeps this free at steady state: Livne cycles every
+# 2 minutes, so a healthy runner's gap is ~2 min, far under the 30-min floor,
+# and no historical bar is ever fetched. It has to sit comfortably above the
+# cycle interval or a slow cycle would trigger a pointless replay.
+#
+# 5m replay bars localise an exit to within five minutes, which is proportionate
+# for a model whose trades last minutes to hours, and yfinance serves 5m for
+# ~60 days -- well past the 72h replay ceiling.
+# ---------------------------------------------------------------------------
+CATCH_UP_CONFIG = CatchUpConfig(
+    min_gap_minutes=30.0,
+    max_lookback_hours=72.0,
+    crypto_interval="5m",
+    stock_interval="5m",
+    interval_minutes=5,
+)
 
 # Intraday signals go stale fast. A setup that has not been entered within a
 # few hours no longer reflects the structure that produced it.

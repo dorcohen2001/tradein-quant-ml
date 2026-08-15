@@ -14,7 +14,13 @@ from dataclasses import asdict, dataclass
 
 import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
 
-from config import CYCLE_INTERVAL_MINUTES, MAX_SLIPPAGE_PCT, PAPER_TRADING_STORE
+from config import (
+    CATCH_UP_CONFIG,
+    CYCLE_INTERVAL_MINUTES,
+    MAX_SLIPPAGE_PCT,
+    PAPER_TRADING_STORE,
+)
+from core.paper_trading.catch_up import CatchUpConfig, CatchUpReport, run_catch_up
 from core.paper_trading.store import load_trades, pnl_pct as _pnl_pct, save_trades
 from core.utils.market_hours import is_market_open
 from paper_trading import journal
@@ -103,6 +109,117 @@ def get_current_price(ticker: str, asset_class: str) -> float | None:
         return None
 
 
+def apply_bar(trade: dict, high: float, low: float, ts: dt.datetime) -> bool:
+    """Apply ONE bar's traded range to ONE open trade. Returns True if the
+    status changed. Mutates `trade` in place.
+
+    The single implementation of Biton's lifecycle transitions, used by both
+    the live loop (one call per cycle, ts=now -- byte-for-byte the behaviour it
+    always had) and the historical catch-up (one call per missed bar, with that
+    bar's timestamp). One implementation so a replay can never drift from the
+    live path.
+
+    Biton is single-shot: TP1 CLOSES the position rather than banking a partial
+    like Livne's PARTIAL_TP1. That difference is exactly why this lives here
+    and not in `core`.
+    """
+    status = trade["current_status"]
+    if status not in ("PENDING", "ACTIVE"):
+        return False
+
+    direction = trade["direction"]
+    entry_low, entry_high = trade["entry_zone"]
+    stamp = ts.isoformat(timespec="seconds")
+
+    if status == "PENDING":
+        signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
+        # Entry-zone touch is an OVERLAP test between the zone and the bar's
+        # range, not "is the last price inside the zone right now" -- price
+        # routinely traded through a ~0.7%-wide zone and back out between
+        # polls, and a point-in-time check silently under-reported fills.
+        if low <= entry_high and high >= entry_low:
+            trade["current_status"] = "ACTIVE"
+            trade["entry_date"] = stamp
+            trade["last_status_change"] = stamp
+            return True
+        if (ts - signal_dt).days >= PENDING_EXPIRY_DAYS:
+            trade["current_status"] = "EXPIRED"
+            trade["exit_date"] = stamp
+            trade["last_status_change"] = stamp
+            return True
+        return False
+
+    # ACTIVE. Check the more extreme target first so a gap move clearing both
+    # target1 and target2 in one bar is credited as a TP2 win. The stop is
+    # checked before either: when one bar's range covers both, OHLC cannot say
+    # which came first, and only the adverse assumption cannot flatter results.
+    entry_price = (entry_low + entry_high) / 2
+    stop = trade["stop_loss"]
+    hit_stop = low <= stop if direction == "LONG" else high >= stop
+    hit_tp2 = high >= trade["target2"] if direction == "LONG" else low <= trade["target2"]
+    hit_tp1 = high >= trade["target1"] if direction == "LONG" else low <= trade["target1"]
+
+    new_status = exit_price = None
+    if hit_stop:
+        new_status = "LOSS_SL"
+        # A stop-loss becomes a market order once triggered - model a small
+        # amount of adverse slippage instead of a perfect fill.
+        exit_price = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
+    elif hit_tp2:
+        new_status, exit_price = "WIN_TP2", trade["target2"]
+    elif hit_tp1:
+        new_status, exit_price = "WIN_TP1", trade["target1"]
+
+    if not new_status:
+        return False
+
+    trade["current_status"] = new_status
+    trade["exit_date"] = stamp
+    trade["exit_price"] = exit_price
+    trade["pnl_pct"] = _pnl_pct(direction, entry_price, exit_price)
+    trade["last_status_change"] = stamp
+    return True
+
+
+def catch_up_open_positions(now: dt.datetime | None = None) -> CatchUpReport:
+    """Replay price action missed while this runner was stopped.
+
+    Call BEFORE `update_open_positions`. On a healthy runner every open trade
+    was checked one cycle ago, so `gap_window` returns None for all of them and
+    this costs one timestamp comparison each -- no fetch, no bars.
+
+    Never raises: a failed catch-up leaves every position exactly as it was for
+    the normal live pass.
+    """
+    trades = _load()
+    stocks_market_open = is_market_open()
+
+    def tradeable(trade: dict) -> bool:
+        # Mirrors the live loop: stocks are not evaluated outside RTH, so the
+        # replay must not resolve them on bars the live system would not have
+        # acted on either.
+        return not (trade["asset_class"] == "stocks" and not stocks_market_open)
+
+    try:
+        report = run_catch_up(
+            trades, apply_bar,
+            fetch_crypto=get_binance_klines, fetch_stock=get_stock_history,
+            config=CATCH_UP_CONFIG, now=now, is_tradeable=tradeable,
+        )
+    except Exception as exc:  # noqa: BLE001 -- catch-up must never break the cycle
+        print(f"[catch-up] pass failed (live positions unaffected): {exc}", file=sys.stderr)
+        return CatchUpReport()
+
+    if report.events:
+        _save(trades)
+        by_id = {t["id"]: t for t in trades}
+        for event in report.events:
+            record = by_id.get(event.trade_id)
+            if record is not None:
+                journal.upsert_trade_row(record)
+    return report
+
+
 def update_open_positions() -> list[dict]:
     """Refresh every PENDING/ACTIVE trade against the current market price.
     Returns the list of trades whose status changed in this pass, so callers
@@ -128,72 +245,22 @@ def update_open_positions() -> list[dict]:
         if price is None:
             continue
 
-        direction = trade["direction"]
-        entry_low, entry_high = trade["entry_zone"]
-
         # The price RANGE since the last check -- not just the instantaneous
-        # last-trade price -- is what every level test below uses, so a level
-        # touched between two cycles is still caught. Fetched once per trade
-        # and reused by both the PENDING entry test and the ACTIVE stop/target
-        # tests.
+        # last-trade price -- is what every level test uses, so a level touched
+        # between two cycles is still caught.
         rng = get_recent_intraday_range(trade["ticker"], trade["asset_class"], CYCLE_INTERVAL_MINUTES)
         hi, lo = (rng["high"], rng["low"]) if rng is not None else (price, price)
 
-        if status == "PENDING":
-            signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
-            # Entry-zone touch is an OVERLAP test between the entry zone and
-            # the cycle's traded range, not "is the last price inside the
-            # zone right now". Entry zones are ~0.7% wide while a cycle is 15
-            # minutes, so price routinely traded through the zone and back out
-            # before the poll -- with the old point-in-time check those trades
-            # stayed PENDING and eventually EXPIRED, silently under-reporting
-            # fills and skewing every downstream win-rate metric.
-            if lo <= entry_high and hi >= entry_low:
-                trade["current_status"] = "ACTIVE"
-                trade["entry_date"] = _now()
-                changed.append(trade)
-            elif (dt.datetime.now() - signal_dt).days >= PENDING_EXPIRY_DAYS:
-                trade["current_status"] = "EXPIRED"
-                trade["exit_date"] = _now()
-                changed.append(trade)
-            continue
-
-        # status == "ACTIVE": check stop/targets against the price range since
-        # the last check (not just the instantaneous last-trade price), so a
-        # breach that happens between 15-minute cycles is still caught at
-        # (near) the actual level instead of wherever price drifted to by the
-        # next check. Check the more extreme target first so a gap move that
-        # clears both target1 and target2 between updates is credited as a
-        # TP2 win.
-        entry_price = (entry_low + entry_high) / 2
-        stop = trade["stop_loss"]
-        hit_stop = lo <= stop if direction == "LONG" else hi >= stop
-        hit_tp2 = hi >= trade["target2"] if direction == "LONG" else lo <= trade["target2"]
-        hit_tp1 = hi >= trade["target1"] if direction == "LONG" else lo <= trade["target1"]
-
-        new_status = exit_price = None
-        if hit_stop:
-            new_status = "LOSS_SL"
-            # A stop-loss becomes a market order once triggered - model a
-            # small amount of adverse slippage instead of a perfect fill.
-            exit_price = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-        elif hit_tp2:
-            new_status, exit_price = "WIN_TP2", trade["target2"]
-        elif hit_tp1:
-            new_status, exit_price = "WIN_TP1", trade["target1"]
-
-        if new_status:
-            trade["current_status"] = new_status
-            trade["exit_date"] = _now()
-            trade["exit_price"] = exit_price
-            trade["pnl_pct"] = _pnl_pct(direction, entry_price, exit_price)
+        # One bar -- the range since the last poll -- through the SAME
+        # transition function the historical catch-up replays bar by bar.
+        if apply_bar(trade, hi, lo, dt.datetime.now()):
             changed.append(trade)
 
-    # Stamp every transition in one place, so the daily summary can filter on
-    # "changed in the last 24h" rather than on exit_date, which is only written
-    # for a full close.
-    for trade in changed:
-        trade["last_status_change"] = _now()
+        # Written for every trade actually evaluated (changed or not), so the
+        # next run can tell how much price action it missed. Not written for
+        # trades skipped above (closed market, no price): those genuinely were
+        # not checked, and pretending otherwise would hide a real gap.
+        trade["last_checked_at"] = _now()
 
     _save(trades)
     for trade in changed:
