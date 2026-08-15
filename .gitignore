@@ -29,7 +29,15 @@ runtime/cache/*/*
 # runs and across both models. It is pure derived data (re-downloadable from
 # Binance/Yahoo at any time) and gets large fast -- a year of 5m candles for
 # one crypto watchlist is millions of rows.
-data/
+#
+# ANCHORED with a leading slash, and that is load-bearing. Written as `data/`
+# this rule matches a directory named `data` at ANY depth, which silently
+# swallowed the `core/data/` SOURCE package -- cache_policy.py and market.py
+# were never committed, so a fresh clone was missing modules that
+# models/*/utils/data_fetch.py imports at startup. Every live model would have
+# failed to import on a clone or a restore-from-git, while working perfectly on
+# the machine where they were written.
+/data/
 
 # --- Generated reports / narratives --------------------------------------
 mail/reports/
