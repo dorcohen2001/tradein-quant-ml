@@ -28,12 +28,18 @@ disagree.
 
 ```
 core/         shared, model-agnostic: yfinance disk cache, Telegram transport,
-              market-session gating, news/sentiment, chart rendering, and the
+              market-session gating, news/sentiment, chart rendering, the
               intraday backtesting engine (core/backtesting: candle fetch +
-              cache, point-in-time resampling, intrabar fills, metrics).
-              Contains NO strategy logic and NO trading thresholds.
+              cache, point-in-time resampling, intrabar fills, metrics), and
+              the tenant execution loop (core/runtime). Contains NO strategy
+              logic and NO trading thresholds.
+core/runtime/ the loop every model runs: one-instance lock, cycle order,
+              catch-up, position refresh, the alert outbox, scheduled
+              summaries, deduplication and the CLI. A model supplies a
+              `TenantStrategy`; it does not write a loop.
 models/       one directory per model; each is its own sys.path root and runs
-              as its own OS process. They never import each other.
+              as its own OS process. They never import each other. A model is
+              an ADAPTER (~250 lines) plus its strategy modules.
 runtime/      ALL mutable state: trade stores, journals, funnel exports,
               caches, rendered charts, logs. Nothing here is source.
 data/         backtest candle cache (git-ignored, re-downloadable). Shared by
@@ -234,8 +240,17 @@ ModelConfig(
 
 The model directory needs `_bootstrap.py` (copy either existing one verbatim),
 a `config.py` deriving its paths from `get_model("<key>")`, and a
-`live_runner.py` exposing `--once`. Registered-but-missing directories are
-skipped with a warning rather than crashing the supervisor.
+`live_runner.py`. Registered-but-missing directories are skipped with a warning
+rather than crashing the supervisor.
+
+**The runner does not implement a loop.** It subclasses
+`core.runtime.TenantStrategy` — supplying this model's `apply_bar`, its
+candidates, its setups and its message text — and hands that to
+`core.runtime.TenantRunner`, which owns the lock, the cycle order, catch-up,
+the alert outbox, summaries, dedup, error containment and the CLI. Four methods
+have no default (`load_trades`, `save_trades`, `apply_bar`, `build_setup`);
+everything else already works. Both live models and the client scaffold are
+built this way, so a fix to the loop reaches all of them at once.
 
 ## Catch-up after downtime
 
