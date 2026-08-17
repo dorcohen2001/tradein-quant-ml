@@ -84,7 +84,12 @@ _EXCLUDED_RELDIRS = {
 }
 # Directory basenames pruned anywhere in the tree.
 _EXCLUDED_DIRNAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".venv", "venv", "node_modules"}
-_EXCLUDED_FILE_GLOBS = ("*.pyc", "*.pyo", "*.tmp", "*~")
+# `*.lock` is not just noise, it is actively hostile to an archiver: a tenant
+# lock file (core.locking) is held by a RUNNING tenant, and on Windows an open
+# byte-range lock makes the file unreadable to anyone else. It also has exactly
+# zero restore value -- it carries no data, and a restored lock would be a lie
+# about what is running. Archiving one turned a live fleet into a failed backup.
+_EXCLUDED_FILE_GLOBS = ("*.pyc", "*.pyo", "*.tmp", "*~", "*.lock")
 _SECRET_GLOBS = ("*.env", ".env")
 
 # Live trading state -- the part of the tree that genuinely cannot be
@@ -202,32 +207,59 @@ def create_backup(mode: str, include_secrets: bool = True, retention: int = 10) 
             counter += 1
         archive_path = f"{stem}_{counter}.zip"
     rel_files = [_rel(p) for p in files]
-    secrets_included = [r for r in rel_files if _is_secret(r)]
-
-    manifest = {
-        "mode": mode,
-        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
-        "repo_root": REPO_ROOT,
-        "file_count": len(files),
-        "uncompressed_bytes": sum(os.path.getsize(p) for p in files),
-        "includes_secrets": bool(secrets_included),
-        "secret_files": secrets_included,
-        # Every archived file that must still parse as JSON on restore. `verify`
-        # actually re-parses these out of the zip -- a zip CRC proves the bytes
-        # survived, it does not prove the trade store was valid when captured.
-        "json_state_files": [r for r in rel_files if r.startswith("runtime/") and r.endswith(".json")],
-        "git": _git_context(),
-        "tool_version": 1,
-    }
 
     # Write to a .part file and rename on success, so an interrupted run can
     # never leave a truncated archive sitting in the snapshots directory
     # looking like a valid restore point.
+    #
+    # A file that cannot be READ is skipped rather than fatal. This is a backup
+    # of a system that is expected to be RUNNING: a log being written, a cache
+    # entry being replaced, a file briefly locked by another process. Aborting
+    # the whole archive over one of those means the backup only ever succeeds
+    # while the fleet is stopped -- which is precisely when it is least needed.
+    # Skips are counted, named on stderr, and recorded in the manifest, so a
+    # skip can never be mistaken for a complete archive.
     partial_path = f"{archive_path}.part"
+    written: list[str] = []
+    skipped: list[dict] = []
+    total_bytes = 0
     try:
         with zipfile.ZipFile(partial_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for abs_path, rel_path in zip(files, rel_files):
-                zf.write(abs_path, rel_path)
+                try:
+                    size = os.path.getsize(abs_path)
+                    zf.write(abs_path, rel_path)
+                except OSError as exc:
+                    skipped.append({"path": rel_path, "error": f"{type(exc).__name__}: {exc}"})
+                    _log(f"[backup] SKIPPED unreadable file {rel_path} ({type(exc).__name__}: {exc})")
+                    continue
+                written.append(rel_path)
+                total_bytes += size
+
+            if not written:
+                raise RuntimeError(f"mode={mode}: every candidate file was unreadable")
+
+            secrets_included = [r for r in written if _is_secret(r)]
+            manifest = {
+                "mode": mode,
+                "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "repo_root": REPO_ROOT,
+                # Counted from what was ACTUALLY written, so `verify`'s
+                # manifest-vs-entries check stays exact when files were skipped.
+                "file_count": len(written),
+                "uncompressed_bytes": total_bytes,
+                "includes_secrets": bool(secrets_included),
+                "secret_files": secrets_included,
+                # Every archived file that must still parse as JSON on restore.
+                # `verify` re-parses these out of the zip -- a CRC proves the
+                # bytes survived, not that the store was valid when captured.
+                "json_state_files": [r for r in written
+                                     if r.startswith("runtime/") and r.endswith(".json")],
+                "skipped_count": len(skipped),
+                "skipped_files": skipped,
+                "git": _git_context(),
+                "tool_version": 2,
+            }
             zf.writestr(MANIFEST_NAME, json.dumps(manifest, indent=2))
         os.replace(partial_path, archive_path)
     except BaseException:
@@ -236,7 +268,11 @@ def create_backup(mode: str, include_secrets: bool = True, retention: int = 10) 
         raise
 
     size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-    _log(f"[backup] {mode}: {len(files)} files -> {_rel(archive_path)} ({size_mb:.1f} MB)")
+    _log(f"[backup] {mode}: {len(written)} files -> {_rel(archive_path)} ({size_mb:.1f} MB)")
+    if skipped:
+        _log(f"[backup] WARNING: {len(skipped)} file(s) were unreadable and are NOT in this "
+             f"archive: {', '.join(s['path'] for s in skipped[:5])}"
+             + (" ..." if len(skipped) > 5 else ""))
     if secrets_included:
         _log(f"[backup] NOTE: archive contains {len(secrets_included)} secret file(s) "
              f"({', '.join(secrets_included)}). Keep it local; use --exclude-secrets for a "
@@ -330,6 +366,11 @@ def verify_snapshot(path: str) -> bool:
                     return False
             if manifest.get("json_state_files"):
                 _log(f"[verify] {len(manifest['json_state_files'])} runtime JSON file(s) re-parsed OK")
+
+            if manifest.get("skipped_count"):
+                _log(f"[verify] NOTE: {manifest['skipped_count']} file(s) were unreadable when "
+                     f"this archive was taken and are absent from it: "
+                     f"{', '.join(s['path'] for s in manifest.get('skipped_files', [])[:5])}")
 
             if manifest.get("includes_secrets"):
                 _log("[verify] NOTE: this archive contains secret files -- keep it local.")

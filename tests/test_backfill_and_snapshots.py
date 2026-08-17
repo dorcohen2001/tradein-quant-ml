@@ -181,6 +181,61 @@ def test_a_failing_snapshot_does_not_stop_the_sweep_or_the_models(monkeypatch, t
         supervisor._stop.clear()
 
 
+def test_an_unreadable_file_is_skipped_not_fatal(tmp_path, monkeypatch):
+    """A backup runs against a system that is EXPECTED to be running.
+
+    Found the hard way: a live tenant holds `runtime/state/tenant_<key>.lock`,
+    and on Windows that file is then unreadable to everyone else -- so the
+    whole `--mode full` archive aborted with PermissionError. A backup that
+    only succeeds while the fleet is stopped is a backup you cannot take when
+    you need one.
+    """
+    import scripts.backup_manager as bm
+
+    (tmp_path / "good.txt").write_text("keep me", encoding="utf-8")
+    unreadable = tmp_path / "bad.dat"
+    unreadable.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(bm, "REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(bm, "BACKUP_ROOT", str(tmp_path / "backups"))
+    monkeypatch.setattr(bm, "MODE_DIRS", {"full": str(tmp_path / "backups" / "full")})
+    monkeypatch.setattr(bm, "MODE_PREFIXES", {"full": "T_"})
+    monkeypatch.setattr(bm, "_iter_tree",
+                        lambda mode, secrets: [str(tmp_path / "good.txt"), str(unreadable)])
+
+    real_getsize = os.path.getsize
+
+    def deny(path):
+        if str(path).endswith("bad.dat"):
+            raise PermissionError(13, "Permission denied")
+        return real_getsize(path)
+
+    monkeypatch.setattr(os.path, "getsize", deny)
+
+    archive = bm.create_backup("full", retention=0)
+
+    monkeypatch.undo()
+    import zipfile
+    with zipfile.ZipFile(archive) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read(bm.MANIFEST_NAME))
+
+    assert "good.txt" in names and "bad.dat" not in names
+    # file_count counts what was WRITTEN, so verification stays exact.
+    assert manifest["file_count"] == 1
+    assert manifest["skipped_count"] == 1
+    assert "bad.dat" in manifest["skipped_files"][0]["path"]
+    assert bm.verify_snapshot(archive) is True
+
+
+def test_lock_files_are_never_archived():
+    """They carry no data, and a restored lock would misrepresent what is
+    running -- besides being the exact file that broke the full backup."""
+    import scripts.backup_manager as bm
+    assert bm._excluded_file("runtime/state/tenant_livne.lock")
+    assert not bm._excluded_file("runtime/state/heartbeat_livne.json")
+
+
 def test_the_two_gates_do_not_share_a_marker(tmp_path):
     """Sweep and backup are keyed separately inside one gate file. Sharing a
     name would mean the daily sweep suppressed the 6-hourly snapshot."""
