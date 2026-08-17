@@ -263,6 +263,28 @@ def _supervisor():
     return importlib.import_module("run_supervisor")
 
 
+@pytest.fixture
+def supervisor(tmp_path, monkeypatch):
+    """The supervisor with its state and log directories redirected into the
+    test's own sandbox, and escalation disarmed.
+
+    Both parts are load-bearing. These tests deliberately crash and hang fake
+    tenants, and against the REAL `runtime/state` that wrote phantom
+    `heartbeat_client_boom.json` entries into live state, where `fleet_status`
+    then reported tenants that do not exist. Worse, failure streaks persist
+    ACROSS pytest runs, so a third run of the suite would cross
+    HEARTBEAT_ALERT_AFTER and send a genuine Telegram alert about a fake
+    tenant. A test must never be able to page a human.
+    """
+    module = _supervisor()
+    monkeypatch.setattr(module, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(module, "LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(module, "_notify_ops",
+                        lambda message: pytest.fail(
+                            "escalation attempted a real send during tests: " + message))
+    return module
+
+
 class _Args:
     asset_class = None
     top_n = None
@@ -292,29 +314,26 @@ def _fake_model(tmp_path, key, body, timeout=480):
     return _Sandboxed(**{f.name: getattr(cfg, f.name) for f in cfg.__dataclass_fields__.values()})
 
 
-def test_client_crash_is_contained_and_reported(tmp_path):
+def test_client_crash_is_contained_and_reported(tmp_path, supervisor):
     """A client raising must be reported as a non-zero exit, not propagate."""
-    supervisor = _supervisor()
     model = _fake_model(tmp_path, "client_boom", CRASHING_RUNNER)
     outcome = supervisor.run_model_cycle(model, _Args())
     assert "exit code" in outcome
     assert "other models unaffected" in outcome
 
 
-def test_client_hang_is_killed_by_its_own_timeout(tmp_path):
+def test_client_hang_is_killed_by_its_own_timeout(tmp_path, supervisor):
     """A hang is NOT an exception -- only a timeout can bound it, and without
     one the supervisor thread would block forever."""
-    supervisor = _supervisor()
     model = _fake_model(tmp_path, "client_hang", SLOW_RUNNER, timeout=2)
     outcome = supervisor.run_model_cycle(model, _Args())
     assert "TIMEOUT" in outcome
     assert "other models unaffected" in outcome
 
 
-def test_a_crashing_client_does_not_stop_a_healthy_model(tmp_path):
+def test_a_crashing_client_does_not_stop_a_healthy_model(tmp_path, supervisor):
     """The blast-radius property itself: the healthy model still runs to
     completion after the crashing one has already failed."""
-    supervisor = _supervisor()
     boom = _fake_model(tmp_path, "client_boom2", CRASHING_RUNNER)
     fine = _fake_model(tmp_path, "client_fine", "print('ok')\n")
 
@@ -322,8 +341,7 @@ def test_a_crashing_client_does_not_stop_a_healthy_model(tmp_path):
     assert supervisor.run_model_cycle(fine, _Args()).startswith("ok in")
 
 
-def test_missing_client_directory_is_skipped_not_fatal(tmp_path):
-    supervisor = _supervisor()
+def test_missing_client_directory_is_skipped_not_fatal(tmp_path, supervisor):
     model = client_config("client_ghost")
     assert "skipped" in supervisor.run_model_cycle(model, _Args())
 

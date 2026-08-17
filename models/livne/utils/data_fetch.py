@@ -36,6 +36,7 @@ from config import (
     YF_STALE_FALLBACK_SECONDS,
 )
 from core.data.cache_policy import HISTORY_CACHE_SECONDS, bucket, bucket_seconds_for
+from core.data.health import note_failure, note_success
 from core.data.market import get_stock_candles
 from core.utils.yf_cache import cached_call
 
@@ -120,8 +121,11 @@ def get_stock_market_cap(ticker: str) -> float | None:
     `get_stock_fast_info` below, which backs LIVE position pricing and must
     never serve a many-hours-stale value."""
     try:
-        return _fetch_stock_market_cap(ticker)
-    except Exception:
+        value = _fetch_stock_market_cap(ticker)
+        note_success("yahoo")
+        return value
+    except Exception as exc:
+        note_failure("yahoo", "market_cap", exc, ticker)
         return None
 
 
@@ -141,8 +145,13 @@ def get_stock_fast_info(ticker: str) -> dict:
     stop/target checks -- see module docstring for why this stays on the
     near-zero-TTL live-price cache rather than the long-lived metadata one."""
     try:
-        return _fetch_stock_fast_info(ticker)
-    except Exception:
+        info = _fetch_stock_fast_info(ticker)
+        note_success("yahoo")
+        return info
+    except Exception as exc:
+        # Live position pricing. A silent {} here reads downstream as "no price
+        # available", which is exactly what a delisted ticker looks like too.
+        note_failure("yahoo", "fast_info", exc, ticker)
         return {}
 
 
@@ -163,12 +172,19 @@ def get_recent_intraday_range(ticker: str, asset_class: str, lookback_minutes: i
         if df is None or df.empty:
             return None
         window = df.tail(lookback_minutes + 1)
-        return {
+        result = {
             "high": float(window["High"].max()),
             "low": float(window["Low"].min()),
             "last_close": float(window["Close"].iloc[-1]),
         }
-    except Exception:
+        note_success("binance" if asset_class == "crypto" else "yahoo")
+        return result
+    except Exception as exc:
+        # This one feeds stop/target checks. Returning None silently means the
+        # level test falls back to the last price alone -- a real degradation
+        # that used to leave no trace at all.
+        note_failure("binance" if asset_class == "crypto" else "yahoo",
+                     "intraday_range", exc, ticker)
         return None
 
 
@@ -248,8 +264,13 @@ def get_recent_intraday_candles(ticker: str, asset_class: str, limit: int = 30) 
             if df is None or df.empty:
                 return None
             df = df.tail(limit)
-        return df if df is not None and not df.empty else None
-    except Exception:
+        if df is None or df.empty:
+            return None
+        note_success("binance" if asset_class == "crypto" else "yahoo")
+        return df
+    except Exception as exc:
+        note_failure("binance" if asset_class == "crypto" else "yahoo",
+                     "intraday_candles", exc, ticker)
         return None
 
 
@@ -268,8 +289,11 @@ def _fetch_next_earnings_date(ticker: str) -> dt.datetime | None:
 def get_next_earnings_date(ticker: str) -> dt.datetime | None:
     """Return the next upcoming earnings datetime for `ticker`, or None if unknown."""
     try:
-        return _fetch_next_earnings_date(ticker)
-    except Exception:
+        value = _fetch_next_earnings_date(ticker)
+        note_success("yahoo")
+        return value
+    except Exception as exc:
+        note_failure("yahoo", "earnings_date", exc, ticker)
         return None
 
 
@@ -314,11 +338,14 @@ def get_binance_orderbook_depth(symbol: str, limit: int = ORDERBOOK_DEPTH_LIMIT)
         resp = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        return {
+        book = {
             "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
             "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
         }
-    except Exception:
+        note_success("binance")
+        return book
+    except Exception as exc:
+        note_failure("binance", "orderbook_depth", exc, symbol)
         return None
 
 
@@ -334,11 +361,14 @@ def get_bybit_orderbook_depth(symbol: str, limit: int = 200) -> dict | None:
         )
         resp.raise_for_status()
         result = resp.json().get("result", {})
-        return {
+        book = {
             "bids": [(float(p), float(q)) for p, q in result.get("b", [])],
             "asks": [(float(p), float(q)) for p, q in result.get("a", [])],
         }
-    except Exception:
+        note_success("bybit")
+        return book
+    except Exception as exc:
+        note_failure("bybit", "orderbook_depth", exc, symbol)
         return None
 
 

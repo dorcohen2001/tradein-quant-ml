@@ -18,10 +18,10 @@ from a second terminal must respect the same budget. The only rendezvous point
 every one of them genuinely shares is the filesystem.
 
 The bucket state therefore lives in `runtime/state/ratelimit_<provider>.json`,
-guarded by a lock file. On Windows the lock is `msvcrt.locking`, on POSIX
-`fcntl.flock`; both are advisory locks released automatically if the holder
-dies, which matters because a killed tenant (the supervisor's phase timeout
-does exactly that) must not wedge the bucket for everyone else.
+guarded by a lock file (`core.locking.FileLock`: `msvcrt.locking` on Windows,
+`fcntl.flock` on POSIX). Both are advisory locks released automatically if the
+holder dies, which matters because a killed tenant (the supervisor's phase
+timeout does exactly that) must not wedge the bucket for everyone else.
 
 TOKEN BUCKET, NOT A FIXED DELAY
 --------------------------------
@@ -48,11 +48,10 @@ import sys
 import time
 from dataclasses import dataclass
 
-_IS_WINDOWS = os.name == "nt"
-if _IS_WINDOWS:
-    import msvcrt
-else:  # pragma: no cover -- this repo runs on Windows
-    import fcntl
+# The lock primitive moved to `core.locking`, which needs the identical thing
+# to guarantee one running instance per tenant. Same class, same semantics --
+# only the home changed, so this module keeps working exactly as before.
+from core.locking import FileLock as _FileLock
 
 
 @dataclass(frozen=True)
@@ -110,55 +109,6 @@ def _warn_once(key: str, message: str) -> None:
     if key not in _warned:
         _warned.add(key)
         print(f"[rate] {message}", file=sys.stderr)
-
-
-class _FileLock:
-    """Advisory cross-process lock, released by the OS if the holder dies.
-
-    A killed tenant -- which the supervisor's phase timeout produces routinely --
-    must never leave the bucket permanently locked for every other tenant.
-    """
-
-    def __init__(self, path: str, timeout: float = 10.0) -> None:
-        self.path = path
-        self.timeout = timeout
-        self._handle = None
-
-    def __enter__(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._handle = open(self.path, "a+b")
-        deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                if _IS_WINDOWS:
-                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:  # pragma: no cover
-                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                if time.monotonic() >= deadline:
-                    # Give up the lock rather than the request: proceeding
-                    # unsynchronised is a rate risk, blocking forever is an outage.
-                    _warn_once(f"lock:{self.path}",
-                               f"could not lock {os.path.basename(self.path)} within "
-                               f"{self.timeout}s; proceeding without synchronisation")
-                    raise TimeoutError(self.path)
-                time.sleep(0.01)
-
-    def __exit__(self, *exc):
-        try:
-            if _IS_WINDOWS:
-                self._handle.seek(0)
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:  # pragma: no cover
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            self._handle.close()
-        except OSError:
-            pass
-        return False
 
 
 def _read_state(path: str) -> dict:

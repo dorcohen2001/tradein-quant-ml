@@ -26,9 +26,11 @@ from core.maintenance import sweep_runtime  # noqa: E402
 from core.settings import (  # noqa: E402
     CANDLE_CACHE_DIR,
     CANDLE_CACHE_RETENTION_DAYS,
+    BACKTEST_LOG_RETENTION_DAYS,
     CHART_RETENTION_DAYS,
     FUNNEL_RETENTION_DAYS,
     LOG_RETENTION_DAYS,
+    MACRO_SNAPSHOT_RETENTION_DAYS,
     RUNTIME_CACHE_RETENTION_DAYS,
 )
 
@@ -69,6 +71,12 @@ def main() -> int:
                          "<key>.log is never aged out, only size-rotated; 0 disables)")
     ap.add_argument("--funnel-days", type=float, default=FUNNEL_RETENTION_DAYS,
                     help="max age for funnel reports (default: %(default)s; 0 disables)")
+    ap.add_argument("--backtest-days", type=float, default=BACKTEST_LOG_RETENTION_DAYS,
+                    help="max age for runtime/backtest CSVs (default: %(default)s; the log Steve "
+                         "reads is rewritten by each run so it never ages out; 0 disables)")
+    ap.add_argument("--snapshot-days", type=float, default=MACRO_SNAPSHOT_RETENTION_DAYS,
+                    help="max age of entries kept in runtime/stores/market_snapshots.json, which "
+                         "is compacted in place rather than deleted (default: %(default)s; 0 disables)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be removed, delete nothing")
     args = ap.parse_args()
 
@@ -79,6 +87,7 @@ def main() -> int:
         "candle cache": CANDLE_CACHE_DIR,
         "logs": os.path.join(runtime_dir, "logs"),
         "funnel reports": os.path.join(runtime_dir, "funnel_logs"),
+        "backtest logs": os.path.join(runtime_dir, "backtest"),
     }
 
     print("before:")
@@ -88,7 +97,8 @@ def main() -> int:
 
     results = sweep_runtime(runtime_dir, args.cache_days, args.chart_days, dry_run=args.dry_run,
                             candle_dir=CANDLE_CACHE_DIR, candle_days=args.candle_days,
-                            log_days=args.log_days, funnel_days=args.funnel_days)
+                            log_days=args.log_days, funnel_days=args.funnel_days,
+                            backtest_days=args.backtest_days, snapshot_days=args.snapshot_days)
 
     if not args.dry_run:
         print("after:")

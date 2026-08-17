@@ -84,6 +84,7 @@ from core.observability import (  # noqa: E402
     heartbeat_age,
     is_stale,
     open_tenant_log,
+    read_heartbeat,
     write_heartbeat,
 )
 from core.registry import ModelConfig, active_models, disabled_models, get_model  # noqa: E402
@@ -94,9 +95,15 @@ from core.settings import (  # noqa: E402
     LOG_BACKUP_COUNT,
     LOG_MAX_BYTES,
     LOG_RETENTION_DAYS,
+    MACRO_SNAPSHOT_RETENTION_DAYS,
     CANDLE_CACHE_RETENTION_DAYS,
+    BACKTEST_LOG_RETENTION_DAYS,
     CHART_RETENTION_DAYS,
+    HEARTBEAT_ALERT_AFTER,
     MAINTENANCE_INTERVAL_MINUTES,
+    OPS_TELEGRAM_ROUTE,
+    RUNTIME_BACKUP_INTERVAL_MINUTES,
+    RUNTIME_BACKUP_RETENTION,
     RUNTIME_CACHE_RETENTION_DAYS,
 )
 
@@ -135,6 +142,65 @@ def _child_args(model: ModelConfig, args) -> list[str]:
     return cmd
 
 
+def _record_outcome(model: ModelConfig, status: str, detail: str = "",
+                    duration_seconds: float | None = None) -> None:
+    """Stamp the heartbeat and escalate if this tenant is repeatedly failing.
+
+    The streak lives IN the heartbeat rather than in supervisor memory, for two
+    reasons: it survives a supervisor restart (restarting during an outage must
+    not re-arm an alert somebody already received), and `fleet_status.py` gets
+    it for free.
+
+    One alert per outage, not one per cycle. `alerted` latches when the message
+    goes out and clears on the first ok cycle, which also emits a short recovery
+    notice -- an operator who was told something broke is owed the news that it
+    came back.
+    """
+    previous = read_heartbeat(STATE_DIR, model.key) or {}
+    was_alerted = bool(previous.get("alerted"))
+
+    if status == "ok":
+        streak, alerted = 0, False
+        if was_alerted:
+            _notify_ops(f"✅ *{model.key}* recovered — cycle completed normally"
+                        f" after {previous.get('failure_streak', '?')} failed cycle(s).")
+            _log(f"[{model.key}] recovered after {previous.get('failure_streak', '?')} failed cycle(s)")
+    else:
+        streak = int(previous.get("failure_streak", 0)) + 1
+        alerted = was_alerted
+        if HEARTBEAT_ALERT_AFTER > 0 and not was_alerted and streak >= HEARTBEAT_ALERT_AFTER:
+            _notify_ops(
+                f"🚨 *{model.key}* has failed {streak} consecutive cycle(s).\n"
+                f"Last status: `{status}`\n"
+                f"Detail: {detail or 'none recorded'}\n"
+                f"Positions are NOT being managed while this tenant is down."
+            )
+            alerted = True
+            _log(f"[{model.key}] ESCALATED: {streak} consecutive failures -- ops alert sent")
+
+    write_heartbeat(STATE_DIR, model.key, status=status, detail=detail,
+                    duration_seconds=duration_seconds,
+                    extra={"failure_streak": streak, "alerted": alerted})
+
+
+def _notify_ops(message: str) -> None:
+    """Send one operational alert. Never raises, never blocks a cycle.
+
+    Imported lazily and wrapped: the escalation path exists to report that
+    something is already broken, and it must not be able to become the thing
+    that breaks the supervisor.
+    """
+    try:
+        from core.utils.telegram_notifier import send_telegram_message
+
+        result = send_telegram_message(message, route=OPS_TELEGRAM_ROUTE)
+        if not result["ok"]:
+            _log("[ops] escalation alert could NOT be delivered "
+                 f"(route {OPS_TELEGRAM_ROUTE!r}) -- see the message above")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[ops] escalation alert failed: {type(exc).__name__}: {exc}")
+
+
 def run_model_cycle(model: ModelConfig, args) -> str:
     """Run one cycle of one model. Never raises -- returns a short outcome
     string for logging. Every failure mode here is contained to this model.
@@ -147,9 +213,10 @@ def run_model_cycle(model: ModelConfig, args) -> str:
 
     A heartbeat is stamped on every outcome, success or not, so the fleet view
     can distinguish "ran and found nothing" from "has not run since Tuesday".
+    Repeated failures escalate to one Telegram alert -- see `_record_outcome`.
     """
     if not model.exists:
-        write_heartbeat(STATE_DIR, model.key, status="skipped", detail="no live_runner on disk")
+        _record_outcome(model, "skipped", "no live_runner on disk")
         return f"skipped (no live_runner at {model.live_runner})"
 
     cmd = _child_args(model, args)
@@ -174,21 +241,19 @@ def run_model_cycle(model: ModelConfig, args) -> str:
             elapsed = time.monotonic() - started
             if result.returncode != 0:
                 outcome = f"exit code {result.returncode} after {elapsed:.0f}s (other models unaffected)"
-                write_heartbeat(STATE_DIR, model.key, status="error", detail=outcome,
-                                duration_seconds=elapsed)
+                _record_outcome(model, "error", outcome, elapsed)
                 return outcome
-            write_heartbeat(STATE_DIR, model.key, status="ok", duration_seconds=elapsed)
+            _record_outcome(model, "ok", duration_seconds=elapsed)
             return f"ok in {elapsed:.0f}s"
         except subprocess.TimeoutExpired:
             # subprocess.run has already killed the child before raising.
             outcome = (f"TIMEOUT after {model.phase_timeout_seconds}s -- child killed; "
                        f"retries next cycle (other models unaffected)")
-            write_heartbeat(STATE_DIR, model.key, status="timeout", detail=outcome,
-                            duration_seconds=time.monotonic() - started)
+            _record_outcome(model, "timeout", outcome, time.monotonic() - started)
             return outcome
         except Exception as exc:  # noqa: BLE001 -- a supervisor must never die of a child
             outcome = f"failed to launch: {exc} (other models unaffected)"
-            write_heartbeat(STATE_DIR, model.key, status="error", detail=str(exc))
+            _record_outcome(model, "error", str(exc))
             return outcome
     finally:
         if handle is not None:
@@ -234,32 +299,72 @@ def _supervise(model: ModelConfig, args) -> None:
         _stop.wait(sleep_for)
 
 
-def _maintenance_loop() -> None:
-    """Age-based retention for derived runtime artifacts.
+def _take_runtime_snapshot() -> None:
+    """Archive the live trading state, and verify what was written.
 
-    Lives in the supervisor rather than in a model because it is not any one
-    model's concern -- the yfinance cache and the charts directory are shared.
-    Gated on a persisted marker so restarting the supervisor does not re-run
-    the sweep every time, and wrapped so a housekeeping failure can never take
-    down the process that keeps the models running.
+    This is the DISASTER-RECOVERY half of housekeeping, and it is the half that
+    was missing: `runtime/` is gitignored, so rolling code back with git
+    restores no trades, journals or report markers. `scripts/backup_manager.py`
+    could always archive them; nothing ever ran it, so every restore point was
+    whatever a human had remembered to take.
+
+    A `runtime` archive is ~115 KB and takes under a second, which is why this
+    can afford to be frequent AND to verify -- an archive that was never read
+    back is a guess, and re-parsing the trade stores out of the zip is the
+    failure a CRC alone cannot see.
+
+    Imported lazily so a supervisor start never depends on the backup tool
+    importing cleanly.
     """
-    gate = PersistentIntervalGate(
-        MAINTENANCE_INTERVAL_MINUTES,
-        state_path=os.path.join(RUNTIME_DIR, "state", "gates_supervisor.json"),
-        name="runtime_sweep",
+    from scripts.backup_manager import create_backup, verify_snapshot
+
+    path = create_backup("runtime", retention=RUNTIME_BACKUP_RETENTION)
+    if verify_snapshot(path):
+        _log(f"[backup] runtime snapshot verified: {os.path.relpath(path, REPO_ROOT)}")
+    else:
+        _log(f"[backup] WARNING: snapshot {os.path.relpath(path, REPO_ROOT)} FAILED verification")
+
+
+def _maintenance_loop() -> None:
+    """Retention sweeps and automated runtime snapshots.
+
+    Lives in the supervisor rather than in a model because neither is any one
+    model's concern -- the yfinance cache and the charts directory are shared,
+    and a snapshot covers every tenant at once. Both are gated on persisted
+    markers so restarting the supervisor does not re-run them every time, and
+    each is wrapped separately so a housekeeping failure can never take down
+    the process that keeps the models running -- nor can a failing sweep
+    suppress the backup, which is the more important of the two.
+    """
+    gate_path = os.path.join(RUNTIME_DIR, "state", "gates_supervisor.json")
+    sweep_gate = PersistentIntervalGate(
+        MAINTENANCE_INTERVAL_MINUTES, state_path=gate_path, name="runtime_sweep",
+    )
+    backup_gate = PersistentIntervalGate(
+        RUNTIME_BACKUP_INTERVAL_MINUTES, state_path=gate_path, name="runtime_backup",
     )
     while not _stop.is_set():
         try:
-            if gate.due():
+            if sweep_gate.due():
                 _log("[maintenance] running retention sweep")
                 sweep_runtime(RUNTIME_DIR, RUNTIME_CACHE_RETENTION_DAYS, CHART_RETENTION_DAYS,
                               candle_dir=CANDLE_CACHE_DIR,
                               candle_days=CANDLE_CACHE_RETENTION_DAYS,
                               log_days=LOG_RETENTION_DAYS,
-                              funnel_days=FUNNEL_RETENTION_DAYS)
+                              funnel_days=FUNNEL_RETENTION_DAYS,
+                              backtest_days=BACKTEST_LOG_RETENTION_DAYS,
+                              snapshot_days=MACRO_SNAPSHOT_RETENTION_DAYS)
         except Exception as exc:  # noqa: BLE001
             _log(f"[maintenance] sweep failed (models unaffected): {exc}")
-        _stop.wait(300)  # re-check every 5 min; the gate decides if it actually runs
+
+        try:
+            if RUNTIME_BACKUP_INTERVAL_MINUTES > 0 and backup_gate.due():
+                _log("[backup] taking scheduled runtime snapshot")
+                _take_runtime_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"[backup] snapshot failed (models unaffected): {exc}")
+
+        _stop.wait(300)  # re-check every 5 min; the gates decide if anything runs
 
 
 def main() -> int:
@@ -326,6 +431,14 @@ def main() -> int:
          + ", ".join(f"{m.key} [{m.stage}] every {m.cycle_interval_minutes}min "
                      f"(timeout {m.phase_timeout_seconds}s, route {m.telegram_route}"
                      f"{', dedicated' if m.dedicated_route else ''})" for m in models))
+
+    if RUNTIME_BACKUP_INTERVAL_MINUTES > 0:
+        _log(f"[supervisor] runtime snapshots every {RUNTIME_BACKUP_INTERVAL_MINUTES / 60:g}h "
+             f"(keeping {RUNTIME_BACKUP_RETENTION}) -> backups/runtime_state/")
+    else:
+        _log("[supervisor] WARNING: automatic runtime snapshots are DISABLED "
+             "(RUNTIME_BACKUP_INTERVAL_MINUTES=0); runtime/ is gitignored, so nothing "
+             "is backing up live trade state")
 
     if args.dry_run:
         for m in models:

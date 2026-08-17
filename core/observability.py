@@ -96,12 +96,18 @@ def heartbeat_path(state_dir: str, key: str) -> str:
 
 def write_heartbeat(state_dir: str, key: str, *, status: str = "ok",
                     detail: str = "", duration_seconds: float | None = None,
-                    now: dt.datetime | None = None) -> bool:
+                    now: dt.datetime | None = None, extra: dict | None = None) -> bool:
     """Stamp `key`'s heartbeat. Returns True on success; never raises.
 
     Written atomically (temp + os.replace) for the same reason every other
     state file here is: a reader -- the supervisor, or `fleet_status.py` --
     must never see a half-written file and conclude the tenant is broken.
+
+    `extra` merges additional fields into the payload. The supervisor uses it
+    to carry escalation state (`failure_streak`, `alerted`) in the heartbeat
+    itself rather than in a second file: the streak has to survive a supervisor
+    restart, or restarting during an outage would re-arm the alert and page
+    somebody about a failure they already know about.
     """
     moment = now or dt.datetime.now()
     payload = {
@@ -111,6 +117,8 @@ def write_heartbeat(state_dir: str, key: str, *, status: str = "ok",
         "detail": detail,
         "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
     }
+    if extra:
+        payload.update(extra)
     try:
         os.makedirs(state_dir, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=state_dir, suffix=".tmp")

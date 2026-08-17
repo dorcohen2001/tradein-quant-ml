@@ -214,9 +214,57 @@ LOG_MAX_BYTES = _int_env("LOG_MAX_BYTES", 5 * 1024 * 1024)
 LOG_BACKUP_COUNT = _int_env("LOG_BACKUP_COUNT", 3)
 LOG_RETENTION_DAYS = _int_env("LOG_RETENTION_DAYS", 7)
 FUNNEL_RETENTION_DAYS = _int_env("FUNNEL_RETENTION_DAYS", 14)
+
+# Backtest trade logs (runtime/backtest/*.csv). Deliberately long: Steve reads
+# the current one per model as that model's simulated sample, and a run
+# rewrites the file (refreshing its mtime), so the live one never ages out
+# while backtests are still being run. This reclaims the logs of models that
+# were renamed or retired.
+BACKTEST_LOG_RETENTION_DAYS = _int_env("BACKTEST_LOG_RETENTION_DAYS", 90)
+
+# Correlation snapshots (runtime/stores/market_snapshots.json). One growing
+# JSON map, compacted in place rather than deleted. The owning model prunes it
+# only on the path that writes it, so a paused model's file never shrinks --
+# which is how it reached 626 KB. Matches MACRO_SNAPSHOT_MAX_AGE_DAYS in the
+# model config, so the sweep and the writer agree on what is stale.
+MACRO_SNAPSHOT_RETENTION_DAYS = _int_env("MACRO_SNAPSHOT_RETENTION_DAYS", 30)
 # How often the supervisor runs the sweep. Daily is plenty for directories
 # that accumulate over weeks.
 MAINTENANCE_INTERVAL_MINUTES = _int_env("MAINTENANCE_INTERVAL_MINUTES", 1440)
+
+# --- Automated runtime snapshots (scripts.backup_manager) ---------------
+# `runtime/` is gitignored, so a `git checkout` restores code and not one
+# trade. The backup tool has always been able to archive it; nothing ran the
+# tool. The supervisor now takes a verified `runtime` snapshot on this
+# interval, which is the one artifact that genuinely cannot be regenerated.
+#
+# 6 hours, keeping 30, is ~115 KB per archive and just over a week of restore
+# points -- cheap enough that the interval is not worth tuning down for space.
+# 0 disables the automatic snapshot entirely (the manual CLI is unaffected).
+#
+# Safe to run against live tenants: every state write in this repo is
+# temp-file + os.replace, so a reader either sees the previous complete file
+# or the next one, never a partial write. No tenant is paused to take it.
+RUNTIME_BACKUP_INTERVAL_MINUTES = _int_env("RUNTIME_BACKUP_INTERVAL_MINUTES", 360)
+RUNTIME_BACKUP_RETENTION = _int_env("RUNTIME_BACKUP_RETENTION", 30)
+
+# --- Tenant failure escalation (run_supervisor) -------------------------
+# Heartbeats, staleness and per-tenant logs made a dead tenant VISIBLE; nothing
+# announced it. Every one of those channels is pull-based, and absence of
+# alerts is also exactly what a quiet market looks like -- so a tenant that
+# died at 02:00 stayed dead until somebody thought to look.
+#
+# After this many consecutive non-ok cycles the supervisor sends ONE message
+# and then stays quiet until the tenant recovers. 3 is deliberately not 1: a
+# single timeout is a slow provider, and alerting on it trains the reader to
+# ignore the alert. 0 disables escalation.
+HEARTBEAT_ALERT_AFTER = _int_env("HEARTBEAT_ALERT_AFTER", 3)
+
+# Where those operational alerts go. Unconfigured it resolves, like every other
+# route, to the shared default chat -- so escalation works out of the box and
+# can be split into an ops-only channel by setting
+# TELEGRAM_ROUTE_OPS_CHAT_ID (see route_env_names).
+OPS_TELEGRAM_ROUTE = os.environ.get("OPS_TELEGRAM_ROUTE", "ops")
 
 # --- Daily analyzer ("Steve", agents/steve) -----------------------------
 # These belong to the ANALYZER, not to any model. They previously lived in

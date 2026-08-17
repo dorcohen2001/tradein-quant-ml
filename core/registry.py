@@ -32,9 +32,16 @@ STAGES AND CLIENT MODELS
 ------------------------
 `stage` separates "is running" from "is reported on". Client strategies are
 scaffolded by `scripts/create_client_model.py` as `client_<key>`, land here as
-`stage="incubating"` with `dedicated_route=True`, and are appended between the
-CLIENT MODELS markers at the end of `_MODELS` so the generator can add and
-remove them without ever touching the first-party entries above.
+`stage="incubating"`, and are appended between the CLIENT MODELS markers at the
+end of `_MODELS` so the generator can add and remove them without ever touching
+the first-party entries above.
+
+Their `dedicated_route` defaults to False -- the platform default is the shared
+primary hub, with every alert name-prefixed. `--dedicated-route` opts a tenant
+into its own channel AND makes its route strict, so a misconfigured dedicated
+tenant sends nothing rather than leaking into the hub. That flag is the only
+thing that makes a client's signals private; assuming otherwise is the mistake
+this paragraph exists to prevent.
 
 STATUS VOCABULARIES ARE PER-MODEL AND NOT INTERCHANGEABLE
 ---------------------------------------------------------
@@ -214,7 +221,7 @@ _MODELS: tuple[ModelConfig, ...] = (
         # exports and the backtest log all remain on disk exactly as they were.
         #
         # OPERATIONAL WARNING -- this is a PAUSE, not a wind-down. 13 positions
-        # were non-terminal at deactivation (12 ACTIVE + 1 PENDING, plus the
+        # were non-terminal at deactivation (11 ACTIVE + 1 PENDING + the
         # long-stuck PARTIAL_TP1 GOOGL record). While disabled, nothing
         # refreshes them: no stop or target is checked and no exit alert is
         # sent. Their recorded status simply freezes. On re-enable they are

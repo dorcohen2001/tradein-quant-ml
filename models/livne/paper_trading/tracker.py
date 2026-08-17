@@ -11,6 +11,7 @@ reversal. Marks positions against live market prices via `utils.data_fetch`.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import sys
 import uuid
 from dataclasses import asdict, dataclass
@@ -26,7 +27,14 @@ from config import (
     PENDING_EXPIRY_HOURS,
     TP1_CLOSE_PCT,
 )
-from core.paper_trading.catch_up import CatchUpConfig, CatchUpReport, run_catch_up
+from core.data.health import note_failure
+from core.paper_trading import outbox
+from core.paper_trading.catch_up import (
+    CatchUpConfig,
+    CatchUpReport,
+    refresh_lookback_minutes,
+    run_catch_up,
+)
 from core.paper_trading.store import load_trades, pnl_pct as _pnl_pct, save_trades
 from core.utils.market_hours import is_market_open
 from paper_trading import journal
@@ -152,13 +160,21 @@ def log_trade(setup, telegram_message_id: int | None = None) -> dict:
     return trade_dict
 
 
-def has_open_trade(ticker: str, asset_class: str) -> bool:
+def has_open_trade(ticker: str, asset_class: str, trades: list[dict] | None = None) -> bool:
     """True if `ticker` already has an open (non-terminal) paper trade, so
-    callers can skip generating a duplicate alert for the same setup."""
+    callers can skip generating a duplicate alert for the same setup.
+
+    `trades` lets a caller supply a snapshot it already holds. The scan calls
+    this once per candidate, and re-reading + re-migrating the whole store each
+    time meant parsing 133 records (~110 KB) six times per asset class for an
+    answer that cannot change mid-scan -- a watchlist has no duplicate tickers,
+    and nothing else writes this store while the lock is held.
+    """
+    records = _load() if trades is None else trades
     return any(
         t["ticker"] == ticker and t["asset_class"] == asset_class
         and t["current_status"] in ("PENDING", "ACTIVE", "PARTIAL_TP1")
-        for t in _load()
+        for t in records
     )
 
 
@@ -169,7 +185,10 @@ def get_current_price(ticker: str, asset_class: str) -> float | None:
         info = get_stock_fast_info(ticker)
         return info.get("last_price")
     except Exception as exc:
-        print(f"[tracker] price fetch failed for {ticker}: {exc}", file=sys.stderr)
+        # Names the exception TYPE and counts the streak, so a provider outage
+        # is one loud line rather than forty indistinguishable ones.
+        note_failure("binance" if asset_class == "crypto" else "yahoo",
+                     "current_price", exc, ticker)
         return None
 
 
@@ -303,6 +322,8 @@ def update_open_positions() -> list[dict]:
     Telegram notifications for newly triggered/partial/closed positions."""
     trades = _load()
     changed: list[dict] = []
+    touched = False
+    now = dt.datetime.now()
     stocks_market_open = is_market_open()
     if not stocks_market_open:
         print(
@@ -329,7 +350,24 @@ def update_open_positions() -> list[dict]:
         # The price RANGE since the last check -- not just the instantaneous
         # last-trade price -- is what every level test uses, so a level touched
         # between two cycles is still caught.
-        rng = get_recent_intraday_range(trade["ticker"], trade["asset_class"], CYCLE_INTERVAL_MINUTES)
+        #
+        # The window is measured from THIS trade's `last_checked_at`, not from
+        # the nominal cycle interval. Those are not the same number: the
+        # supervisor schedules from cycle start and tolerates a cycle running up
+        # to `phase_timeout_seconds`, so a slow scan means the real gap since
+        # the last check is the previous cycle's DURATION. Asking for a flat
+        # CYCLE_INTERVAL_MINUTES then examined only the newest couple of minutes
+        # of it and silently skipped the rest -- while the historical catch-up
+        # ignored the same span too, because its floor is 30 minutes. Anything
+        # past the ceiling belongs to that bar-by-bar replay instead, which
+        # grades it at the right level and the right minute.
+        lookback = refresh_lookback_minutes(
+            trade, now,
+            floor_minutes=CYCLE_INTERVAL_MINUTES,
+            ceiling_minutes=CATCH_UP_CONFIG.min_gap_minutes,
+        )
+        rng = get_recent_intraday_range(trade["ticker"], trade["asset_class"],
+                                        int(math.ceil(lookback)))
         hi, lo = (rng["high"], rng["low"]) if rng is not None else (price, price)
 
         # Emergency reversal is checked BEFORE the range, and only here: it is
@@ -342,29 +380,66 @@ def update_open_positions() -> list[dict]:
             if candles is not None:
                 is_emergency, reason = detect_emergency_reversal(direction, candles)
                 if is_emergency:
-                    now_iso = _now()
+                    now_iso = now.isoformat(timespec="seconds")
                     _close_trade(trade, "EMERGENCY_EXIT", price, entry_price,
                                  emergency_reason=reason, at=now_iso)
                     trade["last_status_change"] = now_iso
                     trade["last_checked_at"] = now_iso
+                    outbox.queue(trade, now=now)
                     changed.append(trade)
+                    touched = True
                     continue
 
         # One bar -- the range since the last poll -- through the SAME
         # transition function the historical catch-up replays bar by bar.
-        if apply_bar(trade, hi, lo, dt.datetime.now()):
+        if apply_bar(trade, hi, lo, now):
+            # Queued in the SAME pass that mutates the trade, so the intent to
+            # notify is written by the same save that writes the transition.
+            # Sending happens afterwards, in `flush_alerts` -- a send that fails
+            # then leaves the alert owed rather than losing it, which is exactly
+            # what used to happen once the store said "already changed".
+            outbox.queue(trade, now=now)
             changed.append(trade)
 
         # Written for every trade actually evaluated (changed or not), so the
         # next run can tell how much price action it missed. Not written for
         # trades skipped above (closed market, no price): those genuinely were
         # not checked, and pretending otherwise would hide a real gap.
-        trade["last_checked_at"] = _now()
+        #
+        # This is also the input to `refresh_lookback_minutes` above, so a
+        # stamp written here is what sizes the NEXT pass's window.
+        trade["last_checked_at"] = now.isoformat(timespec="seconds")
+        touched = True
 
-    _save(trades)
+    # Only rewrite when something in the list actually moved. On a cycle with
+    # no open positions -- or with only stock positions while the market is
+    # closed, which is most of the day -- nothing was mutated, and rewriting an
+    # unchanged 110 KB store every two minutes is pure churn against the same
+    # file the backup snapshot reads.
+    if touched:
+        _save(trades)
     for trade in changed:
         _journal_safe(trade)
     return changed
+
+
+def flush_alerts(send) -> dict:
+    """Deliver every alert this model still owes, oldest first.
+
+    Covers BOTH the transitions `update_open_positions` just queued and
+    anything left over from an earlier cycle whose send failed -- one code
+    path, so a retried alert cannot behave differently from a fresh one.
+
+    `send(trade) -> bool` is the runner's transport: it owns formatting and
+    routing, which is why this takes a callback rather than importing the
+    notifier. The store is rewritten only when something was actually
+    attempted.
+    """
+    trades = _load()
+    result = outbox.flush(trades, send)
+    if result["attempted"]:
+        _save(trades)
+    return result
 
 
 def catch_up_open_positions(now: dt.datetime | None = None) -> CatchUpReport:

@@ -36,10 +36,26 @@ different status vocabularies and different minimum R:R.
 Other usage:
     ... --no-email      # skip the email stage
     ... --no-llm        # deterministic report, full delivery
+    ... --scheduled     # unattended: implies --no-llm so delivery always happens
     ... --min-closed 5  # override the sample gate
 
+SCHEDULING THIS
+---------------
+Phase 1 is interactive by design: above the sample gate it stops at exit code 3
+and waits for a narrative. A Task Scheduler entry that runs the bare command
+therefore archives nothing and emails nothing, every day, and reports only a
+non-zero exit code. Use `--scheduled` for unattended runs -- it forces the
+deterministic report through to archive and email:
+
+    schtasks /Create /TN "TRADEIN daily report" /SC DAILY /ST 21:30 ^
+      /TR "python C:\\Users\\Dor\\Desktop\\TRADEIN\\agents\\steve\\daily_tradein_analyzer.py --scheduled"
+
+The narrative path stays exactly as it was for interactive/agent use, and
+`--narrative <file>` still delivers a real narrative whoever invoked it.
+
 Exit codes: 0 = success, 1 = a stage failed (Task Scheduler surfaces this),
-3 = metrics emitted, awaiting an externally generated narrative (phase 2).
+3 = metrics emitted, awaiting an externally generated narrative (phase 2;
+never returned under `--scheduled`).
 """
 from __future__ import annotations
 
@@ -465,6 +481,10 @@ def main() -> int:
     parser.add_argument("--no-email", action="store_true", help="skip the email stage")
     parser.add_argument("--no-llm", action="store_true",
                         help="skip the narrative handoff; deliver the deterministic report")
+    parser.add_argument("--scheduled", action="store_true",
+                        help="unattended mode (Task Scheduler): implies --no-llm, so the report "
+                             "is always archived and emailed instead of stopping at exit code 3 "
+                             "to wait for a narrative nobody is there to write")
     parser.add_argument("--narrative", metavar="FILE",
                         help="phase 2: deliver an externally generated narrative Markdown file")
     parser.add_argument("--include-incubating", action="store_true",
@@ -475,11 +495,25 @@ def main() -> int:
                              "(default: %(default)s)")
     args = parser.parse_args()
 
+    # Unattended runs must always DELIVER something. The narrative handoff exits
+    # 3 and waits for a human (or an agent) to write the Markdown and re-invoke
+    # with --narrative; from Task Scheduler that means the report is never
+    # archived and never emailed, and the only trace is a non-zero exit code
+    # nobody reads. The live sample is already past the gate, so this is the
+    # current behaviour rather than a hypothetical one.
+    #
+    # --narrative still wins: delivering a narrative that was actually written
+    # is never the wrong thing to do, whoever invoked it.
+    if args.scheduled and not args.narrative:
+        args.no_llm = True
+
     global MODELS
     if args.include_incubating:
         MODELS = active_models()
 
     logger.info("=== daily_tradein_analyzer start ===")
+    if args.scheduled:
+        logger.info("Scheduled/unattended run: deterministic report, narrative handoff skipped.")
     logger.info("Reporting on %d active model(s): %s",
                 len(MODELS), ", ".join(m.label for m in MODELS) or "none")
     # Named explicitly so a paused model is never silently missing from a

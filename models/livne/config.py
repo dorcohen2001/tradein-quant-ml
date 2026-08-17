@@ -526,7 +526,8 @@ FUNNEL_EXPORT_INTERVAL_MINUTES = 15
 # Where file-persisted interval gates keep their last-fire markers (see
 # core.scheduling). Needed because the supervisor launches this runner as a
 # fresh `--once` process per tick, so an in-memory gate would reset every time.
-GATE_STATE_STORE = os.path.join(RUNTIME_DIR, "state", f"gates_{MODEL_KEY}.json")
+STATE_DIR = os.path.join(RUNTIME_DIR, "state")
+GATE_STATE_STORE = os.path.join(STATE_DIR, f"gates_{MODEL_KEY}.json")
 
 # ---------------------------------------------------------------------------
 # Historical catch-up (core.paper_trading.catch_up)

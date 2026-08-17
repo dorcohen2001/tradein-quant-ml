@@ -26,6 +26,15 @@ It never touches `models/livne/`, `models/biton/`, anything under `runtime/`,
 or any other file in `core/`. It refuses to overwrite an existing directory
 without `--force`, and refuses a key that collides with a registered model.
 
+DESTRUCTIVE PATHS ARCHIVE FIRST
+-------------------------------
+`--remove` and `--force` both destroy a client's `strategy/screener.py`, which
+is the one file in the tree that is NOT generated -- it is the strategy, often
+after weeks of tuning, and frequently uncommitted. Both now zip the directory
+into `backups/client_models/` and verify the archive before proceeding, and
+both ABORT if that archive cannot be written. Runtime state was always
+preserved on removal; the code that produced it now is too.
+
 Every runtime artifact the generated model uses is derived from its key by
 `core.registry`, so its trade store, journal, funnel exports and chart prefix
 are namespaced from the moment it exists -- there is no step where a client
@@ -46,10 +55,12 @@ must not be visible to whoever can read the main channel.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import re
 import shutil
 import sys
+import zipfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -57,6 +68,10 @@ if REPO_ROOT not in sys.path:
 
 REGISTRY_PATH = os.path.join(REPO_ROOT, "core", "registry.py")
 MODELS_DIR = os.path.join(REPO_ROOT, "models")
+# Where a client's source tree is archived before it is deleted or overwritten.
+# Under `backups/` because that directory is already gitignored and already the
+# place restore points live.
+MODEL_ARCHIVE_DIR = os.path.join(REPO_ROOT, "backups", "client_models")
 
 BEGIN_MARKER = "# CLIENT MODELS BEGIN"
 END_MARKER = "    # CLIENT MODELS END"
@@ -965,6 +980,66 @@ def deregister(full_key: str) -> bool:
 # ===========================================================================
 # Generation
 # ===========================================================================
+def archive_model_dir(model_dir: str, full_key: str, reason: str) -> str | None:
+    """Zip a client's source tree before it is destroyed. Returns the archive
+    path, or None if there was nothing to archive.
+
+    WHY THIS IS NOT OPTIONAL
+    ------------------------
+    `strategy/screener.py` is the one file in a generated tree that is not
+    generated: it holds the client's actual rules, often after weeks of tuning.
+    Both destructive paths used to take it out with no copy --
+
+        --remove   shutil.rmtree(model_dir)
+        --force    re-renders every template over the existing files, putting
+                   the placeholder trend-pullback rule back
+
+    -- and if the work was never committed, that was the end of it. Runtime
+    state was always preserved (deliberately: it is the client's trade history)
+    while the code that produced it was not, which is precisely backwards.
+
+    Raising rather than swallowing is intentional: if the archive cannot be
+    written, the caller must NOT proceed to delete.
+    """
+    if not os.path.isdir(model_dir):
+        return None
+
+    os.makedirs(MODEL_ARCHIVE_DIR, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path = os.path.join(MODEL_ARCHIVE_DIR, f"{full_key}_{reason}_{stamp}.zip")
+
+    # .part + rename, matching backup_manager: an interrupted write must never
+    # leave a truncated archive that looks like a usable copy.
+    partial = f"{archive_path}.part"
+    count = 0
+    try:
+        with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for dirpath, dirnames, filenames in os.walk(model_dir):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for name in sorted(filenames):
+                    if name.endswith((".pyc", ".pyo")):
+                        continue
+                    absolute = os.path.join(dirpath, name)
+                    zf.write(absolute, os.path.relpath(absolute, MODELS_DIR).replace(os.sep, "/"))
+                    count += 1
+        os.replace(partial, archive_path)
+    except BaseException:
+        if os.path.exists(partial):
+            os.remove(partial)
+        raise
+
+    # Read it back. An archive that was never verified is a guess, and this one
+    # is the only remaining copy the moment the caller proceeds.
+    with zipfile.ZipFile(archive_path) as zf:
+        if zf.testzip() is not None:
+            raise RuntimeError(f"archive {archive_path} failed its CRC check")
+
+    size_kb = os.path.getsize(archive_path) / 1024
+    print(f"  archived {count} file(s) -> {os.path.relpath(archive_path, REPO_ROOT)} "
+          f"({size_kb:.0f} KB, CRC OK)")
+    return archive_path
+
+
 def _write(path: str, content: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -1058,9 +1133,12 @@ def main() -> int:
                     help="give this tenant its OWN Telegram channel instead of the shared "
                          "primary hub. Its route becomes strict: with no credentials of its "
                          "own it sends nothing rather than falling back to the hub.")
-    ap.add_argument("--force", action="store_true", help="overwrite an existing model directory")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing model directory (archived to "
+                         "backups/client_models/ first)")
     ap.add_argument("--remove", metavar="KEY",
-                    help="deregister and DELETE a generated client model (runtime state is kept)")
+                    help="deregister and DELETE a generated client model. The source tree is "
+                         "archived to backups/client_models/ first; runtime state is kept.")
     args = ap.parse_args()
 
     if args.remove:
@@ -1109,6 +1187,19 @@ def _do_create(args) -> int:
     description = args.description or f"Client strategy on {args.timeframe} {args.asset_class}."
 
     print(f"Scaffolding {full_key} ({args.name})")
+
+    # --force re-renders every template over whatever is there, which puts the
+    # placeholder rule back over a tuned `strategy/screener.py`. Archive first,
+    # and abort if the archive cannot be written -- overwriting the only copy
+    # of a client's strategy is not something to do on a best-effort basis.
+    if os.path.isdir(model_dir):
+        print(f"  --force: {full_key} already exists, archiving before overwrite")
+        try:
+            archive_model_dir(model_dir, full_key, "preoverwrite")
+        except Exception as exc:
+            print(f"[error] could not archive {model_dir} ({exc}); refusing to overwrite.",
+                  file=sys.stderr)
+            return 1
     scaffold(full_key, args.name, args.interval, args.timeframe, args.asset_class,
              description, dedicated=args.dedicated_route)
 
@@ -1146,6 +1237,16 @@ def _do_remove(key: str) -> int:
         print(f"  {full_key} was not registered (nothing to deregister)")
 
     if os.path.isdir(model_dir):
+        # Archive BEFORE deleting, and abort if that fails. `strategy/screener.py`
+        # is the client's own work; removing a scaffold is not a decision to
+        # destroy it, and an uncommitted tuning session is otherwise gone.
+        try:
+            archive_model_dir(model_dir, full_key, "preremove")
+        except Exception as exc:
+            print(f"[error] could not archive {model_dir} ({exc}); NOT deleting it. "
+                  f"The registry entry was already removed -- re-register with the "
+                  f"generator, or fix the archive path and re-run --remove.", file=sys.stderr)
+            return 1
         shutil.rmtree(model_dir)
         print(f"  deleted models/{full_key}/")
     else:
@@ -1156,6 +1257,8 @@ def _do_remove(key: str) -> int:
     # scaffold is not a statement about the data it produced.
     print(f"  runtime artifacts for {full_key} were left in place "
           f"(trade store, journal, charts, funnel exports)")
+    print(f"  source tree archived under backups/client_models/ -- unzip it into "
+          f"models/ and re-run the generator to restore")
     return 0
 
 

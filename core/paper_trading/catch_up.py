@@ -58,10 +58,16 @@ from dataclasses import dataclass, field
 
 from core.utils.telegram_notifier import escape_markdown, escape_markdown_code
 
-# Terminal statuses across every model. A trade in one of these is finished and
-# is never replayed. Kept as a superset rather than per-model because this
+# Non-terminal statuses across every model. A trade NOT in this set is finished
+# and is never replayed. Kept as a superset rather than per-model because this
 # module only needs "is there anything left to do", not the vocabulary itself.
-_OPEN_STATUSES = frozenset({"PENDING", "ACTIVE", "PARTIAL_TP1"})
+#
+# Public: the migration script and any future tooling that has to ask "is this
+# position still open" must use this set rather than writing a fourth copy of
+# it -- a copy that missed PARTIAL_TP1 would treat a half-closed Livne position
+# as finished.
+OPEN_STATUSES = frozenset({"PENDING", "ACTIVE", "PARTIAL_TP1"})
+_OPEN_STATUSES = OPEN_STATUSES  # pre-existing private name, kept for callers
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,47 @@ def last_checked_at(trade: dict) -> dt.datetime | None:
         if parsed is not None:
             return parsed
     return None
+
+
+def refresh_lookback_minutes(trade: dict, now: dt.datetime, floor_minutes: float,
+                             ceiling_minutes: float) -> float:
+    """How far back the LIVE refresh must look to cover everything it missed.
+
+    The live loop tests stops and targets against the range traded since the
+    last poll, collapsed into one bar. Sizing that range from the model's
+    nominal cycle interval is wrong, and quietly so: the supervisor schedules
+    from cycle START and allows a cycle to run for `phase_timeout_seconds`
+    (480s by default), so on a 2-minute cadence a slow scan means the real gap
+    between two position checks is the cycle's DURATION, not its interval.
+    Everything older than the last two minutes of it was then never examined --
+    and the historical catch-up does not cover it either, because its floor is
+    `min_gap_minutes` (30). That left an unexamined band between the two.
+
+    Measuring from `last_checked_at` closes the band with no new state: the
+    field is already written on every evaluated trade, it was simply never read
+    back.
+
+    Bounds:
+      * `floor_minutes` (the cycle interval) keeps a healthy cycle asking for
+        exactly what it always did, so nothing about steady state changes.
+      * `ceiling_minutes` (the catch-up floor) is where this stops being the
+        right tool -- past it, the bar-by-bar replay grades the gap properly
+        instead of flattening hours into one high/low, which would resolve at
+        the wrong price and stamp the wrong time.
+
+    A trade with no usable timestamp gets the ceiling: it is the conservative
+    direction, and the alternative (assume it was just checked) is the exact
+    assumption that hid the gap in the first place.
+    """
+    floor_minutes = max(float(floor_minutes), 1.0)
+    ceiling_minutes = max(float(ceiling_minutes), floor_minutes)
+
+    last = last_checked_at(trade)
+    if last is None or last > now:
+        return ceiling_minutes
+
+    elapsed = (now - last).total_seconds() / 60.0
+    return min(max(elapsed, floor_minutes), ceiling_minutes)
 
 
 def gap_window(trade: dict, now: dt.datetime, config: CatchUpConfig) -> tuple[dt.datetime, dt.datetime] | None:

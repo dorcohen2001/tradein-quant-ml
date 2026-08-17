@@ -85,6 +85,16 @@ A single model can still be run directly, exactly as before:
 cd models/livne && python live_runner.py --asset-class both
 ```
 
+**One instance per model.** Each runner takes an advisory lock on its own key
+(`core/locking.py`, `runtime/state/tenant_<key>.lock`) before doing any work. A
+second copy of the same model — a manual run while the supervisor is up, or a
+stale Task Scheduler entry — refuses to start, names the PID holding the lock,
+and exits non-zero without reading or writing anything. That is not a
+convenience: the trade store is read-modify-write, so two writers do not
+corrupt the file, they silently erase each other's transitions while both send
+alerts. The lock is released by the OS if a runner is killed, so the
+supervisor's phase timeout cannot wedge a tenant.
+
 Dry-run scan, no alerts and no paper trades logged:
 
 ```bash
@@ -152,9 +162,14 @@ otherwise. To split one out, set a per-route variable — the route name is the
 model key:
 
 ```
-TELEGRAM_CHAT_ID_LIVNE=-1001234567890
-TELEGRAM_BOT_TOKEN_LIVNE=...        # optional; inherits the shared bot if unset
+TELEGRAM_ROUTE_LIVNE_CHAT_ID=-1001234567890
+TELEGRAM_ROUTE_LIVNE_TOKEN=...      # optional; inherits the shared bot if unset
 ```
+
+Those exact names come from `core.settings.route_env_names()`, which is also
+what the client scaffolder prints — read them from its output rather than
+retyping. (The older `TELEGRAM_CHAT_ID_<KEY>` / `TELEGRAM_BOT_TOKEN_<KEY>` form
+is still honoured, so existing deployments keep working.)
 
 Or configure several at once with a JSON blob, which takes precedence:
 
@@ -176,6 +191,15 @@ live trade state. `scripts/backup_manager.py` covers that gap:
 ```bash
 python scripts/backup_manager.py --mode full
 ```
+
+**The supervisor now takes a verified `runtime` snapshot every 6 hours on its
+own** (keeping 30, ~115 KB each), so live trade state is protected without
+anyone remembering to run anything. Tune with `RUNTIME_BACKUP_INTERVAL_MINUTES`
+/ `RUNTIME_BACKUP_RETENTION`; `0` disables it and the supervisor says so loudly
+at startup. Snapshots are safe to take against running tenants — every state
+write is temp-file + `os.replace`, so a reader sees one complete file or the
+next, never a partial one. `--mode full` remains manual: it is the pre-refactor
+restore point, and taking one is a decision.
 
 `--mode runtime` archives only the live stores and journals (cheap enough to
 schedule); `--mode code` is source-only. Archives land in `backups/`, keep the
@@ -251,16 +275,24 @@ one entry between the `CLIENT MODELS` markers in `core/registry.py`. It never
 touches an existing model or anything under `runtime/`. `--remove alpha`
 reverses it cleanly, keeping any runtime history.
 
-The new model is registered as **`stage="incubating"`** with a **dedicated
-Telegram route**:
+The new model is registered as **`stage="incubating"`** on its own named
+Telegram route.
+
+> **That route resolves to the shared primary hub by default.** The platform
+> default is one channel for every tenant, each alert prefixed with the model
+> name — so a freshly scaffolded client posts into the main `TELEGRAM_CHAT_ID`
+> group alongside Livne and Biton. Pass **`--dedicated-route`** when a client's
+> signals must not be visible to whoever reads the main channel. That flag, and
+> only that flag, gives the tenant its own channel *and* makes its route strict.
 
 | Guarantee | Mechanism |
 |---|---|
 | Runs like any other model | Supervisor schedules it on its own interval, in its own process, with its own timeout |
-| Cannot leak signals | `dedicated_route=True` disables the shared-chat fallback — unconfigured means it sends *nothing* |
 | Cannot collide | Every runtime path derives from the model key |
 | Cannot skew the numbers | Excluded from Steve's report until graduated (`--include-incubating` to peek) |
 | Cannot take others down | A crash or hang is contained by the supervisor's per-model subprocess + timeout |
+| Cannot run twice | A per-model advisory lock (`core/locking.py`); a second instance refuses to start and names the PID holding it |
+| Cannot leak signals — **only with `--dedicated-route`** | `dedicated_route=True` disables the shared-chat fallback, so an unconfigured route sends *nothing* rather than falling back to the hub |
 
 **→ Full walkthrough: [`docs/CLIENT_ONBOARDING_GUIDE.md`](docs/CLIENT_ONBOARDING_GUIDE.md)**
 **→ Strategy spec sheet to send the client: [`docs/STRATEGY_SPEC_TEMPLATE.md`](docs/STRATEGY_SPEC_TEMPLATE.md)** — the

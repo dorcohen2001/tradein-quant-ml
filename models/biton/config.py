@@ -175,6 +175,12 @@ MODEL_ENABLED = _MODEL.enabled
 PAPER_TRADING_STORE = _MODEL.trade_store
 PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 
+# Where cross-process coordination files live: the one-instance-per-tenant lock
+# (core.locking) and any file-persisted gate markers. The lock is what stops a
+# manual run and a supervisor-launched cycle from both read-modify-writing the
+# store above, where the second save would erase the first's transitions.
+STATE_DIR = os.path.join(RUNTIME_DIR, "state")
+
 # ---------------------------------------------------------------------------
 # Live funnel diagnostics (screener/funnel_diagnostics.py) -- shared directory
 # with Livne's own live_funnel_livne_*.xlsx reports; filenames are namespaced

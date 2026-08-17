@@ -246,10 +246,13 @@ pytest tests/
 Confirm before declaring success:
 
 - [ ] Dry run exits `0` and prints per-symbol accept/reject reasons
-- [ ] Supervisor lists it as `[incubating]` with `dedicated`
+- [ ] Supervisor lists it as `[incubating]` — and as `dedicated` **only if you
+      passed `--dedicated-route`**; without that flag it routes to the shared
+      hub, which is the platform default and must be stated to the client
 - [ ] Full test suite passes
 - [ ] `runtime/stores/trades_livne.json` and `trades_biton.json` are unchanged
-- [ ] A test alert arrived in the **client's** channel and nowhere else
+- [ ] A test alert arrived where you expect — the client's own channel for a
+      dedicated tenant, the main group for a hub tenant — and nowhere else
 
 ---
 

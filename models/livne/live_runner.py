@@ -63,10 +63,12 @@ from config import (
     REPORT_STATE_STORE,
     REPORT_UPDATE_STATUSES,
     SEND_EMPTY_DAILY_REPORT,
+    STATE_DIR,
     TELEGRAM_ROUTE,
     TOP_N_ASSETS,
     WEEKLY_REPORT_WEEKDAY,
 )
+from core.locking import TenantBusy, TenantLock
 from core.reporting.summary import (
     build_daily_summary,
     build_weekly_summary,
@@ -85,6 +87,7 @@ from generator.trade_generator import build_trade_setup, format_telegram_message
 from macro.macro_analyzer import get_macro_context
 from paper_trading.tracker import (
     catch_up_open_positions,
+    flush_alerts,
     get_all_trades,
     has_open_trade,
     log_trade,
@@ -180,19 +183,45 @@ def process_catch_up() -> None:
               f"(telegram {'sent' if result['ok'] else 'FAILED'})", file=sys.stderr)
 
 
+def _send_status_update(trade: dict) -> bool:
+    """Transport for one queued status alert. True only on confirmed delivery.
+
+    The outbox clears an entry on True and keeps owing it on False, so this
+    must never report success for a send the transport did not confirm.
+    """
+    result = send_telegram_message(
+        _format_status_update(trade),
+        reply_to_message_id=trade.get("telegram_message_id"),
+        route=TELEGRAM_ROUTE,
+    )
+    print(
+        f"[paper] {trade['ticker']} -> {trade['current_status']} "
+        f"(telegram {'sent' if result['ok'] else 'FAILED -- stays queued'})",
+        file=sys.stderr,
+    )
+    return bool(result["ok"])
+
+
 def process_open_positions() -> None:
-    changed = update_open_positions()
-    for trade in changed:
-        result = send_telegram_message(
-            _format_status_update(trade),
-            reply_to_message_id=trade.get("telegram_message_id"),
-            route=TELEGRAM_ROUTE,
-        )
-        print(
-            f"[paper] {trade['ticker']} -> {trade['current_status']} "
-            f"(telegram {'sent' if result['ok'] else 'FAILED'})",
-            file=sys.stderr,
-        )
+    """Refresh positions, then deliver everything this model owes.
+
+    The two halves are deliberately separate. `update_open_positions` persists
+    each transition together with an outbox entry; `flush_alerts` then sends.
+    A failed send therefore leaves the alert OWED rather than losing it -- the
+    old code sent inline after the store was already written, so three failed
+    attempts meant the notification was gone permanently and silently.
+    """
+    update_open_positions()
+
+    outcome = flush_alerts(_send_status_update)
+    if outcome["attempted"]:
+        print(f"[outbox] {outcome['sent']}/{outcome['attempted']} alert(s) delivered"
+              + (f", {outcome['failed']} still queued" if outcome["failed"] else ""),
+              file=sys.stderr)
+    if outcome["abandoned"]:
+        print(f"[outbox] WARNING: {outcome['abandoned']} alert(s) abandoned after "
+              f"repeated failures -- they are kept on their trade records as "
+              f"`pending_alert.abandoned` and will NOT be retried.", file=sys.stderr)
 
 
 def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False,
@@ -229,6 +258,11 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
         candidates = scan_stocks(macro) if cls == "stocks" else scan_crypto(macro)
         print(f"[screener] {len(candidates)} candidates passed liquidity/TA filters", file=sys.stderr)
 
+        # One snapshot per asset class, rather than a full store read+migrate per
+        # candidate. Safe within a pass: a watchlist has no duplicate tickers, so
+        # no candidate below can be affected by a trade logged for an earlier one.
+        open_trades = [] if dry_run else get_all_trades()
+
         if export_funnel:
             try:
                 print(f"[funnel] Tracing {cls} watchlist for the diagnostic report...", file=sys.stderr)
@@ -241,7 +275,7 @@ def run(asset_class: str, top_n: int, candidate_pool: int, dry_run: bool = False
             if accepted >= top_n:
                 break
 
-            if not dry_run and has_open_trade(candidate.ticker, cls):
+            if not dry_run and has_open_trade(candidate.ticker, cls, trades=open_trades):
                 print(
                     f"[dedup] {candidate.ticker} already has an open/active paper "
                     f"trade — skipping duplicate alert",
@@ -432,15 +466,40 @@ def main():
               file=sys.stderr)
         print("[runner] Stored state is untouched. Set enabled=True to resume, "
               "or pass --force for a one-off run.", file=sys.stderr)
-        return
+        return 0
 
+    # ONE INSTANCE PER MODEL. Everything below read-modify-writes this model's
+    # trade store, and `save_trades` being atomic prevents a torn file, not a
+    # lost update: a second process would load the same records, apply its own
+    # transitions, and its save would erase this one's -- while both sent their
+    # own Telegram alerts. `--force` deliberately does NOT override this; it
+    # overrides the deactivation flag, and running two copies is never what
+    # anyone means by it.
+    lock = TenantLock(STATE_DIR, MODEL_KEY)
+    try:
+        lock.acquire()
+    except TenantBusy as exc:
+        print(f"[runner] {exc}", file=sys.stderr)
+        print("[runner] Nothing was read or written. If that PID is gone, the OS has "
+              "already released the lock and the next start will succeed.", file=sys.stderr)
+        return 1
+
+    try:
+        return _run_until_stopped(args)
+    finally:
+        lock.release()
+
+
+def _run_until_stopped(args) -> int:
+    """The cycle loop itself, run with this model's lock already held."""
     if args.once:
         try:
             run_cycle(args)
         except Exception as exc:
             print(f"[runner] Cycle failed at {_timestamp()}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-        return
+            return 1
+        return 0
 
     print(f"[runner] Starting continuous execution loop "
           f"(every {CYCLE_INTERVAL_MINUTES} min). Press Ctrl+C to stop.", file=sys.stderr)
@@ -470,10 +529,14 @@ def main():
         except KeyboardInterrupt:
             print(f"\n[runner] Stopped by user at {_timestamp()}.", file=sys.stderr)
             break
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        # The exit code is load-bearing: the supervisor records a non-zero child
+        # as an `error` heartbeat, which is exactly how a refused duplicate
+        # start should surface on the fleet dashboard.
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         print(f"\n[runner] Stopped by user at {_timestamp()}.", file=sys.stderr)
