@@ -233,6 +233,35 @@ _MODELS: tuple[ModelConfig, ...] = (
         # To re-enable: set this back to True. Nothing else needs changing.
         enabled=False,
     ),
+    ModelConfig(
+        key="horizon",
+        label="Horizon model",
+        description=("MTFA intraday derived from Livne, recalibrated against the LOSS_SL drag: "
+                     "high-conviction reversals only, tighter volume gate, per-asset-class risk, "
+                     "a midday session block for equities, and a stagnation exit."),
+        cycle_interval_minutes=2,
+        # Livne's vocabulary plus STAGNATION_EXIT. It is a REAL close with a
+        # realized P&L -- a position cut for going nowhere, before it decays
+        # into a full stop -- so it belongs in closed_with_pnl as well.
+        # Omitting it there would drop every stagnation close out of win rate,
+        # profit factor, expectancy and drawdown: precisely the silent metric
+        # corruption this module's docstring records having happened once.
+        closed_statuses=("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT",
+                         "STAGNATION_EXIT", "EXPIRED"),
+        update_statuses=("PARTIAL_TP1",),
+        closed_with_pnl=("WIN_TP2", "LOSS_SL", "LOSS_SL_BE", "EMERGENCY_EXIT",
+                         "STAGNATION_EXIT"),
+        telegram_route="horizon",
+        # Incubating: it runs on its own interval and alerts on its own route,
+        # but stays OUT of the executive report until it has earned a place
+        # there. A recalibration with no live evidence must not move the
+        # headline numbers Livne is judged by.
+        stage="incubating",
+        # PAUSED on arrival, deliberately. Nothing about this model has traded
+        # yet; it is enabled by hand after the graduation checklist in
+        # docs/CLIENT_ONBOARDING_GUIDE.md has actually been walked.
+        enabled=False,
+    ),
     # ------------------------------------------------------------------
     # CLIENT MODELS BEGIN -- managed by scripts/create_client_model.py
     #
