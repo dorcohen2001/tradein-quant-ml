@@ -159,7 +159,12 @@ MODEL_STAGE = _MODEL.stage
 PAPER_TRADING_STORE = _MODEL.trade_store
 PAPER_TRADING_JOURNAL_XLSX = _MODEL.journal_xlsx
 REPORT_STATE_STORE = _MODEL.report_state_store
-GATE_STATE_STORE = os.path.join(RUNTIME_DIR, "state", f"gates_{MODEL_KEY}.json")
+# Cross-process coordination: the one-instance-per-tenant lock (core.locking)
+# and any file-persisted gate markers live here. The lock is what stops a manual
+# run and a supervisor-launched cycle from both read-modify-writing the trade
+# store, where the second save would erase the first's transitions.
+STATE_DIR = os.path.join(RUNTIME_DIR, "state")
+GATE_STATE_STORE = os.path.join(STATE_DIR, f"gates_{MODEL_KEY}.json")
 CHART_OUTPUT_DIR = os.path.join(RUNTIME_DIR, "charts")
 FUNNEL_LOG_DIR = os.path.join(RUNTIME_DIR, "funnel_logs")
 FUNNEL_LOG_PREFIX = _MODEL.funnel_prefix
@@ -496,30 +501,27 @@ before promoting this model to `stage="production"`.
 
 T_RUNNER = '''"""Live runner for __NAME__ (__FULL_KEY__).
 
-Composes the shared primitives in `core/` -- candle feed, paper-trading store,
-gap catch-up, notifier, market-hours gate -- around this model's own rules in
-`strategy/`. Nothing here is client-specific; the strategy is in
-`strategy/screener.py`.
+This file is DELIBERATELY THIN. Everything that is not this client's strategy
+-- the one-instance lock, the cycle order, historical catch-up, the alert
+outbox, scheduled summaries, deduplication, error containment and the CLI the
+supervisor drives -- lives in `core.runtime.TenantRunner` and is shared with
+every other tenant on the platform. A fix there reaches this model without this
+file being touched.
+
+What remains here is the ADAPTER: how this model reads its store, fetches
+candles, and turns a candidate into a setup. The rules themselves are in
+`strategy/`.
 
 Usage:
     python live_runner.py --once            # one cycle, then exit
     python live_runner.py --skip-scan       # only refresh open positions
+    python live_runner.py --once --dry-run  # scan and print, send nothing
     python live_runner.py                   # loop forever
-
-Isolation guarantees, all enforced elsewhere and relied on here:
-  * every runtime path is derived from the model key (core.registry);
-  * the Telegram route is DEDICATED -- an unconfigured route sends nothing
-    rather than falling back to the shared production chat;
-  * the supervisor runs this as its own process with its own timeout, so a
-    crash or hang here cannot affect another model.
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import sys
-import time
-import traceback
 import uuid
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -535,377 +537,240 @@ from config import (
     CATCH_UP_CONFIG,
     CHART_OUTPUT_DIR,
     CHART_SPEC,
-    CYCLE_INTERVAL_MINUTES,
     HISTORY_BARS,
     MAX_SLIPPAGE_PCT,
-    MODEL_ENABLED,
     MODEL_KEY,
-    MODEL_NAME,
-    MODEL_STAGE,
     PAPER_TRADING_STORE,
     PENDING_EXPIRY_HOURS,
-    TELEGRAM_ROUTE,
+    REPORT_STATE_STORE,
+    STATE_DIR,
     TELEGRAM_ROUTE_STRICT,
     TIMEFRAME,
     TOP_N_ASSETS,
     WATCHLIST_CRYPTO,
     WATCHLIST_STOCKS,
 )
-from core.backtesting import IntradayDataFeed
-from core.paper_trading.catch_up import format_catch_up_summary, run_catch_up
+from core.data.market import get_candles, interval_minutes
 from core.paper_trading.store import load_trades, pnl_pct, save_trades
+from core.registry import get_model
+from core.runtime import TenantContext, TenantRunner, TenantStrategy
 from core.utils.chart_attachment import generate_chart_for_setup
-from core.utils.market_hours import is_market_open
-from core.utils.telegram_notifier import (
-    escape_markdown,
-    escape_markdown_code,
-    send_telegram_message,
-    send_telegram_photo,
-)
+from core.utils.telegram_notifier import escape_markdown, escape_markdown_code
 from strategy.screener import evaluate
 
 PENDING_EXPIRY = dt.timedelta(hours=PENDING_EXPIRY_HOURS)
-OPEN_STATUSES = ("PENDING", "ACTIVE")
-
-_feed = IntradayDataFeed(verbose=False)
 
 
-def _now() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
+class Strategy(TenantStrategy):
+    """__NAME__'s adapter onto the shared runner."""
 
+    # This model's non-terminal statuses. Narrower than the platform superset:
+    # it has no partial-close state, so PARTIAL_TP1 must never be treated as
+    # open here.
+    open_statuses = frozenset({"PENDING", "ACTIVE"})
 
-# ---------------------------------------------------------------------------
-# Market data (shared core feed -- cached on disk, both venues)
-# ---------------------------------------------------------------------------
-def get_history(ticker: str, asset_class: str, bars: int = HISTORY_BARS) -> pd.DataFrame:
-    """`bars` most recent candles on the strategy timeframe.
+    # --- state ------------------------------------------------------------
+    def load_trades(self):
+        return load_trades(PAPER_TRADING_STORE)
 
-    The window is requested generously and then tail-sliced: sessions have
-    gaps (weekends, holidays, halts), so asking for exactly `bars` worth of
-    wall-clock time reliably returns fewer than `bars` rows.
-    """
-    minutes = _interval_minutes(TIMEFRAME)
-    end = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    start = end - dt.timedelta(minutes=minutes * bars * 3)
-    df = _feed.get_candles(ticker, asset_class, TIMEFRAME, start, end)
-    return df.tail(bars) if df is not None and len(df) else df
+    def save_trades(self, trades):
+        save_trades(PAPER_TRADING_STORE, trades)
 
+    # --- lifecycle --------------------------------------------------------
+    def apply_bar(self, trade, high, low, ts):
+        """Apply ONE bar's traded range to ONE open trade; True if it moved.
 
-def _interval_minutes(interval: str) -> int:
-    unit = interval[-1]
-    value = int(interval[:-1])
-    return value * {"m": 1, "h": 60, "d": 1440, "w": 10080}.get(unit, 1)
+        The single implementation of this model's lifecycle, used by BOTH the
+        live loop (one call per cycle with the range since the last poll) and
+        the historical catch-up (one call per missed bar). One implementation
+        means a replay can never drift from live behaviour.
 
+        Same-bar ambiguity -- one bar covering both the stop and a target -- is
+        resolved in favour of the STOP. OHLC cannot say which came first, and
+        only the adverse assumption cannot flatter the results.
+        """
+        status = trade["current_status"]
+        if status not in self.open_statuses:
+            return False
 
-def _fetch_crypto(ticker: str, interval: str = "5m", limit: int = 300) -> pd.DataFrame:
-    """Adapter to the signature `core.paper_trading.catch_up` expects."""
-    end = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    start = end - dt.timedelta(minutes=_interval_minutes(interval) * limit)
-    return _feed.get_candles(ticker, "crypto", interval, start, end)
+        direction = trade["direction"]
+        entry_low, entry_high = trade["entry_zone"]
+        stamp = ts.isoformat(timespec="seconds")
 
+        if status == "PENDING":
+            signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
+            # Overlap test, not "is the last price inside the zone right now":
+            # price routinely trades through a narrow zone and back out between
+            # polls, and a point-in-time check silently under-reports fills.
+            if low <= entry_high and high >= entry_low:
+                trade["current_status"] = "ACTIVE"
+                trade["entry_date"] = stamp
+                trade["last_status_change"] = stamp
+                return True
+            if (ts - signal_dt) >= PENDING_EXPIRY:
+                trade["current_status"] = "EXPIRED"
+                trade["exit_date"] = stamp
+                trade["last_status_change"] = stamp
+                return True
+            return False
 
-def _fetch_stock(ticker: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
-    days = int(period.rstrip("d") or 5)
-    end = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    return _feed.get_candles(ticker, "stocks", interval, end - dt.timedelta(days=days), end)
+        entry_price = (entry_low + entry_high) / 2
+        stop = trade["stop_loss"]
+        hit_stop = low <= stop if direction == "LONG" else high >= stop
+        hit_tp2 = high >= trade["target2"] if direction == "LONG" else low <= trade["target2"]
+        hit_tp1 = high >= trade["target1"] if direction == "LONG" else low <= trade["target1"]
 
+        if hit_stop:
+            new_status = "LOSS_SL"
+            exit_price = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
+        elif hit_tp2:
+            new_status, exit_price = "WIN_TP2", trade["target2"]
+        elif hit_tp1:
+            new_status, exit_price = "WIN_TP1", trade["target1"]
+        else:
+            return False
 
-# ---------------------------------------------------------------------------
-# Position lifecycle
-# ---------------------------------------------------------------------------
-def apply_bar(trade: dict, high: float, low: float, ts: dt.datetime) -> bool:
-    """Apply ONE bar's traded range to ONE open trade; True if status changed.
+        trade["current_status"] = new_status
+        trade["exit_date"] = stamp
+        trade["exit_price"] = exit_price
+        trade["pnl_pct"] = pnl_pct(direction, entry_price, exit_price)
+        trade["last_status_change"] = stamp
+        return True
 
-    The single implementation of this model's lifecycle, used by BOTH the live
-    loop (one call per cycle with the range since the last poll) and the
-    historical catch-up (one call per missed bar). One implementation means a
-    replay can never drift from live behaviour.
+    # --- market data ------------------------------------------------------
+    # All of these go through `core.data.market`, the shared cross-tenant
+    # layer, so a symbol another tenant already fetched costs this one no
+    # network call.
+    def history(self, ticker, asset_class, bars=HISTORY_BARS):
+        return get_candles(ticker, asset_class, TIMEFRAME, bars=bars)
 
-    Same-bar ambiguity -- one bar covering both the stop and a target -- is
-    resolved in favour of the STOP. OHLC cannot say which came first, and only
-    the adverse assumption cannot flatter the results.
-    """
-    status = trade["current_status"]
-    if status not in OPEN_STATUSES:
-        return False
+    def current_price(self, ticker, asset_class):
+        frame = get_candles(ticker, asset_class, "5m", bars=2)
+        if frame is None or not len(frame):
+            return None
+        return float(frame["Close"].iloc[-1])
 
-    direction = trade["direction"]
-    entry_low, entry_high = trade["entry_zone"]
-    stamp = ts.isoformat(timespec="seconds")
+    def price_range(self, ticker, asset_class, lookback_minutes):
+        """High/low actually traded since the last check.
 
-    if status == "PENDING":
-        signal_dt = dt.datetime.fromisoformat(trade["signal_date"])
-        # Overlap test, not "is the last price inside the zone right now":
-        # price routinely trades through a narrow zone and back out between
-        # polls, and a point-in-time check silently under-reports fills.
-        if low <= entry_high and high >= entry_low:
-            trade["current_status"] = "ACTIVE"
-            trade["entry_date"] = stamp
-            trade["last_status_change"] = stamp
-            return True
-        if (ts - signal_dt) >= PENDING_EXPIRY:
-            trade["current_status"] = "EXPIRED"
-            trade["exit_date"] = stamp
-            trade["last_status_change"] = stamp
-            return True
-        return False
+        The runner sizes this in MINUTES from `last_checked_at`, so a slow
+        cycle widens the window instead of leaving price action unexamined.
+        The previous scaffold asked for a fixed 3 bars of the STRATEGY
+        timeframe, which at 15m tested levels against a 45-minute range and
+        could fill a PENDING zone price never reached in that cycle.
+        """
+        minutes = max(interval_minutes("5m"), 1)
+        bars = max(2, int(lookback_minutes / minutes) + 2)
+        frame = get_candles(ticker, asset_class, "5m", bars=bars)
+        if frame is None or not len(frame):
+            return None
+        return {"high": float(frame["High"].max()), "low": float(frame["Low"].min())}
 
-    entry_price = (entry_low + entry_high) / 2
-    stop = trade["stop_loss"]
-    hit_stop = low <= stop if direction == "LONG" else high >= stop
-    hit_tp2 = high >= trade["target2"] if direction == "LONG" else low <= trade["target2"]
-    hit_tp1 = high >= trade["target1"] if direction == "LONG" else low <= trade["target1"]
+    def fetch_crypto(self, ticker, interval="5m", limit=300):
+        return get_candles(ticker, "crypto", interval, bars=limit)
 
-    if hit_stop:
-        new_status = "LOSS_SL"
-        exit_price = stop * (1 - MAX_SLIPPAGE_PCT) if direction == "LONG" else stop * (1 + MAX_SLIPPAGE_PCT)
-    elif hit_tp2:
-        new_status, exit_price = "WIN_TP2", trade["target2"]
-    elif hit_tp1:
-        new_status, exit_price = "WIN_TP1", trade["target1"]
-    else:
-        return False
+    def fetch_stock(self, ticker, period="5d", interval="5m"):
+        days = int(str(period).rstrip("d") or 5)
+        bars = max(1, int(days * 24 * 60 / max(interval_minutes(interval), 1)))
+        return get_candles(ticker, "stocks", interval, bars=bars)
 
-    trade["current_status"] = new_status
-    trade["exit_date"] = stamp
-    trade["exit_price"] = exit_price
-    trade["pnl_pct"] = pnl_pct(direction, entry_price, exit_price)
-    trade["last_status_change"] = stamp
-    return True
+    # --- scanning ---------------------------------------------------------
+    def find_candidates(self, asset_class):
+        return WATCHLIST_CRYPTO if asset_class == "crypto" else WATCHLIST_STOCKS
 
+    def candidate_ticker(self, candidate):
+        return candidate
 
-def _tradeable(trade: dict, stocks_open: bool) -> bool:
-    return not (trade["asset_class"] == "stocks" and not stocks_open)
+    def build_setup(self, candidate, asset_class):
+        return evaluate(candidate, asset_class, self.history(candidate, asset_class))
 
+    def log_trade(self, setup, telegram_message_id):
+        trades = self.load_trades()
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        record = {
+            "id": str(uuid.uuid4())[:8],
+            "signal_date": now,
+            "ticker": setup.ticker,
+            "asset_class": setup.asset_class,
+            "direction": setup.direction,
+            "entry_zone": [setup.entry_low, setup.entry_high],
+            "stop_loss": setup.stop,
+            "target1": setup.target1,
+            "target2": setup.target2,
+            "current_status": "PENDING",
+            "entry_date": None,
+            "exit_date": None,
+            "exit_price": None,
+            "pnl_pct": None,
+            "telegram_message_id": telegram_message_id,
+            "last_checked_at": now,
+        }
+        trades.append(record)
+        self.save_trades(trades)
+        return record
 
-def process_catch_up() -> None:
-    """Replay anything missed while this runner was stopped, reported as ONE
-    consolidated message rather than a burst of delayed exit alerts."""
-    trades = load_trades(PAPER_TRADING_STORE)
-    stocks_open = is_market_open()
-    try:
-        report = run_catch_up(
-            trades, apply_bar, fetch_crypto=_fetch_crypto, fetch_stock=_fetch_stock,
-            config=CATCH_UP_CONFIG, is_tradeable=lambda t: _tradeable(t, stocks_open),
+    def chart_for(self, setup):
+        return generate_chart_for_setup(
+            setup, fetch_crypto=self.fetch_crypto, fetch_stock=self.fetch_stock,
+            output_dir=CHART_OUTPUT_DIR, spec=CHART_SPEC, model_key=MODEL_KEY,
         )
-    except Exception as exc:  # noqa: BLE001 -- catch-up must never break the cycle
-        print(f"[catch-up] pass failed (live positions unaffected): {exc}", file=sys.stderr)
-        return
-    if not report.events:
-        return
 
-    save_trades(PAPER_TRADING_STORE, trades)
-    message = format_catch_up_summary(MODEL_NAME, report)
-    if message:
-        send_telegram_message(message, route=TELEGRAM_ROUTE, strict_route=TELEGRAM_ROUTE_STRICT)
+    # --- presentation -----------------------------------------------------
+    # Every dynamic value is escaped: a status like `LOSS_SL` or a ticker like
+    # `BRK_B` contains an underscore, and an unmatched one makes Telegram
+    # reject the ENTIRE message with a 400.
+    def format_status_update(self, trade):
+        status = trade["current_status"]
+        header = "ENTRY ALERT" if status == "ACTIVE" else "EXIT ALERT"
+        lines = [
+            f"[{escape_markdown(self.name)}] {header}",
+            f"`{escape_markdown_code(trade['ticker'])}` ({escape_markdown(trade['direction'])})",
+            f"Status: *{escape_markdown(status)}*",
+        ]
+        if trade.get("exit_price") is not None:
+            lines.append(f"Exit price: `{trade['exit_price']:.4g}`")
+        if trade.get("pnl_pct") is not None:
+            lines.append(f"P&L: *{trade['pnl_pct']:+.2f}%*")
+        return "\\n".join(lines)
 
-
-def process_open_positions() -> None:
-    """Refresh every open position against the range traded since the last
-    poll, and alert on each transition."""
-    trades = load_trades(PAPER_TRADING_STORE)
-    stocks_open = is_market_open()
-    changed = []
-
-    for trade in trades:
-        if trade["current_status"] not in OPEN_STATUSES or not _tradeable(trade, stocks_open):
-            continue
-        df = get_history(trade["ticker"], trade["asset_class"], bars=3)
-        if df is None or not len(df):
-            continue
-        high = float(df["High"].max())
-        low = float(df["Low"].min())
-        if apply_bar(trade, high, low, dt.datetime.now()):
-            changed.append(trade)
-        trade["last_checked_at"] = _now()
-
-    save_trades(PAPER_TRADING_STORE, trades)
-
-    for trade in changed:
-        send_telegram_message(
-            _format_status_update(trade),
-            reply_to_message_id=trade.get("telegram_message_id"),
-            route=TELEGRAM_ROUTE, strict_route=TELEGRAM_ROUTE_STRICT,
-        )
-        print(f"[paper] {trade['ticker']} -> {trade['current_status']}", file=sys.stderr)
+    def format_setup_alert(self, setup):
+        return "\\n".join([
+            f"[{escape_markdown(self.name)}] SETUP ALERT",
+            f"*Asset:* `{escape_markdown_code(setup.ticker)}` ({escape_markdown(setup.asset_class)})",
+            f"*Direction:* *{escape_markdown(setup.direction)}*  |  *Score:* {setup.score}/100",
+            "",
+            f"*Thesis*\\n{escape_markdown(setup.thesis)}",
+            "",
+            f"Entry Zone: `{setup.entry_low:.4g} - {setup.entry_high:.4g}`",
+            f"Stop Loss: `{setup.stop:.4g}`",
+            f"Target 1 (R:R {setup.rr1:.2f}): `{setup.target1:.4g}`",
+            f"Target 2 (R:R {setup.rr2:.2f}): `{setup.target2:.4g}`",
+            "",
+            "\\u26a0\\ufe0f *Not financial advice.* Paper trading only; DYOR.",
+        ])
 
 
-def _format_status_update(trade: dict) -> str:
-    status = trade["current_status"]
-    header = "ENTRY ALERT" if status == "ACTIVE" else "EXIT ALERT"
-    lines = [
-        f"[{escape_markdown(MODEL_NAME)}] {header}",
-        f"`{escape_markdown_code(trade['ticker'])}` ({escape_markdown(trade['direction'])})",
-        f"Status: *{escape_markdown(status)}*",
-    ]
-    if trade.get("exit_price") is not None:
-        lines.append(f"Exit price: `{trade['exit_price']:.4g}`")
-    if trade.get("pnl_pct") is not None:
-        lines.append(f"P&L: *{trade['pnl_pct']:+.2f}%*")
-    return "\\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Scan
-# ---------------------------------------------------------------------------
-def _format_setup(setup) -> str:
-    return "\\n".join([
-        f"[{escape_markdown(MODEL_NAME)}] SETUP ALERT",
-        f"*Asset:* `{escape_markdown_code(setup.ticker)}` ({escape_markdown(setup.asset_class)})",
-        f"*Direction:* *{escape_markdown(setup.direction)}*  |  *Score:* {setup.score}/100",
-        "",
-        f"*Thesis*\\n{escape_markdown(setup.thesis)}",
-        "",
-        f"Entry Zone: `{setup.entry_low:.4g} - {setup.entry_high:.4g}`",
-        f"Stop Loss: `{setup.stop:.4g}`",
-        f"Target 1 (R:R {setup.rr1:.2f}): `{setup.target1:.4g}`",
-        f"Target 2 (R:R {setup.rr2:.2f}): `{setup.target2:.4g}`",
-        "",
-        "\\u26a0\\ufe0f *Not financial advice.* Paper trading only; DYOR.",
-    ])
-
-
-def _log_trade(setup, telegram_message_id=None) -> dict:
-    trades = load_trades(PAPER_TRADING_STORE)
-    record = {
-        "id": str(uuid.uuid4())[:8],
-        "signal_date": _now(),
-        "ticker": setup.ticker,
-        "asset_class": setup.asset_class,
-        "direction": setup.direction,
-        "entry_zone": [setup.entry_low, setup.entry_high],
-        "stop_loss": setup.stop,
-        "target1": setup.target1,
-        "target2": setup.target2,
-        "current_status": "PENDING",
-        "entry_date": None,
-        "exit_date": None,
-        "exit_price": None,
-        "pnl_pct": None,
-        "telegram_message_id": telegram_message_id,
-        "last_checked_at": _now(),
-    }
-    trades.append(record)
-    save_trades(PAPER_TRADING_STORE, trades)
-    return record
-
-
-def run(asset_class: str, top_n: int, dry_run: bool = False) -> list[str]:
-    classes = ["stocks", "crypto"] if asset_class == "both" else [asset_class]
-    reports: list[str] = []
-    open_tickers = {t["ticker"] for t in load_trades(PAPER_TRADING_STORE)
-                    if t["current_status"] in OPEN_STATUSES}
-
-    for cls in classes:
-        if cls == "stocks" and not is_market_open():
-            print("[market] US equities closed -- skipping stocks scan.", file=sys.stderr)
-            continue
-
-        watchlist = WATCHLIST_CRYPTO if cls == "crypto" else WATCHLIST_STOCKS
-        print(f"[screener] scanning {len(watchlist)} {cls} symbols on {TIMEFRAME}...", file=sys.stderr)
-        accepted = 0
-
-        for ticker in watchlist:
-            if accepted >= top_n:
-                break
-            if not dry_run and ticker in open_tickers:
-                print(f"[dedup] {ticker} already has an open position -- skipping.", file=sys.stderr)
-                continue
-
-            setup, reason = evaluate(ticker, cls, get_history(ticker, cls))
-            if setup is None:
-                print(f"[filtered] {reason}", file=sys.stderr)
-                continue
-
-            message = _format_setup(setup)
-            if not dry_run:
-                chart = generate_chart_for_setup(
-                    setup, fetch_crypto=_fetch_crypto, fetch_stock=_fetch_stock,
-                    output_dir=CHART_OUTPUT_DIR, spec=CHART_SPEC, model_key=MODEL_KEY,
-                )
-                if chart:
-                    result = send_telegram_photo(chart, caption=message, route=TELEGRAM_ROUTE,
-                                                 strict_route=TELEGRAM_ROUTE_STRICT)
-                    if not result["ok"]:
-                        result = send_telegram_message(message, route=TELEGRAM_ROUTE,
-                                                       strict_route=TELEGRAM_ROUTE_STRICT)
-                else:
-                    result = send_telegram_message(message, route=TELEGRAM_ROUTE,
-                                                   strict_route=TELEGRAM_ROUTE_STRICT)
-                record = _log_trade(setup, telegram_message_id=result.get("message_id"))
-                print(f"[paper] logged {record['id']} for {setup.ticker}", file=sys.stderr)
-
-            reports.append(message)
-            accepted += 1
-
-        if accepted == 0:
-            print(f"[result] no qualifying {cls} setups this cycle.", file=sys.stderr)
-
-    return reports
-
-
-def run_cycle(args) -> None:
-    process_catch_up()
-    print(f"[{MODEL_NAME}] refreshing open positions...", file=sys.stderr)
-    process_open_positions()
-    if args.skip_scan:
-        return
-    for report in run(args.asset_class, args.top_n, dry_run=args.dry_run):
-        print(report)
-        print("\\n" + "=" * 60 + "\\n")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=f"{MODEL_NAME} live runner")
-    parser.add_argument("--asset-class", choices=["stocks", "crypto", "both"], default=ASSET_CLASS)
-    parser.add_argument("--top-n", type=int, default=TOP_N_ASSETS)
-    parser.add_argument("--candidate-pool", type=int, default=0,
-                        help="accepted for supervisor compatibility; unused by this model")
-    parser.add_argument("--skip-scan", action="store_true")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="scan and print, but send nothing and log nothing")
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--force", action="store_true",
-                        help="run even if this model is disabled in core/registry.py")
-    args = parser.parse_args()
-
-    if not MODEL_ENABLED and not args.force:
-        print(f"[runner] {MODEL_NAME} is DEACTIVATED in core/registry.py -- refusing to run.",
-              file=sys.stderr)
-        print("[runner] Stored state is untouched. Set enabled=True to resume, "
-              "or pass --force for a one-off run.", file=sys.stderr)
-        return
-
-    print(f"[runner] {MODEL_NAME} [{MODEL_STAGE}] route={TELEGRAM_ROUTE} "
-          f"(dedicated={TELEGRAM_ROUTE_STRICT})", file=sys.stderr)
-
-    if args.once:
-        try:
-            run_cycle(args)
-        except Exception as exc:
-            print(f"[runner] cycle failed: {exc}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        return
-
-    while True:
-        try:
-            run_cycle(args)
-        except Exception as exc:
-            print(f"[runner] cycle error: {exc}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        print(f"[runner] sleeping {CYCLE_INTERVAL_MINUTES} min.", file=sys.stderr)
-        try:
-            time.sleep(CYCLE_INTERVAL_MINUTES * 60)
-        except KeyboardInterrupt:
-            break
+def build_runner() -> TenantRunner:
+    """Wire this model's identity, paths and cadence into the shared runner."""
+    context = TenantContext(
+        model=get_model(MODEL_KEY),
+        state_dir=STATE_DIR,
+        catch_up=CATCH_UP_CONFIG,
+        asset_class=ASSET_CLASS,
+        top_n=TOP_N_ASSETS,
+        report_state_store=REPORT_STATE_STORE,
+        telegram_strict=TELEGRAM_ROUTE_STRICT,
+    )
+    return TenantRunner(context, Strategy())
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(build_runner().main())
     except KeyboardInterrupt:
         print("\\n[runner] stopped by user.", file=sys.stderr)
 '''
+
 
 T_REGISTRY_ENTRY = '''    # >>> client:__FULL_KEY__ >>>
     ModelConfig(
@@ -1037,6 +902,11 @@ def archive_model_dir(model_dir: str, full_key: str, reason: str) -> str | None:
     size_kb = os.path.getsize(archive_path) / 1024
     print(f"  archived {count} file(s) -> {os.path.relpath(archive_path, REPO_ROOT)} "
           f"({size_kb:.0f} KB, CRC OK)")
+    if count == 0:
+        # An empty archive followed by a delete is the worst possible mix: the
+        # operator reads "archived" and believes the code is recoverable.
+        print(f"  [warning] {os.path.relpath(model_dir, REPO_ROOT)} contained no archivable "
+              f"files -- there was nothing to preserve.", file=sys.stderr)
     return archive_path
 
 
