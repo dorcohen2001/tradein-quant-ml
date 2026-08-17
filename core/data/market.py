@@ -44,14 +44,17 @@ own TTLs. Claiming this module unified "all market data" would be false.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import threading
 
 import pandas as pd
 
 from core.backtesting.feed import IntradayDataFeed
+from core.backtesting.intervals import INTERVALS, canonical_name, interval_span
 from core.data.cache_policy import bucket_seconds_for
 
-# Minutes per interval token, for turning "N bars" into a time window.
+# Minutes per interval token. Only a FALLBACK for bar sizes the interval
+# registry does not carry -- see `interval_minutes`.
 _UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440, "w": 10080}
 
 # One feed per process. It owns the disk cache handle and an in-process memo,
@@ -62,13 +65,39 @@ _feed_lock = threading.Lock()
 
 
 def interval_minutes(interval: str) -> int:
-    """Bar length in minutes. `15m` -> 15, `1h` -> 60, `1d` -> 1440."""
-    token = interval.strip().lower()
-    unit = token[-1]
+    """Bar length in minutes. `15m` -> 15, `1h` -> 60, `1d` -> 1440.
+
+    THE REGISTRY IS ASKED FIRST, and that is the whole point. This function
+    used to parse `<digits><one letter>` itself, which is a second, poorer copy
+    of knowledge `core.backtesting.intervals` already holds -- and it rejected
+    every venue alias the registry understands. yfinance calls a weekly bar
+    `1wk`; that hit `int("1w")`, raised, and surfaced through the screener's
+    per-ticker guard as
+
+        [screener] AAPL skipped: unrecognised interval '1wk'
+
+    for EVERY stock symbol on EVERY cycle, so the stock side of the funnel
+    silently produced zero candidates while looking like a quiet market. The
+    weekly frame is the first thing `ta.mtfa.build_frames` requests, so nothing
+    downstream of it ran at all.
+
+    The hand parser is kept only as a fallback for bar sizes the registry does
+    not carry (it has no 45m, and no monthly), so nothing that worked before
+    stops working.
+    """
+    span = interval_span(interval)
+    if span is not None:
+        return int(span.total_seconds() // 60)
+
+    token = str(interval).strip().lower()
+    unit = token[-1:]
     try:
         value = int(token[:-1])
     except ValueError as exc:
-        raise ValueError(f"unrecognised interval {interval!r}") from exc
+        raise ValueError(
+            f"unrecognised interval {interval!r}; known intervals are "
+            f"{', '.join(INTERVALS)} (venue aliases such as '1wk' and '60m' are accepted)"
+        ) from exc
     if unit not in _UNIT_MINUTES:
         raise ValueError(f"unrecognised interval unit in {interval!r}")
     return value * _UNIT_MINUTES[unit]
@@ -165,13 +194,43 @@ def period_to_bars(period: str, interval: str) -> int:
 
     Used only to translate a call written against the old fetcher; a caller
     that already thinks in bars should pass `bars` directly.
+
+    THREE REGIMES, because a bar count is not a simple division:
+
+      intraday   `_PERIOD_TRADING_DAYS` counts SESSIONS, and a session is 390
+                 minutes, not 1440. Unchanged.
+      daily      one bar per trading day, so the trading-day count IS the bar
+                 count. Unchanged -- this is the path
+                 `scripts/verify_stock_parity.py` proved equal to the legacy
+                 fetcher across all 70 watchlist symbols.
+      weekly+    a bar spans FIVE trading days, not seven calendar ones. The
+                 old arithmetic floored `1440 // 10080` to 0, clamped it to 1,
+                 and therefore treated a weekly bar as if it were a daily one:
+                 `period="2y"` asked for 520 weekly bars -- ten years of
+                 history where the legacy fetcher returned 105. That is not a
+                 harmless over-fetch. `ta.mtfa` builds its zone map from the
+                 swing extremes of this frame, so eight extra years of
+                 structure silently changes which levels a setup is measured
+                 against. Verified against yfinance: 2y -> 105, 1y -> 53,
+                 6mo -> 27, matching the legacy call exactly.
     """
     days = _PERIOD_TRADING_DAYS.get(period.strip().lower())
     if days is None:
         days = 260
-    minutes_per_day = 390 if interval_minutes(interval) < 1440 else 1440
-    per_day = max(1, minutes_per_day // max(interval_minutes(interval), 1))
-    return max(int(days * per_day), 1)
+
+    minutes = max(interval_minutes(interval), 1)
+    if minutes < 1440:
+        per_day = max(1, 390 // minutes)
+        return max(int(days * per_day), 1)
+
+    # Trading days per bar: 1d -> 1, 1w -> 5. Derived rather than tabulated so
+    # any coarser interval added to the registry is handled without an edit.
+    trading_days_per_bar = max(1, round(minutes / 1440 * 5 / 7))
+    if trading_days_per_bar == 1:
+        return max(int(days), 1)
+    # One extra bar of slack for the partial bars at each end of the window --
+    # this is what reproduces the legacy row counts exactly.
+    return max(int(math.ceil(days / trading_days_per_bar)) + 1, 1)
 
 
 def to_exchange_tz(frame: pd.DataFrame, tz: str = EXCHANGE_TZ) -> pd.DataFrame:

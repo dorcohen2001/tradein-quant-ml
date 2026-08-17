@@ -91,12 +91,18 @@ INTERVALS: dict[str, Interval] = {
 # Aliases so callers can use either the model's config vocabulary
 # (`config.TF_INTERVALS` / `ZONE_DISCOVERY_TFS` say "daily"/"weekly"/"60m")
 # or the venue's.
+#
+# THE WEEKLY ONES ARE LOAD-BEARING. The two venues genuinely disagree: Binance
+# says `1w`, yfinance says `1wk`, and a model's TF_INTERVALS carries whichever
+# its venue uses. Any code that parses an interval string itself, instead of
+# resolving it here, will reject one of them -- which is exactly how every
+# stock symbol came to be skipped with "unrecognised interval '1wk'".
 _ALIASES = {
     "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
     "60m": "1h", "60min": "1h", "hourly": "1h",
     "1hr": "1h", "4hr": "4h",
     "daily": "1d", "1day": "1d", "d": "1d",
-    "weekly": "1w", "1wk": "1w", "w": "1w",
+    "weekly": "1w", "1wk": "1w", "w": "1w", "1week": "1w", "wk": "1w",
 }
 
 # When a venue cannot serve an interval at all for the requested window (a
@@ -121,6 +127,31 @@ def interval_of(name: str) -> Interval:
     if key not in INTERVALS:
         raise KeyError(f"unsupported interval {name!r}; supported: {', '.join(INTERVALS)}")
     return INTERVALS[key]
+
+
+def canonical_name(interval: str) -> str:
+    """This registry's own name for `interval`, resolving venue aliases.
+
+    `1wk` (yfinance) and `1w` (Binance) are the same bar and must resolve to
+    one name -- otherwise they key two separate cache files for one series, and
+    the cross-tenant sharing the shared data layer exists for silently stops
+    working.
+
+    Unknown intervals are returned UNCHANGED rather than raising, so a caller
+    that only wants normalisation (a cache-tier lookup, a log line) is not
+    forced to handle an exception for a string it can still use.
+    """
+    key = str(interval).strip().lower()
+    key = _ALIASES.get(key, key)
+    return key if key in INTERVALS else str(interval).strip().lower()
+
+
+def interval_span(interval: str) -> pd.Timedelta | None:
+    """Bar length for `interval`, or None if this registry does not know it."""
+    try:
+        return interval_of(interval).delta
+    except KeyError:
+        return None
 
 
 def venue_for(asset_class: str) -> str:

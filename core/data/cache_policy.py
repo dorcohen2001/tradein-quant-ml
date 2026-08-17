@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+from core.backtesting.intervals import canonical_name
+
 # 30-minute buckets for daily/weekly context frames, which barely move
 # intraday.
 HISTORY_CACHE_SECONDS = 1800
@@ -43,10 +45,18 @@ MIDRANGE_INTERVALS = frozenset({"1h", "2h", "3h", "4h"})
 
 
 def bucket_seconds_for(interval: str) -> int:
-    """Cache-bucket width for a candle interval, tiered to the bar period."""
-    if interval in LIVE_INTRADAY_INTERVALS:
+    """Cache-bucket width for a candle interval, tiered to the bar period.
+
+    The name is canonicalised first, so a venue alias lands in the tier its BAR
+    PERIOD deserves rather than falling through to the 30-minute default. `60m`
+    is the case that mattered: written that way it missed the 1h-4h tier
+    entirely and a 1h frame was cached for half an hour again -- the exact
+    staleness this module exists to prevent, reintroduced by spelling.
+    """
+    name = canonical_name(interval)
+    if name in LIVE_INTRADAY_INTERVALS:
         return INTRADAY_CACHE_SECONDS
-    if interval in MIDRANGE_INTERVALS:
+    if name in MIDRANGE_INTERVALS:
         return MIDRANGE_CACHE_SECONDS
     return HISTORY_CACHE_SECONDS
 
