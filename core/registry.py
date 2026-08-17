@@ -257,10 +257,20 @@ _MODELS: tuple[ModelConfig, ...] = (
         # there. A recalibration with no live evidence must not move the
         # headline numbers Livne is judged by.
         stage="incubating",
-        # PAUSED on arrival, deliberately. Nothing about this model has traded
-        # yet; it is enabled by hand after the graduation checklist in
-        # docs/CLIENT_ONBOARDING_GUIDE.md has actually been walked.
-        enabled=False,
+        # ACTIVATED 2026-08-17 by operator request. It runs and alerts from the
+        # next supervisor start.
+        #
+        # Enabled WITHOUT a completed baseline backtest -- that is a deliberate
+        # operator decision, recorded here rather than implied. What is still
+        # unestablished is written down in docs/HORIZON_CALIBRATION.md: no live
+        # trades, no full baseline, and no like-for-like comparison against
+        # Livne over the same window. In particular the 1.45x volume gate has
+        # never been measured against trade COUNT, so the first thing to watch
+        # is whether this model produces setups at all.
+        #
+        # It stays `stage="incubating"`, so it still cannot move the headline
+        # numbers Livne is judged by until it is explicitly graduated.
+        enabled=True,
     ),
     # ------------------------------------------------------------------
     # CLIENT MODELS BEGIN -- managed by scripts/create_client_model.py
