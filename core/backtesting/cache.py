@@ -20,6 +20,7 @@ cached series only grows and gaps only ever get filled in.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -107,6 +108,72 @@ class CandleCache:
         safe = _UNSAFE.sub("_", symbol)
         suffix = "parquet" if self.fmt == "parquet" else "csv"
         return self.root / venue / f"{safe}_{interval}.{suffix}"
+
+    def meta_path(self, venue: str, symbol: str, interval: str) -> Path:
+        safe = _UNSAFE.sub("_", symbol)
+        return self.root / venue / f"{safe}_{interval}.meta.json"
+
+    # -- series metadata ----------------------------------------------------
+    def load_meta(self, venue: str, symbol: str, interval: str) -> dict:
+        """What we have learned about this series beyond its candles.
+
+        Currently one fact, and it exists because of a specific waste: a stock
+        that IPO'd in 2023 has no history before its listing, yet a caller
+        asking for five years of context requests one anyway. The request comes
+        back empty, nothing is cached for that span, so the gap is STILL
+        missing on the next cycle -- and is requested again, forever, at one
+        wasted round trip per ticker per cycle. yfinance answers each one with
+        "possibly delisted; no price data found", which is both alarming and
+        wrong: the ticker is listed and trading, it simply did not exist yet.
+
+        A corrupt or absent metadata file is an empty dict, never an error: it
+        is an optimisation hint, and losing it costs one redundant request.
+        """
+        try:
+            with open(self.meta_path(venue, symbol, interval), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def save_meta(self, venue: str, symbol: str, interval: str, meta: dict) -> None:
+        """Persist series metadata. Best-effort and never fatal."""
+        path = self.meta_path(venue, symbol, interval)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=2)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def earliest_available(self, venue: str, symbol: str, interval: str) -> pd.Timestamp | None:
+        """The oldest timestamp this venue will serve for this series, once
+        learned. None means "not known yet, so ask"."""
+        raw = self.load_meta(venue, symbol, interval).get("earliest_available")
+        if not raw:
+            return None
+        try:
+            return pd.Timestamp(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def record_earliest(self, venue: str, symbol: str, interval: str,
+                        earliest: pd.Timestamp) -> None:
+        """Remember that nothing exists before `earliest` for this series.
+
+        Only ever moves the floor EARLIER-to-later on first discovery and then
+        keeps the oldest known value, so a transient empty response cannot
+        permanently shrink a series' known history.
+        """
+        meta = self.load_meta(venue, symbol, interval)
+        known = self.earliest_available(venue, symbol, interval)
+        if known is not None and known <= earliest:
+            return
+        meta["earliest_available"] = pd.Timestamp(earliest).isoformat()
+        meta["earliest_recorded_at"] = pd.Timestamp.now("UTC").isoformat()
+        self.save_meta(venue, symbol, interval, meta)
 
     # -- io -----------------------------------------------------------------
     def load(self, venue: str, symbol: str, interval: str) -> pd.DataFrame:

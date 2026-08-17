@@ -145,14 +145,25 @@ def get_candles(symbol: str, asset_class: str, interval: str = "1d",
     comes back as an empty frame, so one bad symbol skips instead of aborting a
     whole watchlist scan.
 
-    The requested window is deliberately over-wide (`bars * 3` bar-lengths)
-    before being tail-sliced. Sessions have gaps -- weekends, holidays, halts,
-    and for crypto the occasional outage -- so asking for exactly `bars` worth
-    of wall-clock time reliably returns fewer than `bars` rows.
+    The requested window is deliberately over-wide before being tail-sliced:
+    sessions have gaps -- weekends, holidays, halts, and for crypto the
+    occasional outage -- so asking for exactly `bars` worth of wall-clock time
+    reliably returns fewer than `bars` rows.
+
+    HOW over-wide depends on the bar size, and a flat 3x was wrong for the
+    coarse end. An intraday bar only exists during a 6.5h session, so 3x is
+    about right there. A DAILY bar exists on trading days only, which is 7/5 of
+    the calendar -- so 3x asked for six years of weekly history to satisfy a
+    two-year request, and that window predates the listing date of every
+    post-2020 IPO in the watchlist (ARM, RIVN, COIN, HOOD...). Yahoo answers
+    those with "possibly delisted; no price data found", which reads like a bad
+    ticker and is really just a request for history that never existed.
     """
     feed = feed or get_feed()
     end = quantized_end(interval, now)
-    span = dt.timedelta(minutes=interval_minutes(interval) * max(bars, 1) * 3)
+    minutes = interval_minutes(interval)
+    padding = 3.0 if minutes < 1440 else 1.6
+    span = dt.timedelta(minutes=minutes * max(bars, 1) * padding)
     start = end - span
 
     frame = feed.get_candles(symbol, asset_class, interval, start, end)

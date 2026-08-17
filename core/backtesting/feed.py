@@ -170,7 +170,8 @@ class IntradayDataFeed:
         self, symbol: str, venue: str, spec: Interval, start: pd.Timestamp, end: pd.Timestamp,
     ) -> pd.DataFrame:
         cached = self.cache.load(venue, symbol, spec.name)
-        missing = self._missing_segments(cached, spec, start, end)
+        floor = self.cache.earliest_available(venue, symbol, spec.name)
+        missing = self._missing_segments(cached, spec, start, end, earliest=floor)
 
         if missing and not self.offline:
             provider = self.providers[venue]
@@ -181,6 +182,24 @@ class IntradayDataFeed:
                 part = provider.fetch(symbol, spec, seg_start, seg_end)
                 if len(part):
                     fetched.append(part)
+                    # Learn the floor on FIRST contact, not on the next cycle's
+                    # empty head gap: a response that starts later than it was
+                    # asked for has already told us where the series begins.
+                    self._maybe_record_floor(venue, symbol, spec, seg_start, part.index[0])
+                elif len(cached) and seg_end <= cached.index[0]:
+                    # A HEAD segment came back empty. The series does not reach
+                    # that far back -- the overwhelmingly common cause is a
+                    # ticker that had not listed yet (ARM 2023, RIVN 2021,
+                    # COIN 2021...). Nothing gets cached for the span, so
+                    # without recording the floor this exact request repeats on
+                    # every cycle forever, and yfinance answers each one with
+                    # "possibly delisted; no price data found" -- alarming, and
+                    # false: the ticker is listed and trading, it simply did
+                    # not exist yet.
+                    self.cache.record_earliest(venue, symbol, spec.name, cached.index[0])
+                    self._log(f"[data] {symbol} {spec.name}: no history before "
+                              f"{cached.index[0].date()} (listed later than the requested "
+                              f"window); recorded, will not be requested again")
             if fetched:
                 cached = self.cache.merge(venue, symbol, spec.name, pd.concat(fetched))
         elif missing and self.offline:
@@ -191,9 +210,32 @@ class IntradayDataFeed:
             return empty_frame()
         return cached.loc[(cached.index >= start) & (cached.index <= end)]
 
+    def _maybe_record_floor(self, venue: str, symbol: str, spec: Interval,
+                            requested_start: pd.Timestamp, first_returned: pd.Timestamp) -> None:
+        """Record "this series begins here" when a response is truncated at the
+        front -- but ONLY for intervals with no provider retention cap.
+
+        The distinction matters. For 1d/1w, a response that starts later than
+        asked means the INSTRUMENT did not exist earlier: a permanent fact about
+        the symbol, and exactly the IPO case. For capped intraday intervals
+        (yfinance serves ~60 days of 15m), the same truncation means the
+        PROVIDER will not serve it -- a moving window, not a property of the
+        instrument -- and recording it as a floor would freeze a boundary that
+        slides forward every day.
+        """
+        if spec.yahoo_max_lookback_days is not None:
+            return
+        if first_returned <= requested_start + spec.delta:
+            return
+        self.cache.record_earliest(venue, symbol, spec.name, first_returned)
+        self._log(f"[data] {symbol} {spec.name}: series begins {first_returned.date()} "
+                  f"(requested from {requested_start.date()}); recorded, earlier history "
+                  f"will not be requested again")
+
     @staticmethod
     def _missing_segments(
         cached: pd.DataFrame, spec: Interval, start: pd.Timestamp, end: pd.Timestamp,
+        earliest: pd.Timestamp | None = None,
     ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
         """Sub-windows of [start, end] not already covered by the cache.
 
@@ -202,16 +244,25 @@ class IntradayDataFeed:
         (weekends, halts, exchange downtime) and treating every hole as
         "missing" would re-download the whole history on every run forever.
         Only genuine head/tail extensions are fetched.
+
+        `earliest` is the oldest timestamp this venue is known to serve for the
+        series (see `CandleCache.record_earliest`). A head gap entirely below
+        it is not missing data -- it is data that never existed -- so it is not
+        requested. Without this, every post-2020 IPO in a watchlist costs one
+        futile round trip per cycle, permanently.
         """
         if len(cached) == 0:
-            return [(start, end)]
+            if earliest is not None and end <= earliest:
+                return []
+            return [(max(start, earliest) if earliest is not None else start, end)]
 
         first, last = cached.index[0], cached.index[-1]
         gaps: list[tuple[pd.Timestamp, pd.Timestamp]] = []
         # One bar of tolerance either side: the boundary bar is often the one
         # that was still forming when it was cached.
-        if start < first - spec.delta:
-            gaps.append((start, min(first, end)))
+        head_start = start if earliest is None else max(start, earliest)
+        if head_start < first - spec.delta:
+            gaps.append((head_start, min(first, end)))
         if end > last + spec.delta:
             gaps.append((max(last, start), end))
         return gaps
