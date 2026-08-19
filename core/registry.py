@@ -257,20 +257,36 @@ _MODELS: tuple[ModelConfig, ...] = (
         # there. A recalibration with no live evidence must not move the
         # headline numbers Livne is judged by.
         stage="incubating",
-        # ACTIVATED 2026-08-17 by operator request. It runs and alerts from the
-        # next supervisor start.
+        # DEACTIVATED 2026-08-19 by operator request, after running live from
+        # 2026-08-17. Activated then WITHOUT a completed baseline backtest --
+        # a deliberate operator decision; docs/HORIZON_CALIBRATION.md records
+        # what was still unestablished.
         #
-        # Enabled WITHOUT a completed baseline backtest -- that is a deliberate
-        # operator decision, recorded here rather than implied. What is still
-        # unestablished is written down in docs/HORIZON_CALIBRATION.md: no live
-        # trades, no full baseline, and no like-for-like comparison against
-        # Livne over the same window. In particular the 1.45x volume gate has
-        # never been measured against trade COUNT, so the first thing to watch
-        # is whether this model produces setups at all.
+        # What the live run produced: 22 trades, 21 of them closed --
+        # 6 WIN_TP2, 8 LOSS_SL_BE, 2 LOSS_SL, 2 EMERGENCY_EXIT, and 3
+        # STAGNATION_EXIT (the new exit fired live, and graded with P&L as
+        # intended). That is a two-day sample and settles nothing: do NOT
+        # retune against it.
         #
-        # It stays `stage="incubating"`, so it still cannot move the headline
-        # numbers Livne is judged by until it is explicitly graduated.
-        enabled=True,
+        # OPERATIONAL WARNING -- this is a PAUSE, not a wind-down, and ONE
+        # position was non-terminal at deactivation:
+        #     ARKK (id 5a179641) LONG, PARTIAL_TP1. TP1 filled at 82.19 and
+        #     50% is closed; the remaining 50% carries a stop at the breakeven
+        #     price 81.17 (raised from 79.90), with target2 at 83.34.
+        # While disabled nothing refreshes it: neither that stop nor the
+        # target is checked and no exit alert is sent. Its status simply
+        # freezes. On re-enable it is graded against the price AT THAT MOMENT,
+        # so a level crossed during the pause is not detected retroactively
+        # and the recorded P&L will not reflect what actually happened. The
+        # exposure is bounded -- TP1 is already banked and the runner's stop
+        # sits at breakeven -- but it is not zero. To avoid it entirely, close
+        # ARKK out before resuming rather than after.
+        #
+        # It stays `stage="incubating"`, so on re-enable it still cannot move
+        # the headline numbers Livne is judged by until explicitly graduated.
+        #
+        # To re-enable: set this back to True. Nothing else needs changing.
+        enabled=False,
     ),
     # ------------------------------------------------------------------
     # CLIENT MODELS BEGIN -- managed by scripts/create_client_model.py

@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
 
@@ -71,6 +72,14 @@ def _load_snapshots() -> list[dict]:
         return []  # a corrupt/missing snapshot cache only degrades trend precision, never a hard failure
 
 
+def _cleanup(tmp_path: str) -> None:
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass  # a stranded temp file is cosmetic; the maintenance sweep reclaims it
+
+
 def _save_snapshots(snapshots: list[dict]) -> None:
     store_dir = os.path.dirname(MACRO_SNAPSHOT_STORE)
     os.makedirs(store_dir, exist_ok=True)
@@ -79,9 +88,16 @@ def _save_snapshots(snapshots: list[dict]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(snapshots, f, indent=2)
         os.replace(tmp_path, MACRO_SNAPSHOT_STORE)
+    except OSError as exc:
+        # Symmetric with _load_snapshots: the snapshot history only sharpens
+        # trend precision, so losing one write must never take down the scan
+        # that was about to use it. It used to raise, and a single locked file
+        # (another process mid-read, an AV scanner, the 6-hourly backup zipping
+        # runtime/) killed the whole asset-class scan for that cycle.
+        _cleanup(tmp_path)
+        print(f"[macro] snapshot write skipped (non-fatal): {exc}", file=sys.stderr)
     except BaseException:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        _cleanup(tmp_path)
         raise
 
 

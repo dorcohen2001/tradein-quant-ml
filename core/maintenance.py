@@ -37,6 +37,7 @@ be able to take down a live trading loop.
 """
 from __future__ import annotations
 
+import glob
 import os
 import sys
 import tempfile
@@ -92,7 +93,7 @@ def prune_timestamped_records(path: str, max_age_days: float, dry_run: bool = Fa
                               field: str = "ts") -> tuple[int, int]:
     """Drop records older than `max_age_days` from a JSON list of `{ts: ...}`.
 
-    `runtime/stores/market_snapshots.json` is the odd one out in this module:
+    `runtime/stores/market_snapshots_<key>.json` is the odd one out here:
     neither a directory of files nor disposable. It is ONE file holding a list
     of correlation readings (4,313 records / 626 KB at the time of writing),
     and the model that writes it prunes ONLY inside `record_snapshot` -- the
@@ -244,12 +245,18 @@ def sweep_runtime(runtime_dir: str, cache_days: float, chart_days: float,
             os.path.join(runtime_dir, "backtest"), backtest_days, suffix=".csv", dry_run=dry_run,
         )
 
-    # Correlation snapshots -- one growing JSON list rather than a directory.
+    # Correlation snapshots -- growing JSON lists rather than a directory, one
+    # per tenant (market_snapshots_<key>.json). Globbed rather than named so a
+    # new tenant is swept without editing this module, and so the pre-split
+    # shared file is still compacted if one is left on disk.
     if snapshot_days and snapshot_days > 0:
-        results["market_snapshots"] = prune_timestamped_records(
-            os.path.join(runtime_dir, "stores", "market_snapshots.json"),
-            snapshot_days, dry_run=dry_run,
-        )
+        removed = reclaimed = 0
+        pattern = os.path.join(runtime_dir, "stores", "market_snapshots*.json")
+        for path in sorted(glob.glob(pattern)):
+            count, size = prune_timestamped_records(path, snapshot_days, dry_run=dry_run)
+            removed += count
+            reclaimed += size
+        results["market_snapshots"] = (removed, reclaimed)
 
     if candle_dir and os.path.isdir(candle_dir):
         age = cache_days if candle_days is None else candle_days

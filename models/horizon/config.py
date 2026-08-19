@@ -439,7 +439,11 @@ VOLUME_PROFILE_BUCKETS = 40
 # ---------------------------------------------------------------------------
 # Correlation engine (USDT.D / TOTAL market cap / SPY-QQQ)
 # ---------------------------------------------------------------------------
-MACRO_SNAPSHOT_STORE = os.path.join(RUNTIME_DIR, "stores", "market_snapshots.json")
+# Per-tenant: this is a read-modify-write series, not a content-addressed
+# cache like YF_CACHE_DIR, so two tenants sharing one file both raced on
+# os.replace (WinError 5 on Windows) and lost whole scans. Keyed by
+# MODEL_KEY like GATE_STATE_STORE, so a new tenant needs no edit here.
+MACRO_SNAPSHOT_STORE = os.path.join(RUNTIME_DIR, "stores", f"market_snapshots_{MODEL_KEY}.json")
 MACRO_SNAPSHOT_MAX_AGE_DAYS = 30     # prune snapshots older than this
 USDT_D_TREND_LOOKBACK_HOURS = 24
 TOTAL_MCAP_TREND_LOOKBACK_HOURS = 24

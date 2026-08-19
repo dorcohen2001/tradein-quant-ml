@@ -222,10 +222,10 @@ FUNNEL_RETENTION_DAYS = _int_env("FUNNEL_RETENTION_DAYS", 14)
 # were renamed or retired.
 BACKTEST_LOG_RETENTION_DAYS = _int_env("BACKTEST_LOG_RETENTION_DAYS", 90)
 
-# Correlation snapshots (runtime/stores/market_snapshots.json). One growing
-# JSON map, compacted in place rather than deleted. The owning model prunes it
-# only on the path that writes it, so a paused model's file never shrinks --
-# which is how it reached 626 KB. Matches MACRO_SNAPSHOT_MAX_AGE_DAYS in the
+# Correlation snapshots (runtime/stores/market_snapshots_<key>.json, one per
+# tenant). A growing JSON list, compacted in place rather than deleted. The
+# owning model prunes it only on the path that writes it, so a paused model's
+# file never shrinks -- which is how it reached 626 KB. Matches MACRO_SNAPSHOT_MAX_AGE_DAYS in the
 # model config, so the sweep and the writer agree on what is stale.
 MACRO_SNAPSHOT_RETENTION_DAYS = _int_env("MACRO_SNAPSHOT_RETENTION_DAYS", 30)
 # How often the supervisor runs the sweep. Daily is plenty for directories
