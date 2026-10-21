@@ -230,8 +230,8 @@ TRADEIN/
 ### 1. Environment Setup
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/TRADEIN.git
-cd TRADEIN
+git clone https://github.com/dorcohen2001/tradein-quant-ml.git
+cd tradein-quant-ml
 
 # Install pinned production dependencies
 pip install -r requirements.txt
