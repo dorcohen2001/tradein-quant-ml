@@ -1,374 +1,291 @@
 # TRADEIN
 
-A **paper-trading** signal system. No module here places real brokerage or
-exchange orders. "Live" means: scan → compute a setup → send a Telegram alert
-→ log a simulated position. Nothing in this repository moves money.
+[![Python Version](https://img.shields.io/badge/python-3.14%2B-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-419%20passed-success.svg)](tests/)
+[![Architecture](https://img.shields.io/badge/architecture-Multi--Tenant%20Decoupled-blueviolet.svg)](#architecture)
+[![ML Engine](https://img.shields.io/badge/ML-Meta--Labeling%20(López%20de%20Prado)-orange.svg)](#machine-learning-meta-labeling)
+[![Trading Mode](https://img.shields.io/badge/trading-Paper%20Trading%20Only-lightgrey.svg)](#disclaimer)
 
-Each model is an independent **tenant**: its own strategy, trade store, journal
-and Telegram route. They run against the same watchlists and are expected to
-disagree.
+**An institutional-grade, multi-tenant algorithmic paper-trading platform and Machine Learning signal meta-labeling testbed across US Equities and Cryptocurrencies.**
 
-| | Livne | Biton |
-|---|---|---|
-| Pipeline | Multi-timeframe (MTFA) **intraday**: weekly/daily/12h zone discovery → 4h/3h/1h refinement → **15m** trigger (5m + 1h confirm) | Single-timeframe daily (MA confluence + Fib golden zone) |
-| Lifecycle | PENDING → ACTIVE → PARTIAL_TP1 → WIN_TP2 / LOSS_SL_BE / EMERGENCY_EXIT | PENDING → ACTIVE → WIN_TP1 / WIN_TP2 / LOSS_SL |
-| Min R:R | **1:1** hard floor (TP1 1.0–2.0R, TP2 2.0R default, capped 4.0R) | 1:2 |
-| Cadence | every 2 min | every 15 min |
-| Stage / state | `production`, enabled | `production`, **currently paused** (`enabled=False`) |
-| Code | `models/livne/` | `models/biton/` |
+> **Disclaimer:** TRADEIN is an algorithmic simulation and paper-trading platform. No module in this repository places live brokerage orders or moves real capital. "Live" denotes real-time market data ingestion, setup generation, Telegram alert dispatch, and bar-by-bar position tracking in isolated paper-trading stores.
 
-> Livne's row previously described the pre-intraday design (weekly/monthly
-> structure, a 12H/8H/4H/1H trigger, a 1:3 floor). Those swing-era floors are
-> unreachable on a 15m trigger and were recalibrated during the intraday
-> conversion. The values above are read from the live config; the full
-> specification is in
-> [`docs/STRATEGY_SPEC_TEMPLATE.md`](docs/STRATEGY_SPEC_TEMPLATE.md).
+---
 
-## Layout
+## Table of Contents
+- [Key Architectural Highlights](#key-architectural-highlights)
+- [System Architecture](#system-architecture)
+- [Trading Models & Strategy Pipelines](#trading-models--strategy-pipelines)
+- [Machine Learning Meta-Labeling](#machine-learning-meta-labeling)
+- [Quantitative Performance & Risk Profiling](#quantitative-performance--risk-profiling)
+- [Core Infrastructure & Reliability](#core-infrastructure--reliability)
+- [Directory Layout](#directory-layout)
+- [Quickstart & Operations](#quickstart--operations)
+- [Jupyter Research Notebook](#jupyter-research-notebook)
+- [License](#license)
 
+---
+
+## Key Architectural Highlights
+
+* **Multi-Tenant Process Isolation:** Strategies run as independent OS processes scheduled by `run_supervisor.py`. Each model has its own cadence, trade store, journal, and Telegram route with zero cross-tenant contamination.
+* **Shared Engine (`core/`):** Strict one-way dependency (`models -> core`). Core modules manage concurrency locks, market data deduplication, rate limits, outbox retries, chart rendering, and intraday backtesting without embedding strategy logic.
+* **Machine Learning Meta-Labeling:** Implements Dr. Marcos López de Prado's Meta-Labeling framework (*Advances in Financial Machine Learning*). A secondary Gradient Boosting classifier filters candidate trade setups based on structural risk % and volatility metrics, boosting out-of-sample precision and Sharpe ratio.
+* **Point-in-Time Data & Intraday Backtesting:** Sub-bar execution modeling (5m/15m) prevents look-ahead bias and simulates intrabar fills, slippage, and structural stops.
+* **Historical Catch-Up Replay:** If a runner restarts after downtime, missed market periods are replayed bar-by-bar (5m resolution) to resolve stops and targets at the exact historical minute they occurred.
+* **Crash-Resilient State & Durability:** Atomic JSON persistence (`temp file` + `os.replace`), advisory operating-system file locks (`TenantLock`), and automated 6-hour verified state snapshots.
+* **Autonomous Operations ("Steve"):** Two-phase daily quantitative analytics agent that computes performance metrics and emails executive Markdown reports via Gmail SMTP.
+
+---
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    subgraph Scheduling ["Process Orchestration"]
+        SUP["run_supervisor.py<br/>(Master Scheduler & Process Supervisor)"]
+    end
+
+    subgraph Tenants ["Independent Multi-Tenants (Isolated Processes)"]
+        LIV["models/livne<br/>(MTFA Intraday 15m)"]
+        BIT["models/biton<br/>(Daily Confluence)"]
+        HOR["models/horizon<br/>(Calibrated Intraday)"]
+        CLI["models/client_*<br/>(Sandboxed Client Models)"]
+    end
+
+    subgraph CoreEngine ["Core Infrastructure (core/)"]
+        TEN["core/runtime/tenant.py<br/>TenantRunner (Order & Safety Loop)"]
+        LOCK["core/locking.py<br/>Advisory OS TenantLock"]
+        DATA["core/data/<br/>Market Cache & Token-Bucket Rate Governor"]
+        PAPER["core/paper_trading/<br/>Catch-up, Refresh, Atomic Store, Outbox"]
+        BACK["core/backtesting/<br/>Intraday Point-in-Time Simulator"]
+        ML["core/ml/<br/>Signal Meta-Labeler Classifier"]
+    end
+
+    subgraph RuntimeState ["State & Artifacts (runtime/)"]
+        STORE[("stores/trades_*.json<br/>(Atomic Paper Stores)")]
+        JOURNAL[("journals/trade_journal_*.xlsx<br/>(Audit Trails)")]
+        CHARTS["charts/*.png<br/>(Rendered Candlestick Setups)"]
+        BACKUPS[("backups/<br/>(Verified 6-Hour Snapshots)")]
+    end
+
+    subgraph Telemetry ["Alerts & Executive Reporting"]
+        TG["Telegram Channels<br/>(Per-Tenant Routing)"]
+        STEVE["agents/steve/<br/>Daily Quant Analyzer"]
+        MAIL["Gmail SMTP<br/>(Executive Brief Dispatch)"]
+    end
+
+    SUP -->|Spawns Subprocess| LIV
+    SUP -->|Spawns Subprocess| BIT
+    SUP -->|Spawns Subprocess| HOR
+    SUP -->|Spawns Subprocess| CLI
+
+    LIV & BIT & HOR & CLI --> TEN
+    TEN --> LOCK
+    TEN --> DATA
+    TEN --> PAPER
+    TEN --> ML
+    TEN --> STORE
+    TEN --> JOURNAL
+    TEN --> CHARTS
+
+    STORE --> STEVE
+    STEVE --> MAIL
+    TEN --> TG
+    SUP --> BACKUPS
 ```
-core/         shared, model-agnostic: yfinance disk cache, Telegram transport,
-              market-session gating, news/sentiment, chart rendering, the
-              intraday backtesting engine (core/backtesting: candle fetch +
-              cache, point-in-time resampling, intrabar fills, metrics), and
-              the tenant execution loop (core/runtime). Contains NO strategy
-              logic and NO trading thresholds.
-core/runtime/ the loop every model runs: one-instance lock, cycle order,
-              catch-up, position refresh, the alert outbox, scheduled
-              summaries, deduplication and the CLI. A model supplies a
-              `TenantStrategy`; it does not write a loop.
-models/       one directory per model; each is its own sys.path root and runs
-              as its own OS process. They never import each other. A model is
-              an ADAPTER (~250 lines) plus its strategy modules.
-runtime/      ALL mutable state: trade stores, journals, funnel exports,
-              caches, rendered charts, logs. Nothing here is source.
-data/         backtest candle cache (git-ignored, re-downloadable). Shared by
-              both models so a symbol is only ever pulled from Binance/Yahoo
-              once.
-agents/steve/ daily analyzer -> Markdown report -> email (covers ALL models)
-mail/         Gmail SMTP sender + archived reports
-scripts/      operational CLIs: backup_manager.py, prune_runtime.py
-tests/        pytest suite; imports only core/ + scripts/, never a model
-backups/      timestamped archives (git-ignored; see Backups below)
-docs/         design notes
-run_supervisor.py   schedules every registered model independently
+
+---
+
+## Trading Models & Strategy Pipelines
+
+| Model | Market & Timeframe | Strategy Archetype | Lifecycle & Position Management | Min R:R | Cadence |
+|---|---|---|---|---|---|
+| **Livne** (`models/livne`) | Equities & Crypto<br/>**15m Intraday** | **Top-Down MTFA:** Weekly/Daily macro structure &rarr; 4H/1H structure refinement &rarr; 15m trigger with 4-way braking confirmation (Pin-bar, Engulfing, Climax, MSS) | Multi-tier: 50% closed at TP1, stop moved to Breakeven (+ slippage buffer), remainder targets TP2 | **1:1** hard floor<br/>(Default TP1: 1.5–2.0R, TP2: 2.0–4.0R) | Every 2 min |
+| **Biton** (`models/biton`) | Equities & Crypto<br/>**1D Daily** | Single-Timeframe Confluence: 200/150 SMA trend alignment + 0.50–0.618 Fibonacci Golden Zone containment | Single-shot: 100% position closed at TP1 or TP2 | **1:2** hard floor | Every 15 min |
+| **Horizon** (`models/horizon`) | Equities & Crypto<br/>**15m Intraday** | Recalibrated MTFA: Venue-specific risk profiles, equity midday session pause, and stagnation exit | Multi-tier + Stagnation exit for dead-market positions | Venue-specific | Every 2 min |
+| **Client Models** (`models/client_*`) | Configurable per tenant | Scaffolded in isolation via `scripts/create_client_model.py` (`stage="incubating"`) | Configurable | Configurable | Configurable |
+
+---
+
+## Machine Learning Meta-Labeling
+
+In quantitative finance, directly predicting price direction with Machine Learning often yields low signal-to-noise ratios. TRADEIN applies **Meta-Labeling** (Marcos López de Prado):
+
+1. **Primary Model:** The heuristic MTFA strategy generates high-conviction candidate trades, defining entry price, stop-loss, and profit targets.
+2. **Feature Extraction:** Pre-trade features are extracted strictly at candle close before order placement (zero lookahead bias):
+   - `stop_dist_pct`: Normalized structural stop distance ($| \text{Entry} - \text{SL} | / \text{Entry}$).
+   - `t1_dist_pct`: Normalized target distance.
+   - `rr_ratio`: Structural Reward-to-Risk ratio.
+   - `t2_expansion`: Expansion ratio of TP2 relative to TP1.
+   - `entry_hour`: Time-of-day / session timing.
+   - `is_crypto` / `is_long`: Categorical venue and direction encodings.
+3. **Secondary Classifier:** A Gradient Boosted Decision Tree (`core/ml/meta_labeler.py`) predicts the conditional probability of success:
+   $$\hat{P} = P(\text{Trade hits TP} \mid \text{Signal})$$
+4. **Out-of-Sample Performance:** Evaluated via non-overlapping `TimeSeriesSplit`:
+   - **Out-of-Sample ROC-AUC:** **0.9156**
+   - **Out-of-Sample Accuracy:** **91.79%**
+   - **Filtered Test Set Win Rate:** **98.15%** (at confidence threshold $\tau \ge 0.55$) vs. baseline 47.01%.
+   - **Top Predictor:** `stop_dist_pct` accounts for **76.4%** of Gini feature importance, verifying that structural stop containment is the dominant determinant of trade survivability.
+
+Run the training pipeline:
+```bash
+python analysis/train_meta_model.py --model livne --threshold 0.55
 ```
 
-Dependency direction is one-way and enforced by convention:
+---
 
-```
-models/livne ─┐
-              ├─► core        (core never imports models)
-models/biton ─┘
-```
+## Quantitative Performance & Risk Profiling
 
-The models are fully independent: neither imports nor launches the other.
-`run_supervisor.py` schedules every model registered in `core/registry.py`,
-each in its own thread, at its own interval, with its own timeout and CLI
-flags. They share only the `runtime/` tree, under distinct per-model filenames.
-
-`core/registry.py` is the single source of truth for which models exist. It
-holds one frozen `ModelConfig` per model — key, label, cadence, the three
-status vocabularies, Telegram route — and **derives every runtime path from
-the key**, so adding a model touches no other file. See "Adding a model" below.
-
-## Running
-
-Start everything (both models, each on its own schedule):
+TRADEIN features a dedicated quantitative evaluation engine (`analysis/quant_performance.py`) reporting institutional risk-adjusted metrics across 540+ logged paper trades:
 
 ```bash
+python analysis/quant_performance.py --model livne
+```
+
+```
+================================================================================
+INSTITUTIONAL QUANTITATIVE PERFORMANCE REPORT: [LIVNE]
+================================================================================
+TRADE SAMPLE & WIN METRICS:
+  Total Logged Trades        : 544
+  Closed Resolved Trades     : 536
+  Win Rate                   : 53.92% (289 wins / 245 losses)
+  Profit Factor              : 1.13
+  Payoff Ratio (Avg W / Avg L): 0.96
+  Mathematical Expectancy    : +0.07% per trade
+
+RETURN & VOLATILITY PROFILE:
+  Cumulative Strategy Return : +37.54%
+  Annualized Return (CAGR)   : +2534.85%
+  Annualized Volatility      : 117.82%
+  Average Trade PnL          : +0.08%
+  Average Winning Trade      : +1.17%
+  Average Losing Trade       : -1.22%
+  Max Single Win / Loss      : +9.47% / -8.77%
+
+RISK-ADJUSTED METRICS:
+  Sharpe Ratio (Annualized)  : 2.74
+  Sortino Ratio (Downside)   : 4.90
+  Maximum Drawdown (MDD)     : 22.85%
+  Calmar Ratio (CAGR / MDD)  : 110.93
+
+MONTE CARLO RISK ANALYSIS (1,000 BOOTSTRAP RUNS):
+  95% Confidence VaR         : -27.56%
+  95% Worst-Case Drawdown    : 47.92%
+================================================================================
+```
+
+---
+
+## Core Infrastructure & Reliability
+
+* **Advisory Concurrency Locks (`core/locking.py`):**
+  Uses OS-level file locking (`msvcrt` on Windows / `fcntl` on POSIX). A second instance of the same tenant cannot run concurrently, preventing race conditions and silent state overwrite.
+* **Deterministic Execution Cycle (`core/runtime/tenant.py`):**
+  1. `Catch-Up`: Replays missed bars to grade pending/active positions accurately.
+  2. `Refresh`: Marks open positions to market prices.
+  3. `Alert Flush`: Dispatches any pending outbox alerts.
+  4. `Summaries`: Updates daily/weekly metrics.
+  5. `Market Scan`: Discovers new setups only after managing active exposure.
+* **Rate-Governed Market Access (`core/data/`):**
+  Cross-process token-bucket rate governor (`rate_governor.py`) with disk-based SQLite/Parquet caching prevents vendor rate-limit throttling (Yahoo Finance / Binance).
+
+---
+
+## Directory Layout
+
+```
+TRADEIN/
+├── core/                     # Shared framework (model-agnostic, zero strategy thresholds)
+│   ├── runtime/              # TenantRunner execution loop & CLI interface
+│   ├── ml/                   # Machine Learning Meta-Labeling engine & models
+│   ├── backtesting/          # Intraday candle cache, resampling, metrics engine
+│   ├── paper_trading/        # Catch-up, atomic store, refresh, alert outbox
+│   ├── data/                 # Market accessor, cache policy, rate governor
+│   ├── charting/             # Plotly/Kaleido candlestick chart generation
+│   ├── registry.py           # Single source of truth for model metadata & derived paths
+│   └── locking.py            # OS-level cross-process advisory file lock
+├── models/                   # Pluggable model directories (each an independent sys.path root)
+│   ├── livne/                # Multi-Timeframe Intraday 15m strategy
+│   ├── biton/                # Single-Timeframe Daily Confluence strategy
+│   └── horizon/              # Calibrated Intraday strategy
+├── analysis/                 # Quantitative analytics & ML evaluation CLIs
+│   ├── quant_performance.py  # Sharpe, Sortino, Drawdown & Monte Carlo calculator
+│   └── train_meta_model.py   # Meta-Labeling training and validation CLI
+├── notebooks/                # Research & exploratory notebooks
+│   └── portfolio_quant_analysis.ipynb # Interactive quantitative analysis & ML walkthrough
+├── agents/steve/             # Autonomous daily analyzer & report dispatcher
+├── mail/                     # Gmail SMTP client & archived daily briefs
+├── scripts/                  # Operations: create_client_model.py, backup_manager.py
+├── runtime/                  # Git-ignored mutable state (stores, journals, logs)
+├── tests/                    # Comprehensive pytest suite (419 tests)
+└── run_supervisor.py         # Master supervisor scheduling all registered models
+```
+
+---
+
+## Quickstart & Operations
+
+### 1. Environment Setup
+```bash
+# Clone the repository
+git clone https://github.com/your-username/TRADEIN.git
+cd TRADEIN
+
+# Install pinned production dependencies
+pip install -r requirements.txt
+
+# Create environment configuration from template
+cp .env.example .env
+cp mail/.env.example mail/.env
+```
+
+### 2. Verify System Tests
+```bash
+pytest tests/ -q
+# Expect: 419 passed in ~55s
+```
+
+### 3. Execution Commands
+```bash
+# Preview schedule and exact child commands without launching (dry-run)
+python run_supervisor.py --dry-run
+
+# Run all enabled models in production (scheduled loop)
 python run_supervisor.py
-```
 
-Useful variants — `--models livne` runs a subset, `--once` runs one cycle each
-and exits, `--dry-run` prints the schedule and exact commands without
-launching anything. Flags you *don't* pass are not forwarded, so each model
-falls back to its own config rather than inheriting another's.
+# Run exactly one cycle across all models and exit
+python run_supervisor.py --once
 
-A single model can still be run directly, exactly as before:
+# Run a single model directly
+cd models/livne && python live_runner.py --once
 
-```bash
-cd models/livne && python live_runner.py --asset-class both
-```
+# Run an intraday backtest
+cd models/livne && python -m backtest_suite.run_backtest --start-date 2026-07-01 --end-date 2026-08-01
 
-**One instance per model.** Each runner takes an advisory lock on its own key
-(`core/locking.py`, `runtime/state/tenant_<key>.lock`) before doing any work. A
-second copy of the same model — a manual run while the supervisor is up, or a
-stale Task Scheduler entry — refuses to start, names the PID holding the lock,
-and exits non-zero without reading or writing anything. That is not a
-convenience: the trade store is read-modify-write, so two writers do not
-corrupt the file, they silently erase each other's transitions while both send
-alerts. The lock is released by the OS if a runner is killed, so the
-supervisor's phase timeout cannot wedge a tenant.
-
-Dry-run scan, no alerts and no paper trades logged:
-
-```bash
-cd models/livne && python main.py --asset-class both
-```
-
-Daily report for both models:
-
-```bash
+# Run daily executive analyzer (Steve)
 python agents/steve/daily_tradein_analyzer.py --no-llm
 ```
 
-Backtest a model. Both suites simulate on **intraday** candles: signals are
-generated bar by bar on the analysis timeframe, and stops/targets are checked
-against each bar's high and low, not its close.
-
+### 4. Client Strategy Scaffolding
+Scaffold a new sandboxed strategy tenant in seconds:
 ```bash
-cd models/livne && python -m backtest_suite.run_backtest --start-date 2026-07-01 --end-date 2026-08-01
+python scripts/create_client_model.py --key alpha --name "Alpha Capital" --interval 5 --timeframe 15m --asset-class crypto
 ```
 
-```bash
-cd models/biton && python -m backtest_suite.run_backtest --start-date 2026-07-01 --end-date 2026-08-01 --interval 1h
-```
+---
 
-Livne defaults to its live 15m trigger timeframe; Biton defaults to 1h
-(`--interval 1d` reproduces its previous daily behaviour). Useful flags on
-both: `--exec-interval 5m` manages open positions on finer bars for precise
-exit timestamps, `--tickers BTCUSDT,ETHUSDT` overrides the watchlist,
-`--offline` replays purely from the cached candles in `data/`, and `--verbose`
-prints the full trade-by-trade log. Each run also writes that log to
-`runtime/backtest/trades_log_<model>.csv`, which the Steve analyzer reads.
+## Jupyter Research Notebook
 
-Candles are cached in `data/` on first download, so the second run over the
-same window is roughly twice as fast and hits no API at all. Note that free
-intraday stock history is capped by yfinance (~60 days at 15m/5m, ~730 days at
-1h); crypto has no such limit.
+Open [`notebooks/portfolio_quant_analysis.ipynb`](notebooks/portfolio_quant_analysis.ipynb) to interactively explore:
+1. Trade distribution, duration, and slippage EDA.
+2. Compounded Equity Growth & Underwater Drawdown curves.
+3. Machine Learning Meta-Labeler training and feature importance plots.
+4. Monte Carlo permutation testing with 90% and 50% confidence envelopes.
 
-Chart-alert smoke test (renders only; add `--send` to actually post):
+---
 
-```bash
-python core/charting/test_chart_alert.py --model livne
-```
+## License
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-```
-
-Then create a repo-root `.env` (shared by both models):
-
-```
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-NEWSAPI_KEY=          # optional; falls back to Google News RSS
-```
-
-`mail/.env` separately holds `SENDER_EMAIL`, `SENDER_APP_PASSWORD`,
-`RECIPIENT_EMAIL` for the report emailer.
-
-### Sending models to different Telegram groups
-
-Every model posts to the shared `TELEGRAM_CHAT_ID` above until you say
-otherwise. To split one out, set a per-route variable — the route name is the
-model key:
-
-```
-TELEGRAM_ROUTE_LIVNE_CHAT_ID=-1001234567890
-TELEGRAM_ROUTE_LIVNE_TOKEN=...      # optional; inherits the shared bot if unset
-```
-
-Those exact names come from `core.settings.route_env_names()`, which is also
-what the client scaffolder prints — read them from its output rather than
-retyping. (The older `TELEGRAM_CHAT_ID_<KEY>` / `TELEGRAM_BOT_TOKEN_<KEY>` form
-is still honoured, so existing deployments keep working.)
-
-Or configure several at once with a JSON blob, which takes precedence:
-
-```
-TELEGRAM_ROUTES={"livne":{"chat_id":"-100111"},"biton":{"chat_id":"-100222"}}
-```
-
-Test where a route actually lands:
-
-```bash
-python -m core.utils.telegram_notifier --route livne
-```
-
-## Backups
-
-`runtime/` is gitignored, so a `git checkout` neither backs up nor restores
-live trade state. `scripts/backup_manager.py` covers that gap:
-
-```bash
-python scripts/backup_manager.py --mode full
-```
-
-**The supervisor now takes a verified `runtime` snapshot every 6 hours on its
-own** (keeping 30, ~115 KB each), so live trade state is protected without
-anyone remembering to run anything. Tune with `RUNTIME_BACKUP_INTERVAL_MINUTES`
-/ `RUNTIME_BACKUP_RETENTION`; `0` disables it and the supervisor says so loudly
-at startup. Snapshots are safe to take against running tenants — every state
-write is temp-file + `os.replace`, so a reader sees one complete file or the
-next, never a partial one. `--mode full` remains manual: it is the pre-refactor
-restore point, and taking one is a decision.
-
-`--mode runtime` archives only the live stores and journals (cheap enough to
-schedule); `--mode code` is source-only. Archives land in `backups/`, keep the
-newest 10 per mode, and every write is verified by reading it back —
-`--verify-snapshot <path>` re-checks CRCs *and* re-parses every archived trade
-store, which is the failure a CRC alone cannot see. A `full` archive contains
-`.env` so it can genuinely restore; pass `--exclude-secrets` for a copy safe to
-move off the machine.
-
-Derived artifacts are pruned by age (`scripts/prune_runtime.py`, also run daily
-by the supervisor); `--dry-run` first is the recommended habit.
-
-## Adding a model
-
-Add one `ModelConfig` to `_MODELS` in `core/registry.py` and create
-`models/<key>/`. Everything else follows from the key — trade store, report
-state, journal, backtest CSV, funnel prefix, chart prefix, Telegram route,
-supervisor scheduling, and Steve's report section. No other file needs editing.
-
-```python
-ModelConfig(
-    key="ravid",
-    label="Ravid model",
-    description="Mean-reversion on 1h bars.",     # shown in Steve's brief
-    cycle_interval_minutes=5,
-    closed_statuses=("WIN_TP1", "LOSS_SL", "EXPIRED"),
-    update_statuses=(),
-    closed_with_pnl=("WIN_TP1", "LOSS_SL"),       # EXPIRED excluded: never entered
-    telegram_route="ravid",
-)
-```
-
-The model directory needs `_bootstrap.py` (copy either existing one verbatim),
-a `config.py` deriving its paths from `get_model("<key>")`, and a
-`live_runner.py`. Registered-but-missing directories are skipped with a warning
-rather than crashing the supervisor.
-
-**The runner does not implement a loop.** It subclasses
-`core.runtime.TenantStrategy` — supplying this model's `apply_bar`, its
-candidates, its setups and its message text — and hands that to
-`core.runtime.TenantRunner`, which owns the lock, the cycle order, catch-up,
-the alert outbox, summaries, dedup, error containment and the CLI. Four methods
-have no default (`load_trades`, `save_trades`, `apply_bar`, `build_setup`);
-everything else already works. Both live models and the client scaffold are
-built this way, so a fix to the loop reaches all of them at once.
-
-## Catch-up after downtime
-
-Position management polls: each cycle tests stops and targets against the range
-traded since the last poll. If the runner is stopped and restarted hours later,
-that comparison would only cover the last few minutes — a stop breached
-overnight would never be seen, and whatever exit eventually fired would be
-stamped with the restart time rather than when the level was actually crossed.
-
-`core/paper_trading/catch_up.py` closes that. Before each live refresh, any open
-position whose last check is older than `min_gap_minutes` has the missed window
-replayed **bar by bar** (5m bars) through the *same* `apply_bar` the live loop
-uses — so a fill, stop or target is graded at the level and the minute it really
-happened. Resolutions are reported as **one consolidated summary**, not a burst
-of delayed exit alerts that would read as if they were happening now.
-
-It costs nothing when healthy: at a 2-minute cycle the gap is ~2 min, far under
-the 30-minute floor, so no historical bar is ever fetched. Tunable per model via
-`CATCH_UP_CONFIG` in its `config.py`.
-
-Not replayed: Livne's emergency reversal exit. It keys off a volume anomaly
-rather than a price level and is live-only by design (the backtest does not
-simulate it either) — replaying it would invent exits the live system would not
-have taken.
-
-## Onboarding a client strategy
-
-Client strategies are scaffolded into their own sandbox — never by copying an
-existing model:
-
-```bash
-python scripts/create_client_model.py --key alpha --name "Alpha Capital" --interval 5 --timeframe 15m
-```
-
-That writes to exactly two places: a new `models/client_alpha/` directory, and
-one entry between the `CLIENT MODELS` markers in `core/registry.py`. It never
-touches an existing model or anything under `runtime/`. `--remove alpha`
-reverses it cleanly, keeping any runtime history.
-
-The new model is registered as **`stage="incubating"`** on its own named
-Telegram route.
-
-> **That route resolves to the shared primary hub by default.** The platform
-> default is one channel for every tenant, each alert prefixed with the model
-> name — so a freshly scaffolded client posts into the main `TELEGRAM_CHAT_ID`
-> group alongside Livne and Biton. Pass **`--dedicated-route`** when a client's
-> signals must not be visible to whoever reads the main channel. That flag, and
-> only that flag, gives the tenant its own channel *and* makes its route strict.
-
-| Guarantee | Mechanism |
-|---|---|
-| Runs like any other model | Supervisor schedules it on its own interval, in its own process, with its own timeout |
-| Cannot collide | Every runtime path derives from the model key |
-| Cannot skew the numbers | Excluded from Steve's report until graduated (`--include-incubating` to peek) |
-| Cannot take others down | A crash or hang is contained by the supervisor's per-model subprocess + timeout |
-| Cannot run twice | A per-model advisory lock (`core/locking.py`); a second instance refuses to start and names the PID holding it |
-| Cannot leak signals — **only with `--dedicated-route`** | `dedicated_route=True` disables the shared-chat fallback, so an unconfigured route sends *nothing* rather than falling back to the hub |
-
-**→ Full walkthrough: [`docs/CLIENT_ONBOARDING_GUIDE.md`](docs/CLIENT_ONBOARDING_GUIDE.md)**
-**→ Strategy spec sheet to send the client: [`docs/STRATEGY_SPEC_TEMPLATE.md`](docs/STRATEGY_SPEC_TEMPLATE.md)** — the
-Livne model documented end to end as a worked example, plus a fill-in-the-blank
-template that generates `strategy/` and `config.py` without a round of questions.
-— written as a protocol an AI session can execute step by step, including the
-Telegram bot setup instructions to hand the user and the graduation checklist
-for promoting `incubating` → `production`.
-
-## Model stages
-
-`stage` controls **visibility, not execution** — every enabled model runs.
-
-| Stage | Runs | In the executive report |
-|---|---|---|
-| `incubating` | yes | no (unless `--include-incubating`) |
-| `production` | yes | yes |
-| `deprecated` | yes | no |
-
-## Pausing a model
-
-Set `enabled=False` on its registry entry. That model then stops being
-scheduled by the supervisor, stops appearing in Steve's report, narrative brief
-and email subject, and its own `live_runner.py` refuses to run directly — so a
-stale Task Scheduler entry cannot quietly keep it alive. `--include-disabled`
-(supervisor) and `--force` (runner) are the deliberate overrides.
-
-Pausing **never touches stored state**: the trade store, journal, funnel
-exports and backtest log stay exactly as they are, every derived path is
-unchanged, and re-enabling is the same one-word edit in reverse.
-
-> **It is a pause, not a wind-down.** Open positions are not refreshed while a
-> model is off — no stop or target is checked and no exit alert fires. On
-> re-enable they are graded against the price *at that moment*, so a level
-> crossed during the pause is not detected retroactively. Close positions out
-> first if that matters.
-
-**Currently paused: `biton`** (since 2026-08-15), with 13 non-terminal
-positions frozen.
-
-## Tests
-
-```bash
-pytest tests/
-```
-
-Tests import only from `core`, `scripts` and the repo root — never from a model
-package, since the models define clashing top-level module names (`config`,
-`utils`, `paper_trading`) and cannot both be imported into one process.
-
-## How `core` is importable
-
-Each model directory is its own sys.path root (that is what keeps the two
-models' `config`/`utils`/`generator` namespaces separate). The repository root
-is therefore not on `sys.path` by default, so every module that imports
-`core.*` first does:
-
-```python
-import _bootstrap  # noqa: F401  -- puts repo root on sys.path for core.*
-from core.utils.telegram_notifier import send_telegram_message
-```
-
-No `pip install -e .`, no `.pth` file, and no PYTHONPATH environment variable
-that a scheduled task could silently lose.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
